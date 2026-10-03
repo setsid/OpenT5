@@ -34,7 +34,8 @@ any file inside the zone folders configured in `.env`.
   stays fast; an image whose pixels are not in this zone keeps the image icon.
 - **Asset header and view bar** (right). These show the asset's name, type, list index,
   size and zone offset, then one button for each view the asset offers.
-- **Bottom panel** (Ctrl+J), with two tabs: **Search** and **Changes**.
+- **Bottom panel** (Ctrl+J), with three tabs: **Search** (within the open zone),
+  **Changes**, and **All Zones** (the cross-zone search, below).
 - **Status bar.** It shows the cursor or selection in the current view, then the zone
   name, the asset counts, whether the zone is signed and how many changes it has, and the
   backend.
@@ -91,6 +92,46 @@ by its own counts.
   patched out."
 - Closing a zone or the window with unsaved edits asks first.
 
+## Searching every zone
+
+The **Search** menu holds two searches. **Search in Zone** (Ctrl+Shift+F) is the per-zone
+Search tab above; **Search All Zones** (Ctrl+Shift+G, also the command palette) opens the
+**All Zones** tab, which searches every configured zone at once through `opent5.index`
+(`docs/search-index.md`).
+
+The query box carries the index's options: **Names only** (the fast path over asset names
+alone), **Match case**, **Regex**, a **kind** filter (asset name, script/rawfile, stringtable
+cell, localize value, entity string), a **type** box (one asset type) and a **zone glob**.
+Enter runs the search. Results are grouped by zone, each group showing the asset, its type,
+where it matched (a line, a row and column, or the value) and a snippet; the summary gives the
+match and zone counts and the query time. Double-click a result to open that zone (opening it
+in a new tab if it is not already one) and jump to the asset and the line or cell.
+
+The first search builds the on-disk index on a worker thread, with a determinate progress bar
+in the panel header; later searches reuse the cache and are instant. The index lives in the
+per-user cache directory, never in the repository or a game folder (`docs/search-index.md`).
+
+## Mod patches
+
+**File > Create Mod Patch...** and **File > Apply Mod Patch...** (also the command palette) wrap
+`opent5.patch` (`docs/patch-format.md`), so a zone edit can be shared as its difference from the
+stock zone without redistributing any game file. Both run on a worker thread.
+
+- **Create** asks whether to use the current zone as the edited side (or pick an edited `.ff`),
+  then asks for the matching stock `.ff`, and runs `opent5.patch.create`. The result dialog
+  (the Save-report style) lists the assets changed, the patch size, the stock and edited content
+  sizes, the content hashes, that the capture was replayed on a fresh stock copy and reproduces
+  the edited zone byte for byte, and the signature note. **Save Patch As...** writes the
+  `.o5patch`.
+- **Apply** asks for a `.o5patch`, the user's own stock `.ff`, and a Save-As location for the
+  output, then runs `opent5.patch.apply`. The dialog shows the source check (expected vs found
+  content sha1), whether it reproduces the edited zone and verified, the assets changed, the
+  output path and size, any repack note, and the signature note. A stock zone whose content sha1
+  does not match the patch is refused with expected vs found, shown in a clear dialog.
+
+Patches never write into the game folders, and apply always writes a new file through Save As to
+a chosen location (never the stock source).
+
 ## Keyboard
 
 The command palette (Ctrl+Shift+P) lists every action with its shortcut, plus the actions
@@ -104,6 +145,7 @@ for asset names. Help > Keyboard Shortcuts (F1) shows the full list.
 | Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y | Undo, redo |
 | Ctrl+P, Ctrl+Shift+P | Quick open asset, command palette |
 | Ctrl+Shift+F | Search in zone (names, rawfile text, stringtable cells, localize values) |
+| Ctrl+Shift+G | Search all configured zones (the cross-zone index) |
 | Ctrl+Shift+D, Ctrl+J | Changes panel, toggle the bottom panel |
 | Ctrl+1, Ctrl+L | Focus the asset tree, the asset filter |
 | Ctrl+Tab, Ctrl+Shift+Tab | Next, previous zone |
@@ -160,6 +202,9 @@ into `out/screenshots/`, which git ignores. It takes about 35 s:
 | `21_image_resize_dark`, `21_image_resize_changes_dark` | mp_nuked's male mannequin head (streamed, 128 x 256) imported at 256 x 512, and the Changes panel with the new size, the parts and the entry added (nothing is saved) |
 | `22_shared_tree_dark` | code_post_gfx_mp after a share="all" edit of `MPUI_PLAYER_MATCH_CAPS` made from the Fields view: both keys marked in the tree |
 | `23_thumbnails_dark`, `23_thumbnails_light` | the asset tree's image thumbnails and per-type icons, at mp_nuked's streamed colour maps |
+| `24_global_search_dark`, `24_global_search_light` | the All Zones search panel, results grouped by zone |
+| `25_create_patch_dark` | the create-mod-patch result dialog |
+| `26_apply_patch_dark` | the apply-mod-patch result dialog |
 
 ## Tests
 
@@ -179,6 +224,12 @@ the wireframe fallback when GL is missing, and, slow-marked, the shaded Nuketown
 `test_gui_core.py` covers the per-type icons and the tree's thumbnail scaling and lazy
 requests. They are plain pytest with an offscreen QApplication (pytest-qt is not used); the
 fast ones take a few seconds in total.
+`tests/test_gui_search.py` covers the cross-zone search panel: the results tree grouped by
+zone, a double-click emitting an open request, and `run_search` calling the `opent5.index`
+API (build then search) with the header's options, over a fake index.
+`tests/test_gui_patch.py` covers the create- and apply-patch dialogs built from fake result
+objects, and the `patchops` worker wrappers calling `opent5.patch.create` / `apply` with the
+right arguments.
 
 ## Open items
 

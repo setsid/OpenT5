@@ -32,9 +32,15 @@ import opent5
 from opent5 import env
 from opent5.gui import icons, theme
 from opent5.gui.backend import EditError, SaveReport, ZoneDoc
-from opent5.gui.dialogs import AboutDialog, SaveReportDialog, ShortcutsDialog
+from opent5.gui.dialogs import (
+    AboutDialog,
+    ApplyPatchResultDialog,
+    CreatePatchResultDialog,
+    SaveReportDialog,
+    ShortcutsDialog,
+)
 from opent5.gui.palette import Item, Palette
-from opent5.gui.panels import ChangesPanel, SearchPanel
+from opent5.gui.panels import ChangesPanel, GlobalSearchPanel, SearchPanel
 from opent5.gui.strips import LoadingPage
 from opent5.gui.tree import human_size
 from opent5.gui.zonepage import VIEWS, ZonePage
@@ -215,10 +221,14 @@ class MainWindow(QMainWindow):
         self.search.jump.connect(self._jump_hit)
         self.changes = ChangesPanel()
         self.changes.jump.connect(self._jump_change)
+        self.gsearch = GlobalSearchPanel()
+        self.gsearch.search_requested.connect(self._run_global_search)
+        self.gsearch.open_hit.connect(self._open_global_hit)
         self.bottom = QTabWidget()
         self.bottom.setDocumentMode(True)
         self.bottom.addTab(self.search, "Search")
         self.bottom.addTab(self.changes, "Changes")
+        self.bottom.addTab(self.gsearch, "All Zones")
 
         self.centre = QSplitter(Qt.Orientation.Vertical)
         self.centre.setHandleWidth(1)
@@ -288,10 +298,15 @@ class MainWindow(QMainWindow):
         )
         self.a_save = A("File", "Save", self.save, QKeySequence.StandardKey.Save, "save")
         self.a_save_as = A("File", "Save As...", self.save_as, "Ctrl+Shift+S", "save")
+        self.a_create_patch = A("File", "Create Mod Patch...", self.create_patch)
+        self.a_apply_patch = A("File", "Apply Mod Patch...", self.apply_patch)
         self.a_quit = A("File", "Quit", self.close, QKeySequence.StandardKey.Quit)
         self.a_undo = A("Edit", "Undo", self.undo, "Ctrl+Z", "undo")
         self.a_redo = A("Edit", "Redo", self.redo, ["Ctrl+Shift+Z", "Ctrl+Y"], "redo")
-        self.a_search = A("Edit", "Search in Zone", self.show_search, "Ctrl+Shift+F", "search")
+        self.a_search = A("Search", "Search in Zone", self.show_search, "Ctrl+Shift+F", "search")
+        self.a_gsearch = A(
+            "Search", "Search All Zones...", self.show_gsearch, "Ctrl+Shift+G", "search"
+        )
         self.a_quick = A("Go", "Quick Open Asset...", self.quick_open, "Ctrl+P")
         self.a_palette = A(
             "Go", "Command Palette...", self.command_palette, "Ctrl+Shift+P", "palette"
@@ -335,11 +350,13 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addActions([self.a_save, self.a_save_as])
         m.addSeparator()
+        m.addActions([self.a_create_patch, self.a_apply_patch])
+        m.addSeparator()
         m.addActions([self.a_close, self.a_quit])
         m = mb.addMenu("&Edit")
         m.addActions([self.a_undo, self.a_redo])
-        m.addSeparator()
-        m.addAction(self.a_search)
+        m = mb.addMenu("&Search")
+        m.addActions([self.a_search, self.a_gsearch])
         m = mb.addMenu("&View")
         tm = m.addMenu("Theme")
         tm.addActions([self.a_dark, self.a_light])
@@ -455,8 +472,9 @@ class MainWindow(QMainWindow):
                 self._open_async(path)
         return pages
 
-    def _open_async(self, path: Path) -> None:
+    def _open_async(self, path: Path, then=None) -> None:
         task = Task(lambda progress: ZoneDoc.open(path, progress))
+        task.then = then  # called with the ZonePage once it is a tab
         self._tasks.append(task)
         loading = LoadingPage(path)
         i = self.tabs.addTab(loading, f"{path.stem} (opening)")
@@ -491,8 +509,11 @@ class MainWindow(QMainWindow):
         current = self.tabs.currentWidget() is loading
         self.tabs.removeTab(at)
         loading.deleteLater()
-        self._add_doc(doc, at if at >= 0 else None, select=current)
+        page = self._add_doc(doc, at if at >= 0 else None, select=current)
         self.message(f"Opened {doc.zone_name}: {len(doc.refs)} assets in {doc.load_seconds:.1f} s")
+        then = getattr(task, "then", None)
+        if then is not None:
+            then(page)
 
     def _open_failed(self, task: Task, loading: LoadingPage, path: Path, err: str) -> None:
         self._tasks.remove(task)
@@ -860,6 +881,160 @@ class MainWindow(QMainWindow):
         self._update_state()
         self.message(f"Discarded {n} edit{'s' if n != 1 else ''}", 4000)
 
+    # -- mod patches ------------------------------------------------------------------------
+
+    def _patch_dir(self) -> str:
+        return self.settings.value("last_dir", "") or (
+            str(env.zone_dirs()[0]) if env.zone_dirs() else str(Path.home())
+        )
+
+    def _refuses_game_folder(self, path: Path) -> bool:
+        """True (and warns) when ``path`` is inside a configured game folder; never write there."""
+        for folder in env.zone_dirs():
+            try:
+                path.resolve().relative_to(folder.resolve())
+            except ValueError:
+                continue
+            QMessageBox.warning(
+                self,
+                "Refused",
+                f"Refusing to write into the game folder:\n{folder}\n\nChoose another location.",
+            )
+            return True
+        return False
+
+    def create_patch(self) -> None:
+        """Build a .o5patch from a stock zone and an edited one (docs/patch-format.md)."""
+        start = self._patch_dir()
+        page = self.page()
+        edited: Path | None = None
+        if page is not None:
+            answer = QMessageBox.question(
+                self,
+                "Create Mod Patch",
+                f"Use the current zone as the edited zone?\n\n{page.doc.zone_name}\n"
+                f"{page.doc.path}\n\nYes: diff it against a stock copy you choose.\n"
+                "No: pick an edited .ff instead.",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Cancel:
+                return
+            if answer == QMessageBox.StandardButton.Yes:
+                edited = page.doc.path
+        if edited is None:
+            picked, _ = QFileDialog.getOpenFileName(
+                self, "Pick the edited zone (.ff)", start, "Zones (*.ff)"
+            )
+            if not picked:
+                return
+            edited = Path(picked)
+        stock, _ = QFileDialog.getOpenFileName(
+            self, "Pick the stock (unmodified) zone (.ff)", start, "Zones (*.ff)"
+        )
+        if not stock:
+            return
+        self.settings.setValue("last_dir", str(Path(stock).parent))
+        from opent5.gui import patchops
+
+        self._run_patch_task(
+            "Creating patch",
+            lambda _progress: patchops.create_patch(Path(stock), edited),
+            self._patch_created,
+        )
+
+    def apply_patch(self) -> None:
+        """Apply a .o5patch to the user's own stock zone, always writing a new file."""
+        start = self._patch_dir()
+        patch_file, _ = QFileDialog.getOpenFileName(
+            self, "Open a mod patch (.o5patch)", start, "Mod patches (*.o5patch);;All files (*)"
+        )
+        if not patch_file:
+            return
+        stock, _ = QFileDialog.getOpenFileName(
+            self, "Pick your stock (unmodified) zone (.ff)", start, "Zones (*.ff)"
+        )
+        if not stock:
+            return
+        default_dir = self.settings.value("save_dir", "") or str(env.ROOT / "out")
+        suggestion = str(Path(default_dir) / f"{Path(stock).stem}_patched.ff")
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Save the patched zone as (a new file)", suggestion, "Zones (*.ff)"
+        )
+        if not out:
+            return
+        out_path = Path(out)
+        if out_path.resolve() == Path(stock).resolve() or self._refuses_game_folder(out_path):
+            return
+        self.settings.setValue("save_dir", str(out_path.parent))
+        from opent5.gui import patchops
+
+        self._run_patch_task(
+            "Applying patch",
+            lambda _progress: patchops.apply_patch(Path(patch_file), Path(stock), out_path),
+            self._patch_applied,
+        )
+
+    def _run_patch_task(self, busy: str, fn, on_done) -> None:
+        task = Task(fn)
+        self._tasks.append(task)
+        self.progress.setRange(0, 0)  # busy: create/apply report no fine-grained progress
+        self.progress.show()
+        self.message(f"{busy}...")
+
+        def finish() -> None:
+            if task in self._tasks:
+                self._tasks.remove(task)
+            if not self._tasks:
+                self.progress.hide()
+                self.progress.setRange(0, 100)
+            self.message("")
+
+        task.signals.done.connect(lambda result: (finish(), on_done(result)))
+        task.signals.failed.connect(lambda err: (finish(), self._patch_failed(err)))
+        self.pool.start(task)
+
+    def _patch_failed(self, err: str) -> None:
+        self.message("Patch failed")
+        QMessageBox.warning(self, "Patch could not be completed", err)
+
+    def _patch_created(self, result) -> None:
+        self.message(f"Patch built: {len(result.changes)} asset(s), {result.patch_bytes:,} bytes")
+
+        def save(dialog) -> None:
+            from opent5.gui import patchops
+
+            default_dir = self.settings.value("save_dir", "") or str(env.ROOT / "out")
+            suggestion = str(Path(default_dir) / f"{result.source_zone}.o5patch")
+            out, _ = QFileDialog.getSaveFileName(
+                dialog, "Save mod patch as", suggestion, "Mod patches (*.o5patch)"
+            )
+            if not out:
+                return
+            out_path = Path(out)
+            if self._refuses_game_folder(out_path):
+                return
+            self.settings.setValue("save_dir", str(out_path.parent))
+            n = patchops.save_patch(result, out_path)
+            self.message(f"Wrote {out_path.name} ({n:,} bytes)", 5000)
+
+        dialog = CreatePatchResultDialog(result, on_save=save, parent=self)
+        if self.modal_reports:
+            dialog.exec()
+        else:
+            dialog.show()
+
+    def _patch_applied(self, result) -> None:
+        where = Path(result.output).name if result.output else "(not written)"
+        self.message(f"Patch applied to {result.source_zone} -> {where}")
+        dialog = ApplyPatchResultDialog(result, parent=self)
+        if self.modal_reports:
+            dialog.exec()
+        else:
+            dialog.show()
+
     # -- view options -----------------------------------------------------------------------
 
     def _set_format(self, on: bool) -> None:
@@ -918,6 +1093,11 @@ class MainWindow(QMainWindow):
         self.bottom.setCurrentWidget(self.search)
         self.search.focus()
 
+    def show_gsearch(self) -> None:
+        self.bottom.show()
+        self.bottom.setCurrentWidget(self.gsearch)
+        self.gsearch.focus()
+
     def show_changes(self) -> None:
         self.bottom.show()
         self.bottom.setCurrentWidget(self.changes)
@@ -944,6 +1124,80 @@ class MainWindow(QMainWindow):
         ref = page.doc.ref(change.key) if page else None
         if ref is not None:
             page.open_ref(ref)
+
+    # -- cross-zone search ------------------------------------------------------------------
+
+    def _run_global_search(self, params) -> None:
+        from opent5.gui import panels
+
+        self.gsearch.begin_progress()
+        task = Task(
+            lambda progress: panels.run_search(
+                params, progress=lambda done, total: progress(f"Indexing {done}/{total}", 0.0)
+            )
+        )
+        self._tasks.append(task)
+        self.progress.setRange(0, 0)  # busy while the (first) build runs
+        self.progress.show()
+        self.message("Searching all zones...")
+
+        def finish() -> None:
+            if task in self._tasks:
+                self._tasks.remove(task)
+            if not self._tasks:
+                self.progress.hide()
+                self.progress.setRange(0, 100)
+
+        task.signals.progress.connect(lambda _m, _f: None)
+        task.signals.done.connect(lambda result: (finish(), self._global_done(result)))
+        task.signals.failed.connect(lambda err: (finish(), self.gsearch.set_error(err)))
+        self.pool.start(task)
+
+    def _global_done(self, result) -> None:
+        self.gsearch.set_result(result)
+        self.message(f"{result.total} matches across {result.zones_searched} zones", 4000)
+
+    def _open_global_hit(self, hit) -> None:
+        path = Path(hit.zone_path)
+        page = self._page_for(path)
+        if isinstance(page, ZonePage):
+            self.tabs.setCurrentWidget(page)
+            self._jump_global(page, hit)
+        elif page is None:
+            self._open_async(path, then=lambda p: self._jump_global(p, hit))
+
+    def _jump_global(self, page: ZonePage, hit) -> None:
+        ref = self._ref_for_hit(page, hit)
+        if ref is None:
+            self.message(f"{hit.zone}: could not find {hit.type_name} {hit.asset_name}", 4000)
+            return
+        kind = {
+            "rawfile": "text",
+            "entities": "text",
+            "cell": "table",
+            "localize": "localize",
+        }.get(hit.kind)
+        page.open_ref(ref, kind)
+        view = page.current_view()
+        if hit.kind in ("rawfile", "entities") and hasattr(view, "go_to"):
+            view.go_to(hit.line or 1, 0)
+            view.editor.setFocus()
+        elif hit.kind == "cell" and hasattr(view, "select_cell"):
+            view.select_cell(hit.row or 0, hit.column or 0)
+
+    @staticmethod
+    def _ref_for_hit(page: ZonePage, hit):
+        ref = hit.asset_ref or ""
+        if ref and not ref.startswith("inline:"):
+            try:
+                found = page.doc.ref(int(ref))
+            except ValueError:
+                found = None
+            if found is not None:
+                return found
+        if hit.asset_name:
+            return page.find_ref(hit.asset_name, hit.type_name)
+        return None
 
     # -- palette ----------------------------------------------------------------------------
 

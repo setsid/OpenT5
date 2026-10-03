@@ -181,8 +181,6 @@ def test_nuked_shaded_world_not_blank():
     image = view.canvas.render_image()
     bg = theme.current().color("base").rgb()
     colours = {
-        image.pixel(x, y)
-        for x in range(0, image.width(), 8)
-        for y in range(0, image.height(), 8)
+        image.pixel(x, y) for x in range(0, image.width(), 8) for y in range(0, image.height(), 8)
     }
     assert len(colours) > 40 and image.pixel(320, 300) != bg

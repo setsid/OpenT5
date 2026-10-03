@@ -150,6 +150,151 @@ class SaveReportDialog(QDialog):
         self.resize(640, 0)
 
 
+def _sha(value: str) -> str:
+    return value or "(none)"
+
+
+def _changes_box(changes) -> QPlainTextEdit:
+    """A monospace list of the assets a patch changes: index, type, op, name, size."""
+    lines = [
+        f"{c.index:>6}  {c.type_name:<14} {c.op:<9} {(c.name or ''):<40} {c.size:>8} bytes"
+        for c in changes
+    ]
+    box = QPlainTextEdit("\n".join(lines))
+    box.setObjectName("ReportBody")
+    box.setReadOnly(True)
+    box.setFont(theme.mono_font())
+    box.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+    # size to the content, up to ten rows, leaving room for the horizontal scrollbar so the
+    # last change is not clipped by it
+    rows = min(max(len(lines), 1), 10)
+    scrollbar = box.horizontalScrollBar().sizeHint().height()
+    box.setFixedHeight(box.fontMetrics().lineSpacing() * rows + scrollbar + 14)
+    return box
+
+
+def _notice(text: str) -> QLabel:
+    note = QLabel(text)
+    note.setObjectName("Notice")
+    note.setWordWrap(True)
+    return note
+
+
+class CreatePatchResultDialog(QDialog):
+    """What ``opent5.patch.create`` produced, with a button to save the .o5patch."""
+
+    def __init__(self, result, on_save=None, parent=None):
+        super().__init__(parent)
+        self.result = result
+        self.setWindowTitle("Mod patch created")
+        head = QLabel("Mod patch created")
+        f = head.font()
+        f.setPointSize(f.pointSize() + 2)
+        head.setFont(f)
+        rows = [
+            ("Source zone", result.source_zone),
+            ("Assets changed", str(len(result.changes))),
+            ("Patch size", f"{result.patch_bytes:,} bytes"),
+            ("Stock content", f"{result.source_bytes:,} bytes"),
+            ("Edited content", f"{result.edited_bytes:,} bytes"),
+            (
+                "Reproduces the edited zone",
+                "yes: the capture was replayed on a fresh stock copy and matched byte for byte",
+            ),
+            ("Source .ff sha1", _sha(result.source_ff_sha1)),
+            ("Stock content sha1", _sha(result.source_content_sha1)),
+            ("Result content sha1", _sha(result.result_content_sha1)),
+        ]
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(3)
+        for i, (k, v) in enumerate(rows):
+            grid.addWidget(_key(k), i, 0, Qt.AlignmentFlag.AlignTop)
+            grid.addWidget(_val(v, wrap=True), i, 1)
+        grid.setColumnStretch(1, 1)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 12)
+        lay.setSpacing(10)
+        lay.addWidget(head)
+        lay.addLayout(grid)
+        lay.addWidget(_key(f"Changed assets ({len(result.changes)})"))
+        lay.addWidget(_changes_box(result.changes))
+        if result.signature_note:
+            lay.addWidget(_notice(result.signature_note))
+        buttons = QDialogButtonBox()
+        if on_save is not None:
+            save = buttons.addButton("Save Patch As...", QDialogButtonBox.ButtonRole.ActionRole)
+            save.clicked.connect(lambda: on_save(self))
+        close = buttons.addButton(QDialogButtonBox.StandardButton.Close)
+        close.clicked.connect(self.reject)
+        lay.addWidget(buttons)
+        self.resize(680, 0)
+
+
+class ApplyPatchResultDialog(QDialog):
+    """What ``opent5.patch.apply`` produced: the source check, what it wrote, the signature."""
+
+    def __init__(self, result, parent=None):
+        super().__init__(parent)
+        self.result = result
+        self.setWindowTitle("Mod patch applied")
+        matched = result.found_content_sha1 == result.expected_content_sha1
+        ok = result.verified and result.reproduces_target and not result.problems
+        head = QLabel("Patch applied and verified" if ok else "Patch applied, with problems")
+        f = head.font()
+        f.setPointSize(f.pointSize() + 2)
+        head.setFont(f)
+        rows = [
+            ("Source zone", result.source_zone),
+            (
+                "Source verified",
+                "yes: your stock content sha1 matches the patch"
+                if matched
+                else "no: the stock content sha1 does not match the patch",
+            ),
+            ("Expected content sha1", _sha(result.expected_content_sha1)),
+            ("Found content sha1", _sha(result.found_content_sha1)),
+            ("Reproduces the edited zone", "yes" if result.reproduces_target else "no"),
+            ("Verified", "yes" if result.verified else "no"),
+            ("Assets changed", str(len(result.changes))),
+            ("Output", result.output or "(nothing written)"),
+        ]
+        if result.output:
+            rows.append(("Output size", f"{result.output_bytes:,} bytes"))
+            if result.output_sha1:
+                rows.append(("Output sha1", result.output_sha1))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(3)
+        for i, (k, v) in enumerate(rows):
+            grid.addWidget(_key(k), i, 0, Qt.AlignmentFlag.AlignTop)
+            grid.addWidget(_val(v, wrap=True), i, 1)
+        grid.setColumnStretch(1, 1)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 12)
+        lay.setSpacing(10)
+        lay.addWidget(head)
+        lay.addLayout(grid)
+        lay.addWidget(_key(f"Changed assets ({len(result.changes)})"))
+        lay.addWidget(_changes_box(result.changes))
+        for note in result.notes:
+            lay.addWidget(_notice(note))
+        if result.signature_note:
+            lay.addWidget(_notice(result.signature_note))
+        if result.problems:
+            box = QPlainTextEdit("\n".join(result.problems))
+            box.setObjectName("ReportBody")
+            box.setReadOnly(True)
+            box.setFont(theme.mono_font())
+            box.setMaximumHeight(140)
+            lay.addWidget(_key(f"Problems ({len(result.problems)})"))
+            lay.addWidget(box)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        lay.addWidget(buttons)
+        self.resize(680, 0)
+
+
 class ShortcutsDialog(QDialog):
     """Every shortcut, grouped, in two columns."""
 

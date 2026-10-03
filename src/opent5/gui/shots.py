@@ -373,6 +373,92 @@ class Shooter:
             self.shot("15_shortcuts_dark", d)
             d.close()
 
+        if self.wanted("24_global_search"):
+            self.global_search()
+        if self.wanted("25_create_patch") or self.wanted("26_apply_patch"):
+            self.patch_dialogs()
+
+    def global_search(self) -> None:
+        """The cross-zone search panel with results grouped by zone, in both themes. The
+        index is built (changed zones only) against the configured zones, then searched."""
+        from opent5.gui import panels
+
+        win = self.win
+        win.show_gsearch()
+        panel = win.gsearch
+        panel.query.setText("killstreak")
+        try:
+            result = panels.run_search(panel.current_params())
+        except Exception as exc:  # noqa: BLE001 - a screenshot must not crash the run
+            print(f"  skip: 24_global_search build failed: {exc}")
+            return
+        for t in ("dark", "light"):
+            self.theme(t)
+            panel.set_result(result)  # re-paint the zone rows in the current theme's accent
+            settle(self.app, 0.2)
+            self.shot(f"24_global_search_{t}")
+        self.theme("dark")
+        win.bottom.hide()
+
+    def patch_dialogs(self) -> None:
+        """The create-patch result dialog and the apply-patch dialog, from representative
+        result objects (building a real patch needs a stock and an edited .ff pair)."""
+        import hashlib
+
+        from opent5.gui.dialogs import ApplyPatchResultDialog, CreatePatchResultDialog
+        from opent5.patch.core import ApplyResult, ChangeInfo, CreateResult
+
+        def h(seed: bytes) -> str:
+            return hashlib.sha1(seed).hexdigest()
+
+        changes = [
+            ChangeInfo(95, "localize", "CGAME_SB_ACCURACY", "localize", 15),
+            ChangeInfo(471, "stringtable", "mp/killstreaktable.csv", "table", 1842),
+            ChangeInfo(1180, "rawfile", "maps/mp/gametypes/_globallogic.gsc", "text", 8711),
+        ]
+        create = CreateResult(
+            patch=b"O5PATCH\x00" + bytes(10589),
+            source_zone="patch_mp",
+            source_ff_sha1=h(b"ff"),
+            source_content_sha1=h(b"stock"),
+            result_content_sha1=h(b"edited"),
+            signed=True,
+            changes=changes,
+            source_bytes=3715811,
+            edited_bytes=3726408,
+        )
+        if self.wanted("25_create_patch"):
+            d = CreatePatchResultDialog(create, on_save=lambda _dlg: None, parent=self.win)
+            d.show()
+            self.shot("25_create_patch_dark", d)
+            d.close()
+        if self.wanted("26_apply_patch"):
+            apply_res = ApplyResult(
+                source_zone="patch_mp",
+                expected_ff_sha1=h(b"ff"),
+                expected_content_sha1=h(b"stock"),
+                found_ff_sha1=h(b"repacked"),
+                found_content_sha1=h(b"stock"),
+                verified=True,
+                changes=changes,
+                output="out/patch_mp.ff",
+                output_bytes=1196064,
+                output_sha1=h(b"out"),
+                signature_note=(
+                    "The rebuilt zone changed its content, so its console signature no longer "
+                    "matches: it loads only on a client with the signature check patched out."
+                ),
+                reproduces_target=True,
+                notes=[
+                    "the stock .ff sha1 differs from the patch's, but its decompressed content "
+                    "matches, so the result is still reproduced exactly (the .ff was repacked)."
+                ],
+            )
+            d = ApplyPatchResultDialog(apply_res, parent=self.win)
+            d.show()
+            self.shot("26_apply_patch_dark", d)
+            d.close()
+
     def shared_strings(self) -> None:
         """code_post_gfx_mp opened the way a user does (worker thread, loading page captured
         mid-load), then the localize view on a key that shares its string, and the choice

@@ -374,6 +374,7 @@ TYPE_ICONS = {
 def type_icon(type_name: str) -> QIcon:
     return icon(TYPE_ICONS.get(type_name, "asset"))
 
+
 _cache: dict[tuple[str, str, str], QIcon] = {}
 
 
