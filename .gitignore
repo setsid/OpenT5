@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+build/
+dist/
+out/
+*.egg-info/
+# Game data never enters the repo.
+*.ff
+*.self
+*.elf
+*.wad
+*.pcap
+*.pak
+*.sabs
+*.sabl
+*.bik
+*.pkg
+*.dds
+extracted/

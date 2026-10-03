@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools==75.8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opent5"
+version = "0.1.0"
+description = "Open, browse, edit and rebuild Black Ops (T5) PS3 fastfiles"
+requires-python = ">=3.10"
+dependencies = ["numpy==2.2.6"]
+
+[project.scripts]
+opent5 = "opent5.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+markers = ["zones: needs the real zones named in .env", "slow: takes minutes"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests", "tools"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
