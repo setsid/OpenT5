@@ -3,10 +3,11 @@
 Icons are drawn on a 16-unit grid with a 1.2-unit pen in the theme's text
 colour, so they follow the theme. ``icon(name)`` is cached per theme.
 
-The application mark (``resources/opent5.svg``) is a filled square with a
-bevelled corner and a geometric "T5" cut out of it; ``write_app_icon`` renders
-it with Qt to PNGs at 16, 24, 32, 48, 64 and 256 px and writes them into
-``opent5.ico`` (PNG-compressed ICO entries).
+The application mark (``resources/opent5.svg``) is the zone reader's 0x60000-byte
+read ring drawn as eight 0xC000 slots in a square, the top slot sunk inward: the
+chunk being pulled out to decrypt and inflate. It is drawn on two hand-aligned
+grids, 16 units for small sizes and 64 for large, and ``write_app_icon`` renders
+both into ``opent5.ico`` (PNG-compressed entries at 16, 24, 32, 48, 64, 256 px).
 """
 
 from __future__ import annotations
@@ -24,48 +25,40 @@ APP_SVG = RESOURCES / "opent5.svg"
 APP_ICO = RESOURCES / "opent5.ico"
 ICO_SIZES = (16, 24, 32, 48, 64, 256)
 
-#: The mark on a 64 grid: square with the bottom-right corner bevelled, and a
-#: T and a 5 cut out (even-odd fill).
-MARK_SQUARE = [(4, 4), (60, 4), (60, 50), (50, 60), (4, 60)]
-MARK_T = [(12, 14), (30, 14), (30, 20), (24, 20), (24, 50), (18, 50), (18, 20), (12, 20)]
-MARK_5 = [
-    (34, 14),
-    (52, 14),
-    (52, 20),
-    (40, 20),
-    (40, 29),
-    (52, 29),
-    (52, 50),
-    (34, 50),
-    (34, 44),
-    (46, 44),
-    (46, 35),
-    (34, 35),
-]
+#: The mark as (x, y, w, h) rectangles. MARK_SMALL is aligned to a 16-unit grid and used
+#: at whole-pixel scales (16, 32, 48 px) so every edge lands on a pixel; MARK_LARGE is the
+#: 64-unit refinement used at 24, 64 and 256 px.
+MARK_SMALL = [
+    (0, 0, 4, 4), (12, 0, 4, 4), (0, 12, 4, 4), (12, 12, 4, 4),
+    (0, 5, 4, 6), (12, 5, 4, 6), (5, 12, 6, 4), (5, 3, 6, 4),
+]  # fmt: skip
+MARK_LARGE = [
+    (2, 2, 15, 15), (47, 2, 15, 15), (2, 47, 15, 15), (47, 47, 15, 15),
+    (2, 20, 15, 24), (47, 20, 15, 24), (20, 47, 24, 15), (20, 14, 24, 15),
+]  # fmt: skip
 MARK_COLOUR = "#c4a062"
 
 
-def _svg_poly(points) -> str:
-    return "M" + " L".join(f"{x} {y}" for x, y in points) + " Z"
+def _grid(size: int) -> tuple[list, int]:
+    return (MARK_SMALL, 16) if size % 16 == 0 and size <= 48 else (MARK_LARGE, 64)
 
 
 def app_svg(colour: str = MARK_COLOUR) -> str:
-    d = " ".join(_svg_poly(p) for p in (MARK_SQUARE, MARK_T, MARK_5))
+    d = "".join(f"M{x} {y}h{w}v{h}h-{w}z" for x, y, w, h in MARK_LARGE)
     return (
-        '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">\n'
-        f'  <path fill="{colour}" fill-rule="evenodd" d="{d}"/>\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" '
+        'shape-rendering="crispEdges">\n'
+        f'  <path fill="{colour}" d="{d}"/>\n'
         "</svg>\n"
     )
 
 
-def mark_path(scale: float = 1.0) -> QPainterPath:
+def mark_path(size: int) -> QPainterPath:
+    rects, grid = _grid(size)
+    scale = size / grid
     path = QPainterPath()
-    path.setFillRule(Qt.FillRule.OddEvenFill)
-    for poly in (MARK_SQUARE, MARK_T, MARK_5):
-        path.moveTo(poly[0][0] * scale, poly[0][1] * scale)
-        for x, y in poly[1:]:
-            path.lineTo(x * scale, y * scale)
-        path.closeSubpath()
+    for x, y, w, h in rects:
+        path.addRect(QRectF(x * scale, y * scale, w * scale, h * scale))
     return path
 
 
@@ -73,8 +66,9 @@ def render_mark(size: int, colour: str = MARK_COLOUR) -> QImage:
     image = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(Qt.GlobalColor.transparent)
     p = QPainter(image)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing, size >= 32)
-    p.fillPath(mark_path(size / 64.0), QColor(colour))
+    # Small-grid sizes are whole-pixel aligned; antialiasing would only blur them.
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, _grid(size)[1] == 64)
+    p.fillPath(mark_path(size), QColor(colour))
     p.end()
     return image
 
