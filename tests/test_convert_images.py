@@ -65,6 +65,7 @@ def test_name_hash_matches_stock_images():
 
 
 @pytest.mark.zones
+@pytest.mark.slow
 def test_pc_nuked_images_equal_ps3_nuked():
     from opent5.container.zone import Zone
     from opent5.convert import pc as pcmod

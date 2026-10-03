@@ -5,8 +5,10 @@ Strategy (docs/research/box-map.md 4.2, docs/convert.md): keep a stock PS3 map z
 materials, images and their .pak, configstring tables, sound banks, texture list), and
 replace its world: com_map, gfx_map, game_map_mp and col_map_mp with its map_ents, under
 the base's names. The base's map scripts are cut down to what a minimal map needs, its
-glass panes are removed, and its lightdef keeps its own name. Everything is written by the
-product writer and every offset pointer remapped (``splice.Splice``).
+glass panes are removed, and its lightdef keeps its own name. Materials the base lacks are
+built into the map's zone (``materials``), static models place the base's XModels by name
+(``smodels``), and every gametype's objectives are checked (``entities``). Everything is
+written by the product writer and every offset pointer remapped (``splice.Splice``).
 """
 
 from __future__ import annotations
@@ -18,8 +20,10 @@ from pathlib import Path
 
 from opent5.container.fastfile import OFFSET_ZONE_NAME, ZONE_NAME_SIZE
 from opent5.container.zone import Zone
-from opent5.convert import compass, mapname, world
+from opent5.convert import compass, mapname, smodels, world
+from opent5.convert import entities as ent
 from opent5.convert import lighting as lit
+from opent5.convert import materials as mats
 from opent5.convert import pc as pcmod
 from opent5.convert import scripts as sc
 from opent5.convert.splice import BASE, FOREIGN, Splice
@@ -37,7 +41,7 @@ WORLD_TYPES = (
     AssetType.COL_MAP_MP,
 )
 LIGHTING = ("baked", "flat", "sunlit", "keep")
-GAMETYPES = ("dm", "sab", "sd", "tdm", "ctf", "koth", "dom", "dem", "hlnd", "oic", "gun", "shrp")
+GAMETYPES = ent.GAMETYPES
 
 
 @dataclass
@@ -73,18 +77,31 @@ def convert_map(
     progress=None,
     name: str | None = None,
     with_compass: bool = True,
+    image_roots=(),
+    shared_zones=None,
+    force_materials: frozenset[str] | bool = frozenset(),
+    overrides: dict | None = None,
 ) -> ConvertResult:
     """Convert. ``pc_fastfile``: the PC ``.ff`` bytes (``IWffu100``); ``base_path``: the
     stock PS3 map zone whose world is replaced. ``lighting``: "baked" (the PC map's own
     cod2rad lightmaps, probes and outdoor image, ``lightmaps``), or "flat", "sunlit", "keep"
-    (the base's lightmaps, ``lighting``). ``require``: gametypes whose spawns must be in the
-    map. ``compat``: add the entities the base map's stock script needs
+    (the base's lightmaps, ``lighting``). ``require``: gametypes that must be ready
+    (``entities.check``: spawns and objectives); the others are reported only.
+    ``compat``: add the entities the base map's stock script needs
     (``scripts.COMPAT_ENTITIES``); default: only when the map keeps the base's name.
     ``name``: the map's own name (zone ``<name>.ff``, ``mapname.validate`` rules); None
     keeps the base's name. ``with_compass``: add the compass material and image
-    (``compass``)."""
+    (``compass``). ``image_roots``: PC game folders holding the ``.iwi`` of materials the
+    base lacks; ``shared_zones``: the always-loaded zones whose images a new material
+    references by placeholder (default: code_post_gfx_mp and common_mp beside the base or
+    in .env); ``force_materials``: material names (or True) built anew even when the base
+    has them; ``overrides``: image name -> RGBA drawn instead of the PC pixels
+    (``materials.convert_materials``)."""
     if lighting not in LIGHTING:
         raise ConvertError(f"lighting: expected one of {LIGHTING}, found {lighting!r}")
+    unknown = [g for g in require if g not in GAMETYPES]
+    if unknown:
+        raise ConvertError(f"gametypes: expected some of {GAMETYPES}, found {unknown}")
     report: dict = {"assets": {}, "notes": []}
     _progress(progress, "Reading the PC zone")
     pc_content = pcmod.read_pc_fastfile(pc_fastfile)
@@ -129,12 +146,27 @@ def convert_map(
     _progress(progress, "Converting the world")
     stock_words = world.stock_material_words(stock_gfx)
     pc_names = [world.surface_material_name(e) for e in pgfx.get("surfaces") or []]
-    missing = sorted({n for n in pc_names if n not in stock_words}, key=str)
-    if missing:
-        raise ConvertError(
-            f"materials {missing}: not used by any world surface of {base_path.name}; the "
-            "converter reuses the base zone's PS3 materials by name (docs/convert.md)"
-        )
+    if force_materials is True:
+        new_names = set(pc_names)
+    else:
+        new_names = {n for n in pc_names if n not in stock_words or n in force_materials}
+    shared: set[str] = set()
+    if new_names:
+        if shared_zones is None:
+            shared_zones = _shared_zone_paths(base_path)
+        shared = mats.shared_image_names(shared_zones)
+    mres = mats.convert_materials(
+        pgfx,
+        stock_gfx,
+        base,
+        files=mats.ImageFiles(image_roots),
+        shared_images=shared,
+        force=force_materials,
+        overrides=overrides,
+    )
+    report["materials"] = mres.report
+    own_materials = {n for n, s in mres.sources.items() if s == "foreign"}
+    taken = smodels.take(pgfx)
     donors = None
     sun: dict = {}
     if lighting in ("flat", "sunlit") and pc_names:
@@ -147,41 +179,45 @@ def convert_map(
         for d in decoded:
             if d.rgba is None:
                 raise ConvertError(f"lighting: a base lightmap does not decode ({d.reason})")
-        donors = lit.find_donors(stock_gfx, decoded[1].rgba, set(pc_names))
+        lit_names = set(pc_names) - own_materials
+        donors = lit.find_donors(stock_gfx, decoded[1].rgba, lit_names)
         if lighting == "sunlit":
             sun = lit.find_donors(
-                stock_gfx, decoded[1].rgba, set(pc_names), decoded[0].rgba, True, True
+                stock_gfx, decoded[1].rgba, lit_names, decoded[0].rgba, True, True
             )
             donors.update(sun)
-            for name in sorted(set(pc_names) - set(sun), key=str):
+            for name in sorted(lit_names - set(sun), key=str):
                 report["notes"].append(f"lighting: no sunlit even patch of {name}; flat donor kept")
+        _own_donors(donors, own_materials, stock_gfx, decoded[1].rgba, report["notes"])
         image = images[1]
         report["lighting"] = {
             "mode": lighting,
             "image": image.get("name"),
             "donors": {
-                d.material: {
+                material: {
+                    "stock_material": d.material,
                     "stock_surface": d.surface,
                     "stock_vertex": d.vertex,
                     "lightmap_uv": [round(d.uv[0], 6), round(d.uv[1], 6)],
                     "secondary_luminance": round(d.luminance, 1),
                     "lightmap_index": d.light[0],
-                    "sunlit": lighting == "sunlit" and d.material in sun,
+                    "sunlit": lighting == "sunlit" and material in sun,
                     "reflection_probe_index": d.light[1],
                 }
-                for d in donors.values()
+                for material, d in donors.items()
             },
         }
     else:
         report["lighting"] = {"mode": lighting}
 
     words = {name: w for name, (w, _) in stock_words.items()}
+    words.update(mres.words)
     gres = world.convert_gfx(pgfx, stock_gfx, words, baked=lighting == "baked")
     report["notes"] += gres.notes
     report["lighting"].update(gres.lighting)
     surfaces = gres.node["surfaces"] or []
     for element, name in zip(surfaces, pc_names, strict=True):
-        element["material"] = stock_words[name][1]
+        element["material"] = None if name in own_materials else stock_words[name][1]
     if donors is not None and surfaces:
         layer = bytearray(gres.node["vertex_layer_data"])
         strides = {g.first: (g.layer, g.stride) for g in gres.groups}
@@ -192,6 +228,10 @@ def convert_map(
     world.convert_com(pcom)
     world.convert_game(pgame)
     world.convert_clip(pclip)
+    model_words = smodels.model_words(bx)
+    sres = smodels.convert_static_models(taken, model_words, foreign.xfile)
+    clip_models = smodels.repoint_clip(pclip, model_words, foreign.xfile)
+    report["static_models"] = {**sres.report, "collision": len(clip_models)}
 
     # Names: the base's, or the map's own (the game finds the world as
     # maps/mp/<mapname>.d3dbsp, 0x4b5370).
@@ -253,17 +293,20 @@ def convert_map(
         text += sc.entity_text(added, newline)
         ents["header"], ents["entity_string"] = mapents_bytes(ents, text)
     entities = sc.parse_entities(text)
-    ready = sc.gametype_report(entities, list(GAMETYPES))
+    objectives = ent.zone_report(entities, pclip, bx, own or base_name)
+    report["objectives"] = objectives
     report["entities"] = {
         "added_for_the_stock_script": compat_added,
         "minimap_corners": {"north_west": list(nw), "south_east": list(se), "source": corner_note},
         "count": len(entities),
         "classes": _count(e.get("classname") for e in entities),
     }
-    report["gametypes"] = {g: ("ready" if not m else {"missing": m}) for g, m in ready.items()}
+    report["gametypes"] = {
+        g: ("ready" if r["ready"] else {"missing": r["missing"]}) for g, r in objectives.items()
+    }
     for g in require:
-        if ready.get(g):
-            raise ConvertError(f"gametype {g}: the map lacks {ready[g]}")
+        if not objectives[g]["ready"]:
+            raise ConvertError(f"gametype {g}: " + "; ".join(objectives[g]["missing"]))
 
     # The lightdef's name pointed into the replaced ComWorld: make it its own.
     for a in bx.by_type(AssetType.LIGHTDEF):
@@ -294,7 +337,7 @@ def convert_map(
         if a.name and a.name.endswith((".gsc", ".csc")):
             texts[a.name] = rawfile_text(a.data)
             nodes[a.name] = a
-    plan = sc.plan_scripts(base_name, texts)
+    plan = sc.plan_scripts(base_name, texts, own_map=renamed)
     changed = {}
     for name, new in plan.texts.items():
         a = nodes[name]
@@ -362,6 +405,8 @@ def convert_map(
         splice.origin(element, FOREIGN)
     if compass_node is not None:
         splice.origin(compass_node, BASE)
+    mats.attach(mres, pgfx, pc_names, surfaces, splice)
+    smodels.place(pgfx, pclip, sres, splice)
     result = splice.build(check=True, progress=progress)
     report["pointers"] = {
         "via_base": result.via["base"],
@@ -389,6 +434,44 @@ def convert_map(
         "patched out",
     }
     return ConvertResult(result.content, built.data, zone.name, report, compass_rgba)
+
+
+def _shared_zone_paths(base_path: Path) -> list[Path]:
+    """code_post_gfx_mp and common_mp, beside the base or in the .env folders."""
+    from opent5 import env
+
+    out = []
+    for zone in mats.SHARED_ZONES:
+        for folder in (base_path.parent, *env.zone_dirs()):
+            path = folder / f"{zone}.ff"
+            if path.is_file():
+                out.append(path)
+                break
+        else:
+            raise ConvertError(
+                f"materials: the map needs materials of its own, and their images are checked "
+                f"against {zone}.ff; expected it beside the base or in .env, found none"
+            )
+    return out
+
+
+def _own_donors(donors: dict, own: set[str], stock_gfx: dict, secondary, notes: list) -> None:
+    """flat / sunlit: a material of the map's own has no stock surface to take its light
+    from; it takes the brightest donor found for the others (or for any stock material)."""
+    if not own:
+        return
+    pool = donors or lit.find_donors(
+        stock_gfx,
+        secondary,
+        set(world.stock_material_words(stock_gfx)),
+        allow_missing=True,
+    )
+    if not pool:
+        raise ConvertError("lighting: no uniformly lit stock surface; use --lighting keep")
+    best = max(pool.values(), key=lambda d: (d.luminance, d.material))
+    for name in sorted(own):
+        donors[name] = best
+        notes.append(f"lighting: {name} is the map's own material; lit like {best.material}")
 
 
 def _code_post_gfx(base_path: Path):

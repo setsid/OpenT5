@@ -44,7 +44,13 @@ def cmd_convert(args) -> dict:
 
     base = Path(zone_by_name(args.base))
     t0 = time.time()
-    result = convert_map(Path(args.pc).read_bytes(), base, lighting=args.lighting)
+    result = convert_map(
+        Path(args.pc).read_bytes(),
+        base,
+        lighting=args.lighting,
+        name=args.name,
+        image_roots=args.pc_game,
+    )
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     target = out / f"{result.zone_name}.ff"
@@ -148,6 +154,8 @@ def main(argv=None) -> int:
     c.add_argument("--base", required=True)
     c.add_argument("-o", "--out", required=True)
     c.add_argument("--lighting", default="baked", choices=("baked", "flat", "sunlit", "keep"))
+    c.add_argument("--name")
+    c.add_argument("--pc-game", action="append", default=[])
     c = sub.add_parser("compare")
     c.add_argument("pc")
     c.add_argument("ps3")

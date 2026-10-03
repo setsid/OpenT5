@@ -31,6 +31,16 @@ KEEP = (
     r'game\["strings(_menu)?"\]\[".*"\]\s*=.*;',
 )
 EMPTY_MAIN = "main()\n{\n}\n"
+#: The base's art script tunes the light grid for its own map (mp_nuked
+#: ``createart/mp_nuked_art.gsc`` 43-45: r_lightGridEnableTweaks 1, r_lightGridIntensity
+#: 1.25, r_lightGridContrast .18); a converted map has its own grid (docs/research/
+#: box-rpcs3-issues.md 2.2), so those lines are dropped.
+LIGHT_GRID_DVAR = re.compile(r'(?i)\s*setdvar\s*\(\s*"r_lightGrid\w*"\s*,.*\);\s*')
+#: Added to a map's own main(): the compass letter grid and the compass turning with the
+#: player are engine dvars defaulting on (t5mp.elf: compassGridEnabled registered at
+#: 0xdbfc4, compassRotation at 0xdb8dc; box-rpcs3-issues.md 3). INFERRED until a device run
+#: that a level script's setdvar reaches the client's compass.
+OWN_MAP_DVARS = ('setDvar("compassGridEnabled", 0);', 'setDvar("compassRotation", 0);')
 
 
 def _function_body(text: str, name: str) -> tuple[int, int] | None:
@@ -78,18 +88,29 @@ class ScriptPlan:
     dropped: list[str] = field(default_factory=list)
 
 
-def plan_scripts(base: str, texts: dict[str, str]) -> ScriptPlan:
+def plan_scripts(base: str, texts: dict[str, str], own_map: bool = False) -> ScriptPlan:
     """``texts``: every rawfile script of the target zone by name. Refuses when another
-    script calls a function of the main map script that the minimal one drops."""
+    script calls a function of the main map script that the minimal one drops.
+    ``own_map``: the map has its own name, so its main() runs (not patch_mp's) and gets
+    ``OWN_MAP_DVARS``."""
     plan = ScriptPlan()
     main_name = f"maps/mp/{base}.gsc"
     if main_name not in texts:
         raise ConvertError(f"target zone: expected a rawfile {main_name}, found none")
     new, plan.kept, plan.dropped = minimal_main(texts[main_name], base)
+    if own_map:
+        new = new.replace("\n}\n", "\n" + "\n".join(OWN_MAP_DVARS) + "\n}\n", 1)
+        plan.kept += list(OWN_MAP_DVARS)
     plan.texts[main_name] = new
     for name in (f"maps/mp/createfx/{base}_fx.gsc", f"clientscripts/mp/createfx/{base}_fx.csc"):
         if name in texts:
             plan.texts[name] = EMPTY_MAIN
+    art = f"maps/mp/createart/{base}_art.gsc"
+    if art in texts:
+        lines = texts[art].split("\n")
+        kept = [ln for ln in lines if not LIGHT_GRID_DVAR.fullmatch(ln)]
+        if len(kept) != len(lines):
+            plan.texts[art] = "\n".join(kept)
     defined = set(re.findall(r"^(\w+)\s*\(", new, re.M))
     ref = re.compile(rf"maps\\mp\\{re.escape(base)}::(\w+)", re.I)
     for name, text in texts.items():

@@ -179,6 +179,7 @@ def test_pc_nuked_models_and_static_models_against_ps3():
 
 
 @pytest.mark.zones
+@pytest.mark.slow
 def test_props_box_static_models():
     from opent5.convert.pc import open_pc_zone, parse_pc
 

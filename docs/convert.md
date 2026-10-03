@@ -294,8 +294,8 @@ event log and `.ff` identical in all 178 (151 s).
 - Lightmaps, probes, outdoor image, sun and light grid are converted (section 10); probe
   cube faces come only from the game (the PC tools write a black 4 x 4 dummy); a PC map with
   more than one lightmap is converted but untested.
-- Static models (GfxStaticModelDrawInst and XModel conversion), layered materials with
-  ambiguous extras, path nodes, PS3-rebuilt streaming trees: not done.
+- Static models of the base zone's XModels: section 12. Layered materials with ambiguous
+  extras, path nodes, PS3-rebuilt streaming trees: not done.
 - Own map names: section 8. Offering a named map in the menus needs a stock zone change.
 - The PC tools need the LinkerMod `cod2map.dll` / `linker_pc.dll` (box-map.md 1.2).
 
@@ -445,10 +445,10 @@ mp_nuked with the default lighting, `out/demo/i_box_modes/`):
 | `entities.report` on the converted zone | all twelve gametypes ready, no warnings |
 | Determinism | two conversions, same sha1 |
 
-The hook for the converter report (one line in `mapzone.convert_map`, after
-`entities = sc.parse_entities(text)`):
-`report["objectives"] = ent.zone_report(entities, pclip, bx, own or base_name)` with
-`from opent5.convert import entities as ent`.
+Wired into `mapzone.convert_map` (section 13): `report["objectives"]` is
+`ent.zone_report(entities, pclip, bx, own or base_name)` and `report["gametypes"]` is
+derived from it; the gametypes in `require` (default tdm and dm, `--modes` adds more) must
+be ready or the conversion stops with what each lacks.
 
 ## 10. The map's own lighting and compass
 
@@ -634,7 +634,7 @@ Decision: inline, deferred to the end-of-zone block, not the map's own `.pak`. E
 The own `.pak` (named mode, `mp_<name>.pak`) stays the place for streamed images should a
 map ever exceed the deferred budget; not implemented.
 
-### 11.5 Integration (to be wired into `mapzone.convert_map`)
+### 11.5 Integration (wired into `mapzone.convert_map`, section 13)
 
 ```python
 from opent5.convert import materials as mats
@@ -661,7 +661,8 @@ A surface drawn with a new material keeps its PC material word, which `Splice` r
 through the PC parse to the converted MaterialMemory element (`attach` marks bytes
 +0x40..+0x44 of those surfaces as PC values); the material's techset word and the reused
 images' and state bits' words are base values. CLI options proposed: `--pc-game DIR` (where
-the `.iwi` are; default the folder of the PC zone's game), `--new-material NAME` (force).
+the `.iwi` are; default the folder of the PC zone's game), `--new-material NAME` (force);
+both are now `opent5 convert` options (docs/cli.md).
 
 ## 12. Static models and XModels (`smodels.py`, `xmodel.py`)
 
@@ -708,7 +709,7 @@ lightingOrigin and groundLighting colour per instance, and the lightingHandle, r
 probe and primary light per draw instance, all carried from the PC map. With
 `--lighting baked` the light grid they sample is the map's own (section 10).
 
-### 12.2 Integration into `convert_map` (for the lead to wire in)
+### 12.2 Integration into `convert_map` (wired, section 13)
 
 `world.convert_gfx` refuses a GfxWorld with static models (`_UNSUPPORTED`); taking the two
 arrays out first leaves it unchanged:
@@ -792,9 +793,62 @@ values as the product parser.
   materials and images from other zones, `images.py` / `materials.py`) is not done; a
   converted BrushWrapper's planes pointer names its own first side's plane, which a new
   node cannot express to `Rewrite` yet (`adopt` keeps the stock collmaps for that reason).
-- The GUI world view does not draw static models; `tools/dump_zone.py` places them
-  (`world/<map>_static_models.obj`, `previews/world_models_*.png`).
+- The GUI world view draws static models behind its `Static models` toggle (geometry kind
+  `world_models`, placed as `tools/dump_zone.py` places them); off by default, since a
+  stock map holds thousands (mp_nuked: 4209).
 - PC GfxWorld RUNTIME sizes (12.3).
+
+## 13. The integrated converter and the full test map
+
+`mapzone.convert_map` now runs, in order: `materials.convert_materials` (before
+`world.convert_gfx`; the always-loaded zones' image names are read only when a material is
+new), `smodels.take`, `world.convert_gfx` with the material words of both, surfaces with a
+material of the map's own keep their PC word, `smodels.convert_static_models` /
+`repoint_clip` after `world.convert_clip`, `entities.zone_report` on the converted clipMap,
+and before `Splice.build` `materials.attach` and `smodels.place`. With `--lighting flat` or
+`sunlit` a material of the map's own has no stock surface to take its light from; it takes
+the brightest donor found for the others (a note in the report). A PC map without new
+materials, props or extra modes converts to the same bytes as before (the box, five modes:
+default, flat, named, sunlit named, keep; sha1 equal).
+
+Two script changes from the first device runs (docs/research/box-rpcs3-issues.md):
+
+| Change | Where | Evidence |
+|---|---|---|
+| the base's art script loses its `r_lightGrid*` SetDvar lines (mp_nuked `createart/mp_nuked_art.gsc` 43-45: EnableTweaks 1, Intensity 1.25, Contrast .18), since the map has its own grid | `scripts.plan_scripts`, every conversion | box-rpcs3-issues.md 2.2 |
+| a named map's own main() ends with `setDvar("compassGridEnabled", 0);` and `setDvar("compassRotation", 0);` | `scripts.plan_scripts(own_map=True)` | t5mp.elf dvar registration 0xdbfc4 (grid, default 1), 0xdb8dc (rotation, default 1); box-rpcs3-issues.md 3 |
+
+Under the base's name (mp_nuked replacement) patch_mp's `maps/mp/mp_nuked.gsc` runs instead
+of the zone's (10.4), so the letter grid cannot be turned off there without changing a stock
+zone. INFERRED until a device run: that a level script's setDvar reaches the client compass.
+
+The full test map, `tools/testmap.py write|build ... --full` (docs/demo-box-full.md): the
+room of 9.5 with every gametype's objectives and spawns, a `lightgrid_volume` brush 8 units
+inside the walls (10.3), walls in `blockout_test_concrete` (colour map
+`~-gblockout_average_test_c`, in no PS3 zone: string search of the nine inflated zones, 0
+hits), the eight mp_nuked props of docs/demo-box-models.md in two rows at y = +-448, and the
+room light made a primary omni light (`spawnflags 1`). cod2map ignores a primary light
+without a target ("ignoring primary light without a 'target' key", cod2map.exe strings,
+written to the map's `.errlog` on the first try), and one whose fov_outer exceeds 120 unless
+it has no shadow map (cod2map.exe strings; bin/codbo.def 47-49), so the light targets an
+`info_null` on the floor below it and has `fov_outer 110`. cod2map drops `misc_model` and
+`info_null` from the entity string.
+
+Light grid of the full map, read as box-rpcs3-issues.md 2.1 reads it (the 24-bit colour as
+a little-endian word, bits 12..22 luminance, mean of the 56 values, percentiles 1/10/50/90/99
+over the grid entries; this reproduces that document's numbers exactly):
+
+| Zone | Primary lights | Entries referencing a lit primary | Luminance percentiles |
+|---|---|---|---|
+| PS3 mp_nuked | 24 | 33 129 of 37 027 (28 304 the sun) | 322 785 1151 1275 1391 |
+| box lit (g_box_lit) | 2 (empty, sun) | 0 of 2883 | 209 216 230 242 251 |
+| full map, room light primary | 3 (empty, sun, room light) | 2883 of 2919 (the room light) | 153 161 174 190 200 |
+
+So the primary light does what box-rpcs3-issues.md 2.1 asked for in one respect (the grid
+entries now name a real light, index 2, as Nuketown's name its sun and spots) and not in the
+other: the baked colours are darker, not brighter, because cod2rad leaves a primary light's
+direct light out of the grid colours (INFERRED: the renderer adds it for the entity from the
+light itself, as for Nuketown's sun). Whether the viewmodel is then lit needs a device run.
 
 ## Sources
 

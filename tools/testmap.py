@@ -1,10 +1,14 @@
 """Test maps for the converter: write a sealed box room as a Radiant ``.map`` (iwmap 4) with
 spawns, a light and, by default, the objective entities of every MP gametype, and compile it
 with the PC Mod Tools into a PC ``.ff`` (docs/research/box-map.md 1, docs/demo-box-modes.md).
+``--full`` is the whole test map (docs/demo-box-full.md): every objective, a lightgrid_volume
+brush filling the room (docs/demo-box-lit.md), walls in a material no PS3 zone has
+(``FULL_WALL``) and eight stock mp_nuked props (``PROPS``, docs/demo-box-models.md).
 
     .venv/bin/python tools/testmap.py write OUT.map [--half 512] [--height 256] [--no-objectives]
-    .venv/bin/python tools/testmap.py build mp_opent5box_modes --game GAME --work WORK -o OUT.ff
-                                     [--half 512] [--height 256] [--no-objectives]
+                                     [--full | --wall MAT --light-grid --props]
+    .venv/bin/python tools/testmap.py build mp_opent5box_full --game GAME --work WORK -o OUT.ff
+                                     [the same options]
 
 ``GAME`` is the PC game folder and ``WORK`` a scratch folder, both as Windows paths.
 
@@ -56,6 +60,25 @@ WORLDSPAWN = (
 )
 #: Face order and the three points of each face (Radiant winding) of an axis-aligned box.
 FACES = ("bottom", "top", "ymin", "xmax", "ymax", "xmin")
+#: cod2map writes the light grid sample points (``.grid_auto``) from brushes in this
+#: material (docs/convert.md 10.3); without one the grid holds only the default colour.
+LIGHT_GRID = "lightgrid_volume"
+#: A PC Mod Tools material whose colour map (``~-gblockout_average_test_c``, a light and
+#: dark grey check with printed values) no PS3 zone holds: the converter builds it into the
+#: map's zone (docs/convert.md 11).
+FULL_WALL = "blockout_test_concrete"
+#: Stock props (all XModels of PS3 mp_nuked): model, (x, y) for half 512, yaw. Two rows
+#: along the north and south walls, clear of the spawns and objectives.
+PROPS = (
+    ("p_glo_sandbag", (-300, 448), 0),
+    ("p_us_mailbox", (-150, 448), 90),
+    ("mp_nuked_fence", (150, 448), 0),
+    ("p_glo_cardboardbox_4", (300, 448), 30),
+    ("p_dest_trashcan_metal", (-300, -448), 0),
+    ("p_glo_potted_plant_01", (-150, -448), 0),
+    ("p_jun_wood_stack", (150, -448), 45),
+    ("p_glo_barricade_wood_barb", (300, -448), 90),
+)
 
 
 def _faces(lo, hi) -> dict[str, tuple]:
@@ -110,15 +133,37 @@ def point(classname: str, origin, yaw: float | None = None, **keys) -> Entity:
     return Entity(e)
 
 
-def room_brushes(half: int, height: int, wall: int = 16) -> list[list[str]]:
+def room_brushes(
+    half: int, height: int, wall: int = 16, material: str = WALL, light_grid: bool = False
+) -> list[list[str]]:
     r, h, t = half, height, wall
-    return [
+    out = [
         brush_lines((-r - t, -r - t, -t), (r + t, r + t, 0), {"top": FLOOR}),
         brush_lines((-r - t, -r - t, h), (r + t, r + t, h + t), {"bottom": CEILING}),
-        brush_lines((-r - t, -r, 0), (-r, r, h), {"xmax": WALL}),
-        brush_lines((r, -r, 0), (r + t, r, h), {"xmin": WALL}),
-        brush_lines((-r - t, -r - t, 0), (r + t, -r, h), {"ymax": WALL}),
-        brush_lines((-r - t, r, 0), (r + t, r + t, h), {"ymin": WALL}),
+        brush_lines((-r - t, -r, 0), (-r, r, h), {"xmax": material}),
+        brush_lines((r, -r, 0), (r + t, r, h), {"xmin": material}),
+        brush_lines((-r - t, -r - t, 0), (r + t, -r, h), {"ymax": material}),
+        brush_lines((-r - t, r, 0), (r + t, r + t, h), {"ymin": material}),
+    ]
+    if light_grid:
+        # 8 units inside each wall, as the grid box of docs/demo-box-lit.md.
+        out.append(brush_lines((-r + 8, -r + 8, 8), (r - 8, r - 8, h - 8), LIGHT_GRID, 64))
+    return out
+
+
+def prop_entities(half: int) -> list[Entity]:
+    s = half / 512
+    return [
+        Entity(
+            {
+                "classname": "misc_model",
+                "model": model,
+                "origin": _v(x * s, y * s, 0),
+                "angles": _v(0, yaw, 0),
+                "modelscale": "1",
+            }
+        )
+        for model, (x, y), yaw in PROPS
     ]
 
 
@@ -399,11 +444,18 @@ def objective_entities(half: int) -> list[Entity]:
     return out
 
 
-def map_text(half: int = 512, height: int = 256, objectives: bool = True) -> str:
+def map_text(
+    half: int = 512,
+    height: int = 256,
+    objectives: bool = True,
+    wall: str = WALL,
+    light_grid: bool = False,
+    props: bool = False,
+) -> str:
     """The whole ``.map`` (CRLF line ends are added by ``write_map``)."""
     lines = ["iwmap 4", '"000_Global" flags  active', '"The Map" flags ', "// entity 0", "{"]
     lines += [f'"{k}" "{v}"' for k, v in WORLDSPAWN]
-    for i, b in enumerate(room_brushes(half, height)):
+    for i, b in enumerate(room_brushes(half, height, material=wall, light_grid=light_grid)):
         lines.append(f"// brush {i}")
         lines += b
     lines.append("}")
@@ -411,16 +463,26 @@ def map_text(half: int = 512, height: int = 256, objectives: bool = True) -> str
         Entity(
             {
                 "classname": "light",
+                # PRIMARY_OMNI (PC tools bin/codbo.def 42-49; docs/research/
+                # box-rpcs3-issues.md 2.1). cod2map ignores a primary light without a
+                # target ("ignoring primary light without a 'target' key") and one whose
+                # fov_outer exceeds 120 unless it has no shadow map.
+                "spawnflags": "1",
                 "origin": _v(0, 0, height - 56),
                 "radius": "1200",
                 "intensity": "1.5",
                 "_color": "1 1 1",
+                "target": "room_light_target",
+                "fov_outer": "110",
             }
         ),
+        Entity({"classname": "info_null", "origin": "0 0 0", "targetname": "room_light_target"}),
         *spawn_entities(half),
     ]
     if objectives:
         entities += objective_entities(half)
+    if props:
+        entities += prop_entities(half)
     for i, e in enumerate(entities, 1):
         lines.append(f"// entity {i}")
         lines.append("{")
@@ -432,8 +494,9 @@ def map_text(half: int = 512, height: int = 256, objectives: bool = True) -> str
     return "\n".join(lines) + "\n"
 
 
-def entity_dicts(half: int = 512, height: int = 256, objectives: bool = True) -> list[dict]:
-    """The point and brush entities as written to the ``.map`` (no worldspawn, no light)."""
+def entity_dicts(half: int = 512, height: int = 256, objectives: bool = True, **_) -> list[dict]:
+    """The point and brush entities as written to the ``.map`` (no worldspawn, no light, no
+    props: cod2map turns ``misc_model`` into static models)."""
     out = [dict(e.keys) for e in spawn_entities(half)]
     if objectives:
         out += [dict(e.keys) for e in objective_entities(half)]
@@ -441,13 +504,14 @@ def entity_dicts(half: int = 512, height: int = 256, objectives: bool = True) ->
 
 
 def compiled_entities(
-    half: int = 512, height: int = 256, objectives: bool = True
+    half: int = 512, height: int = 256, objectives: bool = True, **_
 ) -> tuple[list[dict], list[tuple]]:
     """The entity string and brush model bounds cod2map makes of ``map_text`` (read from
     the compiled box, tests/test_convert_entities.py): the worldspawn, then the entities in
     order without the light; a brush entity gains ``origin`` (its brushes' centre) and
     ``model "*N"`` (N from 1 in order), and brush model N spans the brush relative to that
     origin, widened by 1. Model 0 is the world: the room's outer faces, widened by 1.
+    ``misc_model`` props leave the entity string (they become static models).
     cod2rad also adds a ``gndLt`` key (a ground light colour) to some script_models; that
     key is not modelled here."""
     world = dict(WORLDSPAWN)
@@ -585,8 +649,23 @@ def main(argv=None) -> int:
         c.add_argument("--half", type=int, default=512)
         c.add_argument("--height", type=int, default=256)
         c.add_argument("--no-objectives", action="store_true")
+        c.add_argument("--wall", default=WALL, help=f"wall material (default {WALL})")
+        c.add_argument("--light-grid", action="store_true", help="add a lightgrid_volume brush")
+        c.add_argument("--props", action="store_true", help="add the eight stock props")
+        c.add_argument(
+            "--full",
+            action="store_true",
+            help=f"the full test map: objectives, light grid, {FULL_WALL} walls, props",
+        )
     args = p.parse_args(argv)
-    kw = {"half": args.half, "height": args.height, "objectives": not args.no_objectives}
+    kw = {
+        "half": args.half,
+        "height": args.height,
+        "objectives": args.full or not args.no_objectives,
+        "wall": FULL_WALL if args.full else args.wall,
+        "light_grid": args.full or args.light_grid,
+        "props": args.full or args.props,
+    }
     if args.cmd == "write":
         write_map(Path(args.out), **kw)
         print(json.dumps({"map": args.out, "entities": len(entity_dicts(**kw))}))

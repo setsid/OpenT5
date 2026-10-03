@@ -253,6 +253,7 @@ def _patch_mp() -> Path:
 
 
 @pytest.mark.zones
+@pytest.mark.slow
 def test_patch_mp_registers_the_map(tmp_path):
     from opent5.edit import Document
 

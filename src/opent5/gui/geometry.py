@@ -4,6 +4,7 @@
     m = geometry.mesh(doc, "world", None)      # the zone's first GfxWorld
     m = geometry.mesh(doc, "collision", 1234)   # a clipMap by asset index
     m = geometry.mesh(doc, "model", 56)         # an XModel's LOD0
+    m = geometry.mesh(doc, "world_models", None)  # the world with its static models placed
 
 ``doc`` is anything with an ``xfile`` (the backend adapter or a ZoneDoc). The
 decoding is the exporter's (``opent5.export``): GfxWorld surfaces through
@@ -12,7 +13,8 @@ triangles, XModel LOD0 surfaces through the XSurface vertex formats. Results
 are cached per parsed zone.
 
 ``MeshData.groups`` holds one id per triangle: the surface index (world,
-model), the brush index (collision brushes) or -1 (collision triangles).
+model), the brush index (collision brushes), -1 (collision triangles) or
+``STATIC_MODEL`` (a placed static model's LOD0, ``world_models``).
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from opent5.gui.backend import EditError, MeshData
 from opent5.xfile.constants import AssetType as T
 
 WORLD_TYPES = (T.GFX_MAP,)
+STATIC_MODEL = -2
 COLLISION_TYPES = (T.COL_MAP_MP, T.COL_MAP_SP)
 KIND_OF_TYPE = {T.GFX_MAP: "world", T.COL_MAP_MP: "collision", T.COL_MAP_SP: "collision",
                 T.XMODEL: "model"}  # fmt: skip
@@ -78,13 +81,16 @@ def _pick(xfile, types, index: int | None, what: str):
 
 def mesh(doc, kind: str, index: int | None = None) -> MeshData:
     xfile = _xfile(doc)
-    if index is not None and kind not in ("world", "collision", "model"):
+    if index is not None and kind not in ("world", "world_models", "collision", "model"):
         kind = kind_for_type(xfile.assets[index].type) or kind
     key = (id(xfile), kind, index)
     if key in _cache:
         return _cache[key]
     if kind == "world":
         out = world_mesh(xfile, _pick(xfile, WORLD_TYPES, index, "world geometry (gfx_map)"))
+    elif kind == "world_models":
+        asset = _pick(xfile, WORLD_TYPES, index, "world geometry (gfx_map)")
+        out = with_static_models(xfile, asset, mesh(doc, "world", asset.index))
     elif kind == "collision":
         out = collision_mesh(xfile, _pick(xfile, COLLISION_TYPES, index, "collision (col_map)"))
     elif kind == "model":
@@ -129,6 +135,41 @@ def world_mesh(xfile, asset) -> MeshData:
         groups,
         label=g.get("name") or asset.name or "world",
         notes=[f"{len(surfs)} surfaces"],
+    )
+
+
+def with_static_models(xfile, asset, world: MeshData) -> MeshData:
+    """``world`` plus every static model's LOD0 placed as the exporter places it
+    (``ZoneExporter.static_models``: origin + scale x position @ axes)."""
+    h = _helper(xfile)
+    placements = h.static_models(asset.data)
+    positions, tris, groups = [world.positions], [world.triangles], [world.groups]
+    at, placed, missing = len(world.positions), 0, 0
+    for p in placements:
+        node = h.index.get(T.XMODEL, p["model"])
+        try:
+            parts = h.model_lod0(node) if node is not None else None
+        except (ValueError, KeyError, TypeError):
+            parts = None
+        if not parts:
+            missing += 1
+            continue
+        axes, origin = np.array(p["axes"]), np.array(p["origin"])
+        for _mat, m in parts:
+            positions.append((origin + p["scale"] * (m.positions @ axes)).astype(np.float32))
+            tris.append((m.triangles + at).astype(np.int32))
+            groups.append(np.full(len(m.triangles), STATIC_MODEL, np.int32))
+            at += len(m.positions)
+        placed += 1
+    notes = [*world.notes, f"{placed} static models"]
+    if missing:
+        notes.append(f"{missing} without a usable model")
+    return MeshData(
+        np.concatenate(positions),
+        np.concatenate(tris),
+        groups=np.concatenate(groups),
+        label=world.label,
+        notes=notes,
     )
 
 

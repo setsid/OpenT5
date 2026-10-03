@@ -636,8 +636,19 @@ def cmd_convert(args) -> dict:
     stem = name or base.stem
     target = out_file(folder / f"{stem}.ff", base, pc_path)
     started = time.perf_counter()
+    require = ("tdm", "dm") + _modes(args.modes)
+    roots = [Path(r) for r in args.pc_game] or _pc_game_of(pc_path)
+    force = True if "all" in args.new_material else frozenset(args.new_material)
     try:
-        result = convert_map(pc_path.read_bytes(), base, lighting=args.lighting, name=name)
+        result = convert_map(
+            pc_path.read_bytes(),
+            base,
+            lighting=args.lighting,
+            name=name,
+            require=tuple(dict.fromkeys(require)),
+            image_roots=roots,
+            force_materials=force,
+        )
     except XFileError as exc:
         raise Failure(str(exc)) from None
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -653,6 +664,13 @@ def cmd_convert(args) -> dict:
         "bytes": report["zone"]["fastfile_bytes"],
         "checks": report["checks"],
         "gametypes_ready": [g for g, v in report["gametypes"].items() if v == "ready"],
+        "gametypes_not_ready": [g for g, v in report["gametypes"].items() if v != "ready"],
+        "new_materials": sorted(
+            n
+            for n, m in report.get("materials", {}).get("materials", {}).items()
+            if m["action"].startswith("new")
+        ),
+        "static_models": report.get("static_models", {}).get("count", 0),
     }
     renamed = result.zone_name != base.stem
     if renamed and args.copy_pak:
@@ -668,6 +686,28 @@ def cmd_convert(args) -> dict:
     data["report"] = str(folder / "convert.json")
     (folder / "convert.json").write_text(json.dumps({**data, **report}, indent=1, default=str))
     return data
+
+
+def _modes(text: str | None) -> tuple[str, ...]:
+    from opent5.convert.entities import GAMETYPES
+
+    if not text:
+        return ()
+    modes = tuple(m.strip() for m in text.split(",") if m.strip())
+    if "all" in modes:
+        return GAMETYPES
+    unknown = [m for m in modes if m not in GAMETYPES]
+    if unknown:
+        raise Failure(f"--modes: expected some of {', '.join(GAMETYPES)} or all, found {unknown}")
+    return modes
+
+
+def _pc_game_of(pc_path: Path) -> list[Path]:
+    """The PC game folder of a map built in place (<game>/zone/<language>/<map>.ff)."""
+    parts = pc_path.resolve().parents
+    if len(parts) > 2 and parts[1].name.lower() == "zone":
+        return [parts[2]]
+    return []
 
 
 def _register(args, folder: Path, name: str, base: str) -> dict:
@@ -701,8 +741,17 @@ def text_convert(d: dict) -> str:
         f"{'identically' if c['write_identical'] else 'DIFFERENTLY'}; "
         f"{c['unresolved']} of {c['offset_and_alias_pointers']} pointers unresolved",
         f"  ready    {', '.join(d['gametypes_ready'])}",
-        f"  output   {d['sha1']}  {d['output']}",
     ]
+    if d.get("gametypes_not_ready"):
+        lines.append(
+            f"  not ready {', '.join(d['gametypes_not_ready'])} (what each lacks: "
+            "objectives in the report)"
+        )
+    if d.get("new_materials"):
+        lines.append(f"  built    {len(d['new_materials'])} material(s) of the map's own")
+    if d.get("static_models"):
+        lines.append(f"  props    {d['static_models']} static model(s)")
+    lines.append(f"  output   {d['sha1']}  {d['output']}")
     if "pak" in d:
         lines.append(f"  pak      {d['pak']['sha1']}  {d['pak']['output']}")
     r = d.get("registration")
@@ -862,6 +911,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--copy-pak",
         action="store_true",
         help="with --name: also write <name>.pak, a copy of the base map's image pack",
+    )
+    p.add_argument(
+        "--modes",
+        help="gametypes that must be ready besides tdm and dm (comma list, or all); the "
+        "others are only reported",
+    )
+    p.add_argument(
+        "--pc-game",
+        action="append",
+        default=[],
+        help="a PC game folder holding the .iwi images of the map's own materials (raw/images "
+        "or main/*.iwd); default: the game folder the PC map was built in",
+    )
+    p.add_argument(
+        "--new-material",
+        action="append",
+        default=[],
+        help="build this material anew even when the base has one of that name (repeat; "
+        "all for every material)",
     )
     return parser
 

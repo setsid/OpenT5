@@ -40,7 +40,12 @@ DRAG_EDGES = 40_000
 NEAR = 1.0
 KIND_OF_TYPE = {T.GFX_MAP: "world", T.COL_MAP_MP: "collision", T.COL_MAP_SP: "collision",
                 T.XMODEL: "model"}  # fmt: skip
-KIND_TITLES = {"world": "World geometry", "collision": "Collision", "model": "Model"}
+KIND_TITLES = {
+    "world": "World geometry",
+    "world_models": "World geometry",
+    "collision": "Collision",
+    "model": "Model",
+}
 COLLISION_MODES = ("Brushes and triangles", "Brushes", "Triangles")
 
 
@@ -518,6 +523,9 @@ class MeshView(AssetView):
         row.setSpacing(2)
         self.depth_button = self._toggle("Depth cue", True, self._set_depth)
         self.grid_button = self._toggle("Grid", True, self._set_grid)
+        self.models_button = self._toggle("Static models", False, self._set_models)
+        self.models_button.setToolTip("Place the world's static models (props)")
+        self.models_button.setVisible(False)
         self.mode = QComboBox(bar)
         self.mode.addItems(COLLISION_MODES)
         self.mode.setToolTip("Which collision geometry to draw")
@@ -528,7 +536,7 @@ class MeshView(AssetView):
         self.frame_button.clicked.connect(lambda: self.canvas.frame_all())
         self.info = QLabel("", bar)
         self.info.setObjectName("AssetMeta")
-        for w in (self.depth_button, self.grid_button, self.mode):
+        for w in (self.depth_button, self.grid_button, self.models_button, self.mode):
             row.addWidget(w)
         row.addStretch(1)
         row.addWidget(self.info)
@@ -581,6 +589,16 @@ class MeshView(AssetView):
         self.canvas.renderer.grid = on
         self.canvas.invalidate()
 
+    def _set_models(self, on: bool) -> None:
+        if self.doc is None or self.mesh_kind not in ("world", "world_models"):
+            return
+        self._start(self.doc, "world_models" if on else "world", self.ref)
+
+    def _world_kind(self, kind: str | None) -> str | None:
+        if kind == "world" and self.models_button.isChecked():
+            return "world_models"
+        return kind
+
     def _show_message(self, text: str) -> None:
         self.placeholder.setText(text)
         self.stack.setCurrentWidget(self.placeholder)
@@ -599,16 +617,17 @@ class MeshView(AssetView):
         if kind is None:
             self._show_message(f"{ref.type_name} assets have no geometry.")
             return
-        self._start(doc, kind, ref)
+        self._start(doc, self._world_kind(kind), ref)
 
     def load_kind(self, doc: ZoneDoc, kind: str) -> None:
         """World geometry or collision of the zone, without a selected asset."""
         self.doc, self.ref = doc, None
-        self._start(doc, kind, None)
+        self._start(doc, self._world_kind(kind), None)
 
     def _start(self, doc: ZoneDoc, kind: str, ref: Ref | None) -> None:
         self._generation += 1
         self.mesh_kind = kind
+        self.models_button.setVisible(kind in ("world", "world_models"))
         label = ref.label if ref is not None else KIND_TITLES.get(kind, kind)
         self._show_message(f"Building mesh for {label} ...")
         job = _MeshJob(self._generation, doc, kind, ref)
@@ -627,7 +646,9 @@ class MeshView(AssetView):
         else:
             self.doc, self.ref = doc, None
             kind, ref = what, None
+        kind = self._world_kind(kind)
         self.mesh_kind = kind
+        self.models_button.setVisible(kind in ("world", "world_models"))
         try:
             mesh = doc.mesh(kind, ref)
         except (EditError, ValueError, KeyError, IndexError, TypeError) as exc:

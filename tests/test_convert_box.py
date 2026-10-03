@@ -1,6 +1,7 @@
 """The converter on real data: the PC box map (built with the PC Mod Tools,
-docs/research/box-map.md 1) into the disc's mp_nuked, and (slow: they add 5 s to the
-default run) the converted zone read back and PC mp_nuked's world against PS3 mp_nuked's.
+docs/research/box-map.md 1) into the disc's mp_nuked, the converted zone read back and PC
+mp_nuked's world against PS3 mp_nuked's (slow: each conversion takes about 10 s; the quick
+real-data smoke tests are in test_convert_full.py).
 Skipped when the files are not on this machine. Neither file enters the repository; the
 PC box is looked for at $OPENT5_PC_BOX, then in the default build locations."""
 
@@ -70,6 +71,7 @@ def test_pc_box_walks_exactly_and_writes_back(box):
 
 
 @pytest.mark.zones
+@pytest.mark.slow
 def test_box_converts_into_mp_nuked(converted):
     r = converted.report
     assert r["checks"]["reparse_exact"] and r["checks"]["write_identical"]
@@ -82,6 +84,7 @@ def test_box_converts_into_mp_nuked(converted):
         "maps/mp/mp_nuked.gsc",
         "maps/mp/createfx/mp_nuked_fx.gsc",
         "clientscripts/mp/createfx/mp_nuked_fx.csc",
+        "maps/mp/createart/mp_nuked_art.gsc",
     }
     assert "maps\\mp\\_load::main();" in r["scripts"]["main_kept"]
     assert r["assets"]["glasses"]["action"].startswith("numGlasses 62 -> 0")

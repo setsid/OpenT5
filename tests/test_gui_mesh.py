@@ -78,3 +78,32 @@ def test_nuked_geometry():
     view.resize(640, 480)
     view.load_sync(doc, "world")
     assert view.canvas.counts[1] == 117181
+
+
+def test_world_view_offers_static_models_only_for_worlds():
+    view = mv.MeshView()
+    assert view.models_button.isHidden()
+    view._done(view._generation, MeshData(CUBE_POS, CUBE_TRIS, label="cube"))
+    assert view._world_kind("world") == "world"
+    view.models_button.blockSignals(True)
+    view.models_button.setChecked(True)
+    view.models_button.blockSignals(False)
+    assert view._world_kind("world") == "world_models"
+    assert view._world_kind("collision") == "collision"
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_nuked_world_with_static_models():
+    path = nuked()
+    if path is None:
+        pytest.skip("mp_nuked.ff not configured in .env")
+    from opent5.gui import geometry
+    from opent5.gui.backend import ZoneDoc
+
+    doc = ZoneDoc.open(path)
+    world = geometry.mesh(doc, "world")
+    both = geometry.mesh(doc, "world_models")
+    placed = both.groups == geometry.STATIC_MODEL
+    assert (both.triangles[~placed] == world.triangles).all()
+    assert placed.sum() > 0 and "4209 static models" in both.notes

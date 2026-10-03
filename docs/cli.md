@@ -315,6 +315,7 @@ map's, everything else is kept. The base is only read; the result goes to OUTDIR
 Details, supported gametypes and limits: docs/convert.md.
 
     opent5 convert PC_MAP.ff --base mp_nuked -o OUTDIR [--lighting baked|flat|sunlit|keep]
+        [--modes sd,dom,...|all] [--pc-game DIR] [--new-material NAME|all]
         [--name mp_NAME [--copy-pak]] [--register --patch-mp PATCH_MP.ff
         [--title TEXT] [--description TEXT] [--ui-slot N]] [--json]
 
@@ -323,6 +324,20 @@ probes and outdoor image into the map's zone; `flat`, `sunlit` and `keep` light 
 base map's lightmaps instead (docs/convert.md 3.5, 10). Every conversion also adds the
 minimap corners and a compass material and image of the map's own inside its zone
 (docs/convert.md 10.4).
+
+Gametypes: every one of the twelve is checked against the map's entities (spawns and
+objectives, docs/convert.md 9.4) and reported in `convert.json` (`objectives`, with what
+each lacks and the script lines that need it). Team Deathmatch and Free-for-all must be
+ready or the conversion stops; `--modes` adds more that must be ready (`--modes all`: every
+one). The text output lists the ready and the not-ready modes.
+
+Materials and props: a material the base zone has is reused by name; any other is built
+into the map's own zone with its textures (docs/convert.md 11). Their `.iwi` images are read
+from `--pc-game` (repeatable; default: the PC game folder the map was built in, when the PC
+map is its `zone/<language>/` file). `--new-material NAME` builds a material anew even
+when the base has one of that name. Static models (Radiant `misc_model`) place the base
+zone's XModels by name; a prop the base lacks stops the conversion with its name
+(docs/convert.md 12).
 
 `--name` gives the map its own zone name (`mp_NAME.ff`, every internal occurrence renamed;
 docs/research/map-registration.md lists them); `--copy-pak` writes `mp_NAME.pak` beside it.
