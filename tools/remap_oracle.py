@@ -11,7 +11,7 @@ tool derives it from the shipped loader instead, so the two can be compared byte
 byte (fixture tests/fixtures/remap_<zone>.json).
 
 How it works.
-1. Trace. The harness in .oracle/r2b (emu.py, ppc.py: a scratch PPC64 interpreter
+1. Trace. The harness in tools/loader_emu (emu.py, ppc.py: a PPC64 interpreter
    that runs t5mp.elf's loader functions over a decompressed zone, with only the file
    reader 0x233558 and the string reader 0x2335d0 replaced) is run over the original
    content. Hooks on the stream primitives record, for VIRTUAL:
@@ -56,7 +56,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / ".oracle" / "r2b"))  # the emulator harness (scratch code)
+sys.path.insert(0, str(ROOT / "tools" / "loader_emu"))
 
 from emu import BLOCKBASE, BLOCKSTEP, G281, Emu  # noqa: E402
 from ppc import M32  # noqa: E402

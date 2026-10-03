@@ -1,6 +1,6 @@
 # Zones: inventory, container rules, round-trip
 
-Track P1. Every zone on this machine, opened, counted and rebuilt, and the
+Every zone on this machine, opened, counted and rebuilt, and the
 container rules that the rebuild depends on. Every rule below is measured
 on the files; where the ELF was read the VMA is given; anything else is
 marked INFERRED.

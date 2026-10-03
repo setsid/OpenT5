@@ -6,7 +6,7 @@ more maps); the transform PC to PS3 is byte-exact for the lightmaps, reflection 
 outdoor image, GfxImage headers, sun light and light grid (apart from one constant colour). A
 prototype applied it to the box map (`mp_opent5box`) converted into mp_nuked; the result
 reparses exactly and is consumed exactly by the game's own loader (emulated, local CPU only).
-Nothing was run on RPCS3 or hardware. Prototype code is in the track scratch directory
+Nothing was run on RPCS3 or hardware. Prototype code was kept outside the repository
 (`p6l/`), not in `src/`.
 
 Conventions as in box-map.md: "PC zone" is the inflated PC stream, "PS3 zone" the inflated

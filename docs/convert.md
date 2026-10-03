@@ -3,7 +3,7 @@
 `opent5 convert` turns a map built with the PC Mod Tools (cod2map, cod2rad, linker_pc; how
 the box map was built is in docs/research/box-map.md section 1) into a PS3 map zone that a
 signature-patched PS3 client can load. First target: a sealed box (`mp_opent5box`), shipped
-inside `mp_nuked.ff`. The user-facing test procedure is docs/demo-box.md.
+inside `mp_nuked.ff`. The test procedure is docs/demo-box.md.
 
     opent5 convert PC_MAP.ff --base mp_nuked -o OUTDIR [--lighting flat|sunlit|keep] [--json]
                    [--name mp_NAME [--copy-pak] [--register [--patch-mp FILE] [--title T]
@@ -197,7 +197,7 @@ and vision dvars), the client scripts (`GetEntArray` results loop over nothing).
 `maps/mp/_load.gsc` (common_mp) only reads optional entity arrays; `_spawnlogic.gsc` aborts the
 level when a gametype's spawn class is missing and asserts one `mp_global_intermission`.
 
-Finding: the installed update's `patch_mp.ff` (sha1 499ce654..., identical to the user's
+Finding: the installed update's `patch_mp.ff` (sha1 499ce654..., identical to the installed
 `patch_mp.ff.retail.bak`) carries its own `maps/mp/mp_nuked.gsc` (asset 584, 7337 bytes:
 the stock script plus a spawn fix, `move_spawn_point("mp_dom_spawn", ...)` and two
 `spawncollision` walls at Nuketown positions) and `clientscripts/mp/mp_nuked_fx.csc` (652).
@@ -266,7 +266,7 @@ written, so the walk starts there, box-map.md 2.3) and converts with the convert
 |---|---|
 | PC box zone (`mp_opent5box.ff`, sha1 20e4cffb...) | parses exactly with the product parser and the `PC` platform; written back identically; `Rewrite(platform=PC).build()` identical |
 | Converted content | reparses exactly; `write(parse(content))` identical (the rewrite_all check); 53 166 offset / alias pointers, 0 unresolved |
-| Game loader (t5mp.elf's XFile loader in the local PowerPC interpreter of .oracle/r2b, `tools/convert_map.py oracle`, 17 s) | consumed 0x30bad10 of 0x30bad10 bytes; final block positions RUNTIME 0x3d0e80, PHYSICAL_RUNTIME 0x115d900, VIRTUAL 0x1295d71, PHYSICAL 0xd0e0c8 = the header (TEMP rewound to 0); the loader converted 53 166 pointers, the same fields with the same values as the product parser reads, none outside its block. Control, stock mp_nuked: 109 495 = 109 495, all equal, 24 s |
+| Game loader (t5mp.elf's XFile loader in the local PowerPC interpreter in tools/loader_emu, `tools/convert_map.py oracle`, 17 s) | consumed 0x30bad10 of 0x30bad10 bytes; final block positions RUNTIME 0x3d0e80, PHYSICAL_RUNTIME 0x115d900, VIRTUAL 0x1295d71, PHYSICAL 0xd0e0c8 = the header (TEMP rewound to 0); the loader converted 53 166 pointers, the same fields with the same values as the product parser reads, none outside its block. Control, stock mp_nuked: 109 495 = 109 495, all equal, 24 s |
 | `opent5 verify --against mp_nuked` | ok; container 1043 chunks, 4 terminators; parse exact; rewrites identically; 9 assets changed as listed in 1.1 |
 | GUI self-test (`--selftest`, with code_post_gfx_mp for the localize view) | ok, 99 checks (52 on the converted zone), 0 failed |
 | Geometry views | world: 24 vertices, 12 triangles, bounds (-512, -512, 0)..(512, 512, 256), normals inward (walls -X, -Y, +Y, +X, floor +Z, ceiling -Z); collision: 6 brushes, bounds (-528, -528, -16)..(528, 528, 272). Screenshots `out/demo/e_box/screenshots/` |

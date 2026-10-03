@@ -8,7 +8,7 @@ platforms, and check a converted zone with the game's own loader (emulated).
 ``compare`` walks the PC zone from its com_map to its col_map_mp (pc.walk_range; the PC
 XModel / FX / sound handlers are not written, docs/convert.md) and runs
 opent5.convert.compare.compare_world. ``oracle`` runs t5mp.elf's XFile loader in the local
-PowerPC interpreter of .oracle/r2b (the harness tools/remap_oracle.py uses) over the
+PowerPC interpreter in tools/loader_emu (the harness tools/remap_oracle.py uses) over the
 content: it must consume the stream exactly, end every block at the header's size, and
 convert exactly the offset / alias pointers the product parser reads, with the same values,
 each landing inside its block. Local CPU only; nothing is run on a console or an emulator
@@ -91,7 +91,7 @@ def cmd_compare(args) -> dict:
 
 
 def cmd_oracle(args) -> dict:
-    sys.path.insert(0, str(ROOT / ".oracle" / "r2b"))
+    sys.path.insert(0, str(ROOT / "tools" / "loader_emu"))
     sys.path.insert(0, str(ROOT / "tools"))
     from opent5.xfile import parse
     from opent5.xfile.events import EventKind, PtrKind

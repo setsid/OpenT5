@@ -5,7 +5,7 @@ French, DLC 1 to 5 in English and French 72). Every break found outside the nine
 fixed from the loader in `t5mp.elf`; each fix was confirmed by running the game's own loader
 code over the failing asset and comparing every stream read.
 
-Owner: Phase 2 core track. Code: `src/opent5/xfile/` (parser and handlers), `tools/walk_all.py`
+Code: `src/opent5/xfile/` (parser and handlers), `tools/walk_all.py`
 (this walk). Companion documents: `xfile.md` (stream framing), `structs-content.md`,
 `structs-map.md` (per-type layouts).
 

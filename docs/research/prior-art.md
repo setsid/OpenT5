@@ -275,7 +275,7 @@ etc. Reference only.
 
 Community guides: "A Little Introduction To Modding In Call Of Duty: Black
 Ops" (Steam Community guide id 2494448328); Neoseeker "Call of Duty: Black
-Ops - Mod Tools" tutorial thread. Track R5 (`pc-route.md`) owns the
+Ops - Mod Tools" tutorial thread. `pc-route.md` covers the
 PC-to-PS3 conversion question.
 
 ### 2.6 PS3 platform references (not CoD-specific)
@@ -295,7 +295,7 @@ PC-to-PS3 conversion question.
 - No public description of T5 PS3 `.pak` image packs was found. The wiki's
   "data will be found in PAK files" note is for MW2/MW3/Ghosts/AW.
   T5 `.pak` format must come from the files on disc and from the ELF
-  (track R3).
+  (textures.md).
 - OAT's T5 `GfxImage`/`GfxImageLoadDef` (`T5_Assets.h` line 1880,
   `XAssets/GfxImage.txt`) shows the PC fields `streaming`, `delayLoadPixels`,
   `loadDef` with `resourceSize`; useful names, PC layout.

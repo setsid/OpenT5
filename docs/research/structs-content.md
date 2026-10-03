@@ -5,7 +5,7 @@ below was checked by walking real zones and comparing, asset by asset, with the 
 loader code run over the same bytes (section 1). Fields that are not confirmed that way are
 marked INFERRED, with what would confirm them.
 
-Owner: track R2b. Companion documents: `xfile.md` (R1: header, blocks, pointer encoding, type
+Companion documents: `xfile.md` (R1: header, blocks, pointer encoding, type
 enum, per-type loader table), `textures.md` (R3: pixel formats). R2a owns clipmap, comworld,
 gfxworld, mapents, xmodel, physpreset, physconstraints, destructibledef, lightdef.
 

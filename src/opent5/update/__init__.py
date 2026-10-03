@@ -12,7 +12,7 @@ when the test override is set); tests/test_no_network.py enforces both.
 from __future__ import annotations
 
 #: "owner/name" of the GitHub repository whose releases are checked. Empty: checking is
-#: disabled (logged once per check), which is the state until the lead sets it.
+#: disabled (logged once per check), which is the state until it is set.
 REPO = ""
 
 #: The release signing public key (the base64 line `npm run keygen` prints). Empty:

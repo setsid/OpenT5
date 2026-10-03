@@ -4,13 +4,13 @@ Status: research and prototype. The PC tools built a box map headless; the PC zo
 exactly; the PC world assets were converted to PS3 form and spliced into an in-memory copy of
 the stock PS3 mp_nuked zone; the result parses exactly with the product parser and is consumed
 exactly by the game's own loader (emulated). Nothing has been run on RPCS3 or hardware (not
-allowed for this track). Prototype code is in the track scratch directory (`p6/`), not in
+allowed for this work). Prototype code was kept outside the repository, not in
 `src/`.
 
 Conventions: "PC zone" is the zlib-inflated payload of a PC `.ff` (from byte 12). "PS3 zone"
 is the inflated XFile stream. Offsets are into those streams. Type numbers are PS3 numbers
 (xfile.md section 5) unless "PC type" is written. "Box" is the map built here,
-`mp_opent5box`. Scratch is `a scratch folder`.
+`mp_opent5box`.
 
 Contents
 
@@ -27,7 +27,7 @@ Contents
 ### 1.1 Inputs
 
 - `C:\o5\p6\map_source\mp_opent5box.map` (written by `p6/genmap.py`): `iwmap 4`, the layer
-  lines and brush syntax copied from the user's `map_source/test_room.map` (the stock
+  lines and brush syntax copied from a local `map_source/test_room.map` (the stock
   `map_source/mp/*.map` files are 50-byte placeholders: "// Blank / Used By Launcher To
   Populate Map List"). Six brushes: floor, ceiling and four walls, 16 units thick, enclosing
   x, y in -512..512 and z in 0..256. Inner faces use `jun_art_concrete_base02` (floor),
@@ -348,7 +348,7 @@ stock zones anyway, plus a correct asset order, a new map name in the menu table
 
 ### 5.2 Results
 
-| Spliced | Content | Pointers | Product parse | Game loader (emulated, `.oracle/r2b`) |
+| Spliced | Content | Pointers | Product parse | Game loader (emulated, `tools/loader_emu`) |
 |---|---|---|---|---|
 | col_map + map_ents, com_map, game_map_mp | 66 341 569 bytes (stock 68 848 457) | 20 via the PC layout, 62 946 via the stock layout, 23 011 rewritten | exact (`problems() == []`) | consumed 0x3f44ac1 of 0x3f44ac1, blocks equal the header (RUNTIME 0x49f920, VIRTUAL 0x1c54191, PHYSICAL 0x11d90c8, PHYSICAL_RUNTIME 0x115d900), 18 s |
 | the above + gfx_map | 51 115 155 bytes | 20 PC, 53 225 stock, 17 540 rewritten | exact | consumed 0x30bf493 of 0x30bf493, blocks equal the header (RUNTIME 0x3d0e80, VIRTUAL 0x129a231, PHYSICAL 0xd0e0c8), 16 s |
@@ -410,7 +410,7 @@ Nothing broke at the loader level. Expected problems at run time (not tested):
 6. `convert/splice.py` (CLI `opent5 convert-map PC.ff --into mp_nuked.ff --out ...`): world
    assets wholesale; materials matched by name to the target's materialMemory, with a clear
    error listing missing materials; stripped map scripts; empty glasses; spawn check for the
-   gametypes the user wants.
+   gametypes wanted.
 7. Verification in the product: exact reparse, every pointer of the replaced assets resolving
    into the expected arrays, and the emulated loader in the test suite where the harness is
    available.

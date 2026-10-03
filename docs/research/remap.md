@@ -25,7 +25,7 @@ positions after 0x9b307 by a shift that the next alignments may change.
 
 ## 2. Algorithm
 
-1. Trace the original zone with the loader itself. The scratch PowerPC interpreter (`.oracle/r2b`
+1. Trace the original zone with the loader itself. The PowerPC interpreter (`tools/loader_emu`
    emu.py / ppc.py) runs t5mp.elf's loader over the decompressed content (only the file reader
    0x233558 and string reader 0x2335d0 are replaced). Hooks record:
    - every VIRTUAL position change: DB_AllocStreamPos 0x26aca0 (mask), DB_IncStreamPos 0x26acc0
@@ -221,7 +221,7 @@ Limits:
   splice.
 - Deferred (LARGE_RUNTIME / PHYSICAL_RUNTIME) data may only change in place.
 
-## 9. Results in RPCS3 (reported by the user, 2026-10-03)
+## 9. Results in RPCS3 (2026-10-03)
 
 Run in RPCS3 with the signature-patched multiplayer client, each file replacing the disc's
 `USRDIR/english/code_post_gfx_mp.ff` in turn (retail sha1 `d658721a79bc541f51d2fd2ff28c7098ce703872`

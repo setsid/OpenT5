@@ -1,10 +1,10 @@
 # Research
 
-One file per track. Every claim carries its evidence: a file with offset and
+One file per subject. Every claim carries its evidence: a file with offset and
 bytes, an ELF address, or a source URL. Anything not confirmed from bytes or
 code is marked INFERRED.
 
-| Track | File | Subject |
+| Ref | File | Subject |
 |---|---|---|
 | R1 | xfile.md | XFile layout, blocks, pointer markers, asset type enum |
 | R2a | structs-map.md | Map asset struct layouts on PS3 |

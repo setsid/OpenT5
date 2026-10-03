@@ -2,7 +2,7 @@
 docs/research/box-map.md 1) into the disc's mp_nuked, and (slow: they add 5 s to the
 default run) the converted zone read back and PC mp_nuked's world against PS3 mp_nuked's.
 Skipped when the files are not on this machine. Neither file enters the repository; the
-PC box is looked for at $OPENT5_PC_BOX, then in the places the research track wrote it."""
+PC box is looked for at $OPENT5_PC_BOX, then in the default build locations."""
 
 import os
 from pathlib import Path

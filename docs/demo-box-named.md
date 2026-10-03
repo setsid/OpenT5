@@ -67,7 +67,7 @@ map list (base maps, not DLC): `OpenT5 Box` is the last entry.
   minimal `maps/mp/mp_opent5box.gsc` does. No nuke at match end, no Nuketown entities added.
 - The look may differ from the first demo: `vision/mp_opent5box.vision` does not exist, so
   the game uses `vision/default.vision` after the art script's Nuketown vision (lighting is
-  another track's work).
+  separate work).
 
 ## Failures and their meaning
 
