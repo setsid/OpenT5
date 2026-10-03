@@ -48,6 +48,78 @@ def test_rejects_non_canonical_s_and_small_order_keys():
     assert not ed25519.verify(pub, msg, sig[:63])
 
 
+#: Every small-order point of edwards25519 in its 32-byte encoding (orders 1, 2, 4 and 8),
+#: including the encodings with the sign bit set, as listed in libsodium's blocklist.
+SMALL_ORDER = [
+    "0100000000000000000000000000000000000000000000000000000000000000",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000080",
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+]
+
+
+def _vector(i=1):
+    v = VECTORS["vectors"][i]
+    return tuple(bytes.fromhex(v[k]) for k in ("secret", "public", "message", "signature"))
+
+
+@pytest.mark.parametrize("encoding", SMALL_ORDER)
+def test_small_order_public_keys_are_refused(encoding):
+    """With a small-order key, R = a small-order point and S = 0 satisfies the plain
+    verification equation for many messages; only a verifier that rejects such keys is
+    safe against it."""
+    key = bytes.fromhex(encoding)
+    for message in (b"", b"manifest", b"x" * 100):
+        for r in SMALL_ORDER:
+            assert not ed25519.verify(key, message, bytes.fromhex(r) + bytes(32))
+
+
+@pytest.mark.parametrize("encoding", SMALL_ORDER)
+def test_small_order_r_is_refused_under_a_real_key(encoding):
+    _, pub, msg, sig = _vector()
+    assert not ed25519.verify(pub, msg, bytes.fromhex(encoding) + sig[32:])
+    assert not ed25519.verify(pub, msg, bytes.fromhex(encoding) + bytes(32))
+
+
+@pytest.mark.parametrize("extra", [1, 2, 15])
+def test_non_canonical_s_is_refused(extra):
+    """S + k*L verifies under the plain equation (malleability); it must not here."""
+    _, pub, msg, sig = _vector()
+    s = int.from_bytes(sig[32:], "little")
+    assert ed25519.verify(pub, msg, sig)
+    forged = s + extra * ed25519.L
+    if forged < 2**256:
+        assert not ed25519.verify(pub, msg, sig[:32] + forged.to_bytes(32, "little"))
+
+
+def test_s_at_or_above_the_order_is_refused():
+    _, pub, msg, sig = _vector()
+    for s in (ed25519.L, ed25519.L + 1, 2**253, 2**256 - 1):
+        assert not ed25519.verify(pub, msg, sig[:32] + s.to_bytes(32, "little"))
+
+
+def test_non_canonical_public_key_encodings_are_refused():
+    """y >= p encodings of a point: the same point, a different byte string."""
+    _, pub, msg, sig = _vector()
+    p = 2**255 - 19
+    for y in (p, p + 1, 2**255 - 1):
+        for sign in (0, 1):
+            key = (y | (sign << 255)).to_bytes(32, "little")
+            assert not ed25519.verify(key, msg, sig)
+
+
+def test_verification_is_libsodium():
+    import nacl.bindings
+
+    _, pub, msg, sig = _vector()
+    assert ed25519.verify(pub, msg, sig)
+    nacl.bindings.crypto_sign_open(sig + msg, pub)  # libsodium accepts the same input
+
+
 def test_scrypt_parameters_match_libsodium():
     # (opslimit, memlimit) -> (log2 N, r, p), as libsodium 1.0.18 computes them (checked
     # against PyNaCl 1.5.0's crypto_pwhash_scryptsalsa208sha256 output, see docs/updates.md).
