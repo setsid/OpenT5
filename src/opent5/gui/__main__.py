@@ -14,6 +14,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("zones", nargs="*", help="zones (.ff) to open")
     parser.add_argument("--theme", choices=("dark", "light"), help="colour theme")
+    # Smoke test for packaged builds: render, save the window to PATH and exit. Run with
+    # QT_QPA_PLATFORM=offscreen so nothing appears on screen.
+    parser.add_argument("--screenshot", metavar="PATH", help=argparse.SUPPRESS)
+    parser.add_argument("--after", type=float, default=8.0, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     from PySide6.QtWidgets import QApplication
@@ -36,6 +40,14 @@ def main(argv: list[str] | None = None) -> int:
     window.show()
     if args.zones:
         window.open_paths(args.zones)
+    if args.screenshot:
+        from PySide6.QtCore import QTimer
+
+        def grab() -> None:
+            window.grab().save(args.screenshot)
+            app.quit()
+
+        QTimer.singleShot(int(args.after * 1000), grab)
     return app.exec()
 
 
