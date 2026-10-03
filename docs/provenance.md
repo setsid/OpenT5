@@ -14,6 +14,7 @@ OpenAssetTools, which is GPL-3.0.
 | OpenT5 file | Source project | Source path | What was taken | Changes |
 |---|---|---|---|---|
 | docs/research/structs-content.md | OpenAssetTools @ ecfdab39 | src/Common/Game/T5/T5_Assets.h | Struct and field names for content asset types (layouts and offsets were measured from t5mp.elf and zone bytes) | Names only; PS3 offsets differ and are the document's own |
+| docs/research/structs-map.md | OpenAssetTools @ ecfdab39 | src/Common/Game/T5/T5_Assets.h | Field names for GfxWorld, ComWorld and other map types where PS3 data gives no name (sizes, order and offsets measured from t5mp.elf and zone bytes) | Names only |
 
 ## Derived from game data, not copied
 
