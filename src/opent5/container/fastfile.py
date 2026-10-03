@@ -12,7 +12,8 @@ A signed PS3 zone is a 0x13c-byte header followed by a stream of XChunks:
     0x13c  the XChunks
 
     each chunk: u32 big-endian size, then that many bytes
-    a size of zero ends the stream, and the file is padded to 0x40
+    a size of zero ends a stream, one per stream; then zero padding (see
+    TRAILER_SLACK), and no size field straddles a 0x60000 ring boundary
 
 The 256 bytes at 0x3c are a real RSA-2048 signature, PSS-padded with MGF1
 over SHA-256 and an 8-byte salt, and the console checks it. `pack` carries
@@ -120,30 +121,52 @@ SHA1_HASH_SIZE = 20
 SALSA20_IV_SIZE = 8
 STREAM_COUNT = 4
 
-# The largest a stored chunk may be. T6 uses 0x8000; T5 PS3 clearly does not,
-# and this is empirical rather than read out of a reference implementation:
-# the largest stored chunk across the sixteen zones to hand is 49007 bytes,
-# in patch_mp.ff. 0x10000 covers every one of them with room to spare, and
-# the field is a u32 so nothing else bounds it.
+# The largest a stored chunk may be. Empirical: the largest stored chunk in
+# all 82 zones to hand is 49098 bytes (code_post_gfx.ff, frontend.ff,
+# river.ff); see docs/research/zones.md. The field is a u32, so nothing in
+# the format itself bounds it.
 XCHUNK_SIZE = 0x10000
-# What the game's own writer fills before flushing a chunk. It is not a limit
-# on what a chunk may inflate to -- real zones hold chunks well past it -- so
-# it is used only when splitting fresh content.
-XCHUNK_MAX_WRITE = 0x8000 - 0x40
 
-# A chunk's size field, and the alignment the file is padded out to.
+#: What the original writer puts in one chunk: every chunk after the 36-byte
+#: prefix inflates to exactly 0xBFC0 (49088) bytes except the last, in every
+#: one of the 82 zones measured (docs/research/zones.md). A fresh split
+#: mimics it.
+XCHUNK_WRITE_SIZE = 0xC000 - 0x40
+#: Kept under its old name for callers that split content themselves.
+XCHUNK_MAX_WRITE = XCHUNK_WRITE_SIZE
+
+# A chunk's size field.
 CHUNK_SIZE_FIELD = struct.Struct(">I")
-FILE_ALIGNMENT = 0x40
 
-# The reader tracks its position within a buffer of this size and never lets
-# a size field straddle the boundary: when one would, the rest of the buffer
-# is skipped and the field starts the next one. Without this a zone bigger
-# than the buffer desynchronises partway through.
-VANILLA_BUFFER_SIZE = 0x80000
+#: The file ends with the four terminators, then zeros: the length is the
+#: end of the last terminator plus TRAILER_SLACK, rounded up to
+#: FILE_ALIGNMENT. Measured on all 82 zones: the padding runs from 48
+#: (common_mp.ff) to 79 bytes (mp_nuked.ff), every file length is a multiple
+#: of 0x20, and every padding byte is zero.
+FILE_ALIGNMENT = 0x20
+TRAILER_SLACK = 0x30
 
-# Raw deflate: no zlib header, no gzip header.
+#: The console reads a zone through a ring buffer of 0x60000 bytes indexed by
+#: file offset: t5mp.elf at VMA 0x231ea8-0x231ec4 reduces the read position
+#: modulo 0x60000 (multiply by 0xaaaaaaab, shift 18, subtract q<<19 - q<<17)
+#: and adds the ring's base, and reads at most 0x30000 at a time (VMA
+#: 0x231f98). A chunk size field never straddles the end of the ring: when
+#: fewer than four bytes are left before a multiple of 0x60000, the writer
+#: leaves them unused and the field starts on the boundary. The one case in
+#: 82 zones is creek_1.ff, where chunk 414 ends at 0xb9ffff, the single byte
+#: 0x60 there is skipped, and chunk 415's size field 00009160 sits at
+#: 0xba0000 = 31 * 0x60000. Fifty other size fields lie within three bytes of
+#: a 0x1000 boundary and are not skipped; 0x60000 from offset 0 is the
+#: ring the ELF shows and is consistent with all 51.
+RING_BUFFER_SIZE = 0x60000
+
+#: The deflate settings that reproduce every original chunk byte for byte:
+#: raw deflate, level 9, memLevel 9, default strategy, 32K window. Python's
+#: zlib defaults to memLevel 8, which gives a different block split on some
+#: chunks -- the cause of patch.ff's old repack mismatch at 0x66a6.
 RAW_DEFLATE_WBITS = -15
 DEFAULT_LEVEL = 9
+DEFLATE_MEM_LEVEL = 9
 LEVELS = range(10)
 
 MANIFEST_NAME = "fastfile.json"
@@ -219,20 +242,39 @@ def carries_console_signature(header: bytes) -> bool:
 
 @dataclass(frozen=True)
 class Chunk:
+    """One chunk as it was read.
+
+    `deflated` is the chunk after decryption and before inflation: the exact
+    bytes the original encoder produced. Carrying it is what lets an untouched
+    chunk go back out byte for byte without trusting a recompression.
+    `skipped` is whatever sat in the ring-buffer gap before this chunk's size
+    field, usually nothing.
+    """
+
     stream: int
     nonce: bytes
     compressed: int
     body: bytes
     level: int | None = None
+    deflated: bytes = b""
+    skipped: bytes = b""
+    offset: int = 0
 
 
 @dataclass(frozen=True)
 class FastFile:
     header: bytes
     chunks: tuple[Chunk, ...]
-    # How long the file was. The tail is zero padding whose length does not
-    # follow from the chunks, so it is carried rather than recomputed.
+    # How long the file was. The tail is zeros whose length follows from the
+    # chunks (see TRAILER_SLACK); it is carried so that a file that broke the
+    # rule would still round-trip.
     total_bytes: int = 0
+    #: How many zero size fields ended the stream (four in every retail zone).
+    terminators: int = 0
+    #: Where the last terminator ends.
+    end: int = 0
+    #: Bytes skipped at the ring boundary before a terminator, by offset.
+    trailing_skips: tuple[tuple[int, bytes], ...] = ()
 
     @property
     def zone_name(self) -> str:
@@ -260,7 +302,7 @@ def check_header(header: bytes) -> None:
         )
     (version,) = struct.unpack_from(">I", header, OFFSET_VERSION)
     if version != ZONE_VERSION:
-        raise FastFileError(f"zone version {version}, this reads {ZONE_VERSION}")
+        raise FastFileError(f"zone version {version} at {OFFSET_VERSION:#x}, wanted {ZONE_VERSION}")
     if not zone_name_of(header):
         raise FastFileError("the zone name field is empty, so there is no nonce to derive")
 
@@ -311,45 +353,82 @@ class NonceTable:
             self.blocks[start + offset] ^= digest[offset]
 
 
+def deflate(body: bytes, level: int = DEFAULT_LEVEL, mem_level: int = DEFLATE_MEM_LEVEL) -> bytes:
+    """Raw deflate with the settings the original encoder used."""
+    compressor = zlib.compressobj(level, zlib.DEFLATED, RAW_DEFLATE_WBITS, mem_level)
+    return compressor.compress(body) + compressor.flush()
+
+
 def level_that_rebuilds(body: bytes, stored: bytes) -> int | None:
-    """The deflate level that reproduces `stored` exactly, if one does. Kept
-    so an untouched chunk repacks byte-identically rather than merely
-    validly."""
-    for level in LEVELS:
-        compressor = zlib.compressobj(level, zlib.DEFLATED, RAW_DEFLATE_WBITS)
-        if compressor.compress(body) + compressor.flush() == stored:
+    """The deflate level that reproduces `stored` exactly at memLevel 9, if
+    one does.
+
+    Level 9 is tried first and matches every chunk of every retail zone, so
+    this normally compresses once. Nothing on the read path calls it any
+    more: an untouched chunk keeps its original deflate stream instead.
+    """
+    for level in (DEFAULT_LEVEL, *(n for n in LEVELS if n != DEFAULT_LEVEL)):
+        if deflate(body, level) == stored:
             return level
     return None
 
 
+def ring_gap(offset: int) -> int:
+    """How many bytes must be skipped at `offset` before a size field, so it
+    does not straddle the end of the console's read ring."""
+    left = RING_BUFFER_SIZE - offset % RING_BUFFER_SIZE
+    return left if left < CHUNK_SIZE_FIELD.size else 0
+
+
+def padded_length(end: int) -> int:
+    """The file length the original writer gives a zone whose terminators end
+    at `end`."""
+    want = end + TRAILER_SLACK
+    return (want + FILE_ALIGNMENT - 1) // FILE_ALIGNMENT * FILE_ALIGNMENT
+
+
 def read_fastfile(data: bytes, key: bytes = SALSA20_KEY) -> FastFile:
     check_header(data)
-    header = data[:CHUNKS_OFFSET]
+    header = bytes(data[:CHUNKS_OFFSET])
     table = NonceTable(zone_name_of(header))
     chunks: list[Chunk] = []
     offset = CHUNKS_OFFSET
-    buffer_offset = CHUNKS_OFFSET
     stream = 0
+    terminators = 0
+    trailing: list[tuple[int, bytes]] = []
     while offset + CHUNK_SIZE_FIELD.size <= len(data):
-        if buffer_offset + CHUNK_SIZE_FIELD.size > VANILLA_BUFFER_SIZE:
-            offset += VANILLA_BUFFER_SIZE - buffer_offset
-            buffer_offset = 0
-            if offset + CHUNK_SIZE_FIELD.size > len(data):
-                break
-        buffer_offset = (buffer_offset + CHUNK_SIZE_FIELD.size) % VANILLA_BUFFER_SIZE
-        (size,) = CHUNK_SIZE_FIELD.unpack_from(data, offset)
-        offset += CHUNK_SIZE_FIELD.size
-        if size == 0:
+        gap = ring_gap(offset)
+        skipped = bytes(data[offset : offset + gap])
+        offset += gap
+        if offset + CHUNK_SIZE_FIELD.size > len(data):
             break
+        (size,) = CHUNK_SIZE_FIELD.unpack_from(data, offset)
+        if size == 0:
+            if gap:
+                trailing.append((offset - gap, skipped))
+            offset += CHUNK_SIZE_FIELD.size
+            terminators += 1
+            if terminators == STREAM_COUNT:
+                break
+            continue
+        if terminators:
+            raise FastFileError(
+                f"a chunk of {size} bytes at {offset:#x} follows a terminator; "
+                f"wanted {STREAM_COUNT} zero size fields in a row"
+            )
+        field_at = offset
+        offset += CHUNK_SIZE_FIELD.size
         if size > XCHUNK_SIZE:
             raise FastFileError(
-                f"chunk {len(chunks)} claims {size} bytes, the most is {XCHUNK_SIZE}"
+                f"chunk {len(chunks)} at {field_at:#x} claims {size} bytes, "
+                f"the most is {XCHUNK_SIZE}"
             )
         stored = data[offset : offset + size]
         if len(stored) != size:
-            raise FastFileError(f"chunk {len(chunks)} is short: wanted {size}, got {len(stored)}")
+            raise FastFileError(
+                f"chunk {len(chunks)} at {field_at:#x} is short: wanted {size}, got {len(stored)}"
+            )
         offset += size
-        buffer_offset = (buffer_offset + size) % VANILLA_BUFFER_SIZE
 
         nonce = table.nonce(stream)
         plaintext = crypt(stored, key, nonce)
@@ -358,8 +437,8 @@ def read_fastfile(data: bytes, key: bytes = SALSA20_KEY) -> FastFile:
             body = zlib.decompress(plaintext, RAW_DEFLATE_WBITS)
         except zlib.error as exc:
             raise FastFileError(
-                f"chunk {len(chunks)} on stream {stream} did not inflate ({exc}); "
-                f"the key or the nonce chain is wrong"
+                f"chunk {len(chunks)} on stream {stream} at {field_at:#x} did not inflate "
+                f"({exc}); the key, the nonce chain or the chunk framing is wrong"
             ) from exc
         chunks.append(
             Chunk(
@@ -367,13 +446,22 @@ def read_fastfile(data: bytes, key: bytes = SALSA20_KEY) -> FastFile:
                 nonce=nonce,
                 compressed=size,
                 body=body,
-                level=level_that_rebuilds(body, plaintext),
+                deflated=plaintext,
+                skipped=skipped,
+                offset=field_at,
             )
         )
         stream = (stream + 1) % STREAM_COUNT
     if not chunks:
         raise FastFileError("no chunks: the stream ended before the first one")
-    return FastFile(header=header, chunks=tuple(chunks), total_bytes=len(data))
+    return FastFile(
+        header=header,
+        chunks=tuple(chunks),
+        total_bytes=len(data),
+        terminators=terminators,
+        end=offset,
+        trailing_skips=tuple(trailing),
+    )
 
 
 def declared_size(content: bytes) -> int:
@@ -394,7 +482,61 @@ def with_declared_size(content: bytes) -> bytes:
     want = len(content) - ZONE_SIZE_PREFIX
     if want < 0:
         raise FastFileError(f"a zone is at least {ZONE_SIZE_PREFIX} bytes, got {len(content)}")
-    return struct.pack(">I", want) + content[ZONE_SIZE_AT + 4 :]
+    return struct.pack(">I", want) + bytes(content[ZONE_SIZE_AT + 4 :])
+
+
+def assemble(
+    header: bytes,
+    deflated: list[bytes],
+    key: bytes = SALSA20_KEY,
+    total_bytes: int = 0,
+    gaps: dict[int, bytes] | None = None,
+) -> bytes:
+    """Frame, encrypt and chain already-deflated chunks into a fastfile.
+
+    The nonce of every chunk is recomputed from the zone name and the chunks
+    before it on its stream, so a chunk that did not change and sits behind
+    only chunks that did not change gets back its original nonce, and with it
+    its original ciphertext.
+
+    `gaps` gives the bytes to write into a ring-buffer gap at a given offset;
+    a gap with no entry is zero-filled. `total_bytes` pads the result to that
+    length; zero means the original writer's rule (padded_length).
+    """
+    check_header(header)
+    gaps = gaps or {}
+    table = NonceTable(zone_name_of(header))
+    out = bytearray(header[:CHUNKS_OFFSET])
+
+    def field(size: int) -> None:
+        gap = ring_gap(len(out))
+        if gap:
+            fill = gaps.get(len(out), b"")
+            out.extend(fill if len(fill) == gap else bytes(gap))
+        out.extend(CHUNK_SIZE_FIELD.pack(size))
+
+    stream = 0
+    for index, plaintext in enumerate(deflated):
+        if not plaintext:
+            raise FastFileError(f"chunk {index} is empty, and a zero size ends the stream")
+        if len(plaintext) > XCHUNK_SIZE:
+            raise FastFileError(
+                f"chunk {index} compresses to {len(plaintext)} bytes, the most stored "
+                f"is {XCHUNK_SIZE}"
+            )
+        nonce = table.nonce(stream)
+        field(len(plaintext))
+        out += crypt(plaintext, key, nonce)
+        table.advance(stream, plaintext)
+        stream = (stream + 1) % STREAM_COUNT
+    # A zero size ends one stream, so every stream gets one.
+    for _ in range(STREAM_COUNT):
+        field(0)
+    want = total_bytes or padded_length(len(out))
+    if want < len(out):
+        raise FastFileError(f"the chunks need {len(out)} bytes, the file was {total_bytes}")
+    out += bytes(want - len(out))
+    return bytes(out)
 
 
 def write_fastfile(
@@ -403,58 +545,25 @@ def write_fastfile(
     key: bytes = SALSA20_KEY,
     total_bytes: int = 0,
 ) -> bytes:
-    """Rebuild a fastfile from its chunk bodies, recomputing every size.
+    """Rebuild a fastfile from its chunk bodies, compressing every one.
 
-    `total_bytes` pads the result out to the length the original had. The
-    tail is zeros and its length does not follow from the chunks, so a
-    byte-identical repack has to be told it; without it the file is padded to
-    the next FILE_ALIGNMENT boundary.
+    Each body is deflated at its given level (level 9 when None) and memLevel
+    9, which is what reproduces the retail chunks. `total_bytes` pads the
+    result out to that length; without it the original writer's rule is
+    used. For keeping untouched chunks verbatim, see opent5.container.zone.
     """
-    check_header(header)
-    table = NonceTable(zone_name_of(header))
-    out = bytearray(header)
-    buffer_offset = CHUNKS_OFFSET
-    stream = 0
-    for index, (body, level) in enumerate(bodies):
-        compressor = zlib.compressobj(
-            DEFAULT_LEVEL if level is None else level, zlib.DEFLATED, RAW_DEFLATE_WBITS
-        )
-        plaintext = compressor.compress(body) + compressor.flush()
-        # The reader's limit is on the stored size, not the inflated one:
-        # real zones hold chunks that inflate well past XCHUNK_SIZE.
-        if len(plaintext) > XCHUNK_SIZE:
-            raise FastFileError(
-                f"chunk {index} compresses to {len(plaintext)} bytes, the most stored "
-                f"is {XCHUNK_SIZE}"
-            )
-        nonce = table.nonce(stream)
-        if buffer_offset + CHUNK_SIZE_FIELD.size > VANILLA_BUFFER_SIZE:
-            out += bytes(VANILLA_BUFFER_SIZE - buffer_offset)
-            buffer_offset = 0
-        buffer_offset = (buffer_offset + CHUNK_SIZE_FIELD.size) % VANILLA_BUFFER_SIZE
-        out += CHUNK_SIZE_FIELD.pack(len(plaintext))
-        out += crypt(plaintext, key, nonce)
-        buffer_offset = (buffer_offset + len(plaintext)) % VANILLA_BUFFER_SIZE
-        table.advance(stream, plaintext)
-        stream = (stream + 1) % STREAM_COUNT
-    # A zero size ends one stream, so every stream gets one: the reader
-    # advances all four before it starts and would otherwise sit waiting on
-    # the ones never terminated.
-    out += CHUNK_SIZE_FIELD.pack(0) * STREAM_COUNT
-    if total_bytes:
-        if total_bytes < len(out):
-            raise FastFileError(f"the chunks need {len(out)} bytes, the file was {total_bytes}")
-        out += bytes(total_bytes - len(out))
-    elif len(out) % FILE_ALIGNMENT:
-        out += bytes(FILE_ALIGNMENT - len(out) % FILE_ALIGNMENT)
-    return bytes(out)
+    deflated = [deflate(body, DEFAULT_LEVEL if level is None else level) for body, level in bodies]
+    return assemble(header, deflated, key, total_bytes)
 
 
-def split_content(content: bytes, size: int = XCHUNK_MAX_WRITE) -> list[bytes]:
-    """Split fresh content into chunks. XCHUNK_MAX_WRITE is what the game's
-    own writer fills before flushing a chunk; it is not a limit on what a
-    chunk may inflate to, and real zones exceed it."""
-    return [content[at : at + size] for at in range(0, len(content), size)] or [b""]
+def split_content(content: bytes, size: int = XCHUNK_WRITE_SIZE) -> list[bytes]:
+    """Split fresh content the way the original writer does: the 36-byte
+    prefix alone, then XCHUNK_WRITE_SIZE pieces, the last one shorter."""
+    if len(content) <= ZONE_SIZE_PREFIX:
+        return [bytes(content)] if content else [b""]
+    head = [bytes(content[:ZONE_SIZE_PREFIX])]
+    rest = content[ZONE_SIZE_PREFIX:]
+    return head + [bytes(rest[at : at + size]) for at in range(0, len(rest), size)]
 
 
 def unpack(path: Path, directory: Path, key: bytes = SALSA20_KEY, out=None) -> FastFile:
