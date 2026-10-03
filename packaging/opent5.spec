@@ -13,6 +13,9 @@ resources = root / "src" / "opent5" / "gui" / "resources"
 # registers handlers per asset type, so static analysis alone misses modules.
 sys.path.insert(0, str(root / "src"))
 hidden = collect_submodules("opent5")
+# PyNaCl's compiled _sodium module imports cffi's backend from C, which static
+# analysis cannot see.
+hidden.append("_cffi_backend")
 
 import opent5  # noqa: E402
 from PyInstaller.utils.win32.versioninfo import (  # noqa: E402

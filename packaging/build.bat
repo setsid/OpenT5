@@ -12,7 +12,8 @@ if not exist %VENV%\Scripts\python.exe (
     py -3.12 -m venv %VENV% || exit /b 1
 )
 %VENV%\Scripts\python -m pip install --disable-pip-version-check -q ^
-    numpy==2.2.6 PySide6-Essentials==6.8.1 shiboken6==6.8.1 pyinstaller==6.11.1 || exit /b 1
+    numpy==2.2.6 PyNaCl==1.5.0 cffi==2.1.1 pycparser==3.0 ^
+    PySide6-Essentials==6.8.1 shiboken6==6.8.1 pyinstaller==6.11.1 || exit /b 1
 rem O5_WORK overrides the PyInstaller work folder, so two builds (for example tools\release.py
 rem in C:\o5\rel) do not share one.
 if not defined O5_WORK set O5_WORK=%~d0\o5\w

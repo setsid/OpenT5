@@ -131,26 +131,28 @@ an update found in test mode is **never installed**: Restart to Update refuses i
 the override can make the app download and verify a file, never run one. Nothing
 remote can turn it on.
 
-## The dependency decision: none
+## The dependency decision: PyNaCl (libsodium)
 
-Ed25519 verification is implemented in pure Python (`opent5/update/ed25519.py`, about
-150 lines, following the reference code in RFC 8032 section 6) instead of adding
-PyNaCl. Reasons: nothing new to pin, audit or bundle into the exe (PyNaCl brings
-libsodium and cffi into PyInstaller), and the code is short enough to read in one
-sitting. The evidence that it is right:
+Ed25519 signing and verification go through PyNaCl 1.5.0, which wraps libsodium
+(`opent5/update/ed25519.py` is a thin wrapper), pinned exactly with its two
+dependencies, cffi 2.1.1 and pycparser 3.0. An earlier pure-Python implementation passed
+every RFC 8032 test vector, but those vectors prove correct signing, not complete
+rejection, and rejection is the verifier's only job. libsodium's
+`crypto_sign_verify_detached` refuses:
 
-- every Ed25519 test vector in RFC 8032 section 7.1 (TEST 1, 2, 3, 1024 and SHA(abc);
-  `tests/fixtures/rfc8032_ed25519.json`) passes for key derivation, signing and
-  verification (`tests/test_update_crypto.py`);
-- on 40 random keys and messages, public keys and signatures matched libsodium
-  byte for byte (PyNaCl 1.5.0 in a scratch environment, not in the repo), and
-  single-bit corruptions were rejected;
-- the extra checks libsodium also makes are present: non-canonical S (S >= L), invalid
-  or non-canonical point encodings, and small-order public keys are rejected.
+- non-canonical S (S >= L), so a signature cannot be re-encoded into a second valid one;
+- non-canonical public key encodings (y >= p);
+- small-order public keys and small-order R, which otherwise let one signature verify
+  against many messages.
 
-Verification handles only public data, so it does not need to be constant time.
-Signing (release machine only) is not constant time; an attacker would need to time
-signing operations on that machine, which is out of scope.
+`tests/test_update_crypto.py` checks each of these against this module: all eight
+small-order encodings as the public key with crafted signatures, small-order R under a
+real key, S + kL for several k, S at and above L, non-canonical key encodings, plus the
+RFC 8032 vectors and single-bit corruptions. The tests were seen to fail with a verifier
+that accepts everything.
+
+Verification handles only public data. Signing runs only on the release machine, with
+libsodium's constant-time implementation.
 
 The file formats are minisign's (signature, public key, and the passphrase-encrypted
 secret key: scrypt from `hashlib`, XOR, BLAKE2b-256 checksum). The scrypt parameters
