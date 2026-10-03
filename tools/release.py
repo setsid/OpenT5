@@ -38,7 +38,7 @@ from opent5.update import minisign  # noqa: E402
 from opent5.update import version as semver  # noqa: E402
 
 INIT = ROOT / "src" / "opent5" / "__init__.py"
-#: The build folder (Windows path); never the lead's C:\o5\src.
+#: The build folder (Windows path), kept apart from the working copy in C:\o5\src.
 BUILD_DIR = r"C:\o5\rel"
 EXE_NAME = f"{opent5.APP_NAME}.exe"
 
@@ -258,7 +258,7 @@ def check_release(files: list[Path], version: str, public: minisign.PublicKey) -
 
 
 def main(argv: list[str] | None = None) -> int:
-    sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with the build's
+    sys.stdout.reconfigure(line_buffering=True)  # interleave in order with the build's output
     if argv is None:
         argv = sys.argv[1:]
     if argv[:1] == ["version"]:

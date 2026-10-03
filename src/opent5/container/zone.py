@@ -119,8 +119,6 @@ class Zone:
     def modified(self) -> bool:
         return bytes(self.header) != self._header or self.content != self._original
 
-    # The plan: a list of (body, deflated-or-None) covering the content.
-
     def _matches(self, content: bytes, at: int, index: int) -> bool:
         size = self._sizes[index]
         start = self._starts[index]

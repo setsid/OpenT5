@@ -6,7 +6,7 @@ Why an oracle. A fastfile is a memory image: offset pointers are encoded as
 ((block << 29) | offset) + 1 and point into the in-memory block, not into the file.
 Growing a string inside VIRTUAL (block 4) moves everything loaded after it in that
 block, and every later DB_AllocStreamPos re-aligns, so the shift is piecewise. The
-product remapper (another track) derives the layout from its own struct walker; this
+product remapper (opent5.xfile.remap) derives the layout from its own struct walker; this
 tool derives it from the shipped loader instead, so the two can be compared byte for
 byte (fixture tests/fixtures/remap_<zone>.json).
 
@@ -270,7 +270,6 @@ def build(content: bytes, value_offset: int, old: bytes, new: bytes):
     assert len(grown) == 1, grown
     string_old_pos = grown[0][0]
 
-    # Pointer fields.
     pointers = []  # (file_offset, function, old_value, new_value)
     unresolved = 0
     by_block: dict[int, int] = {}

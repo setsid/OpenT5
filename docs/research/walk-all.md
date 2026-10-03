@@ -35,10 +35,10 @@ expected and found values.
    offset and the seven block positions at its start.
 2. Run the game's loader for that one asset: a scratch PowerPC interpreter (the one described
    in `structs-content.md` section 1, local CPU emulation only) loads `t5mp.elf`, sets the
-   seven block positions and the file position to the values our parser had at the asset's
+   seven block positions and the file position to the values the OpenT5 parser had at the asset's
    start, pushes VIRTUAL and calls `Load_XAsset` (0x256e60) as the loop at 0x233ba4 does.
 3. Compare the game's Load_Stream / string reads (block, size, file offset, return address)
-   with our handler's READ / STRING / DEFER events and stop at the first difference; the
+   with the OpenT5 handler's READ / STRING / DEFER events and stop at the first difference; the
    return address names the load site, whose disassembly gives the field, count and alignment.
 4. Fix the handler, re-run the comparison until the reads are identical, then re-walk all
    zones.

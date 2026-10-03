@@ -24,7 +24,7 @@ Nothing was copied into the repo. Scratch inflations are in the R5 scratch direc
 
 ## 1. PC T5 zone format vs PS3
 
-### 1.1 File header - CONFIRMED
+### 1.1 File header: CONFIRMED
 
 PC `.ff`, first 16 bytes (identical pattern in mp_nuked.ff, mp_firingrange.ff, common_mp.ff,
 patch_mp.ff, usermaps zombie_test_room.ff):
@@ -51,7 +51,7 @@ OpenAssetTools agrees: src/ZoneCommon/Game/T5/ZoneConstantsT5.h (`MAGIC_UNSIGNED
 `IWffu100` (0x121cdc), `IWff0100` (0x121ce8). INFERRED: `s` = signed PC zone (retail/patch),
 `u` = unsigned (all stock PC zones on this machine are `u`), `0` = console form.
 
-### 1.2 XFile header - CONFIRMED
+### 1.2 XFile header: CONFIRMED
 
 Same 36-byte layout (size, externalSize, 7 block sizes), little-endian on PC:
 
@@ -78,7 +78,7 @@ StepLoadZoneSizes and the PC loader).
 
 Pointer size is 32-bit on both; the -1 (inline follows) marker is the same (`ffffffff`).
 
-### 1.3 Script strings and asset list - CONFIRMED identical modulo enum
+### 1.3 Script strings and asset list: CONFIRMED identical modulo enum
 
 For the three stock MP maps compared, the PC and PS3 zones share the script string table byte
 for byte (52 .. start of asset array; mp_nuked 516 strings, asset array at 0x2d74 in both;
@@ -107,7 +107,7 @@ linker with a ps3 platform, and the asset order of a PC map zone is a good templ
 PS3 one. Identity of the extra sound: INFERRED (likely a platform sound bank or patch; confirm
 with R1's walker by reading the name of PS3 asset 443 in mp_nuked).
 
-### 1.4 Example asset: rawfile - CONFIRMED
+### 1.4 Example asset (rawfile): CONFIRMED
 
 `maps/mp/mp_nuked.gsc`:
 
@@ -230,7 +230,7 @@ the map tables, loadscreen and menus need no changes; requires the signature-pat
 A Radiant box (six caulk/textured brushes, spawns, a light) compiled with cod2map/cod2rad and
 linked with `col_map_mp,maps/mp/mp_box.d3dbsp` produces a PC zone with col_map_mp, com_map,
 game_map_mp, gfx_map, map_ents, the techsets/materials/images of the textures used, a PC
-configstrings table and the listed rawfiles - i.e. every asset in 4.1 except the PS3-only
+configstrings table and the listed rawfiles, i.e. every asset in 4.1 except the PS3-only
 texturelist and the per-gametype configstrings, already in the correct order and with the
 same script strings. Converting it needs: type renumbering, endian swap of every field
 (needs per-struct layouts, R2), gfx_map vertex/index re-layout, techset substitution, image
@@ -252,7 +252,7 @@ collision and lighting must be internally consistent, which the PC compiler othe
 1. Build the PS3 struct writer first (needed by either route), proven by round-tripping stock
    PS3 map zones.
 2. For the box map, use a hybrid: compile the box with the PC tools on this machine, parse the
-   PC zone (LE, unsigned, plain zlib - trivial to read), and convert the world assets
+   PC zone (LE, unsigned, plain zlib, so easy to read), and convert the world assets
    field by field into PS3 structs; substitute techsets by name from stock PS3 zones; use only
    textures already present on PS3 so no image re-encoding or `.pak` is needed at first;
    copy configstrings, sound, glasses and texturelist from the replaced stock map.

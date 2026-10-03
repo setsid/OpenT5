@@ -69,7 +69,7 @@ the way past one.
 
 GitHub answers 404 for a private repository when asked without credentials, so while
 the repository is private every check ends quietly in "not-found". That is expected:
-the check starts working the moment the repository (or just its releases) is public.
+the check starts working the moment the repository (or only its releases) is public.
 Unauthenticated API requests are limited to 60 an hour per IP address; one per start is
 well inside that.
 
@@ -112,7 +112,7 @@ What it does not protect against:
 - **Theft of the private key together with its passphrase.** Whoever has both can sign
   anything. Keep it offline (below).
 - **Withholding updates.** Someone who can block or alter the connection can stop the
-  app learning about a new release. The app then just stays on its current version.
+  app learning about a new release. The app then stays on its current version.
 - **Malware already running as the user.** It could replace the exe directly; nothing
   an updater does helps against that.
 
@@ -126,7 +126,7 @@ sign with a throwaway key and the release key is never needed.
 
 Does this weaken anything? Using it needs two environment variables in the app's own
 process and a server on the same machine's loopback address, which together already
-mean code running as the user (who could simply replace the exe). On top of that,
+mean code running as the user (who could replace the exe). On top of that,
 an update found in test mode is **never installed**: Restart to Update refuses it. So
 the override can make the app download and verify a file, never run one. Nothing
 remote can turn it on.

@@ -27,7 +27,7 @@ decrypts first and inflates second. Chunks go round-robin over four streams,
 each with its own Salsa20 nonce state and block index.
 
 The nonce is not fixed. A table of 200 x streams x 20 bytes is filled from the
-zone name -- four copies of each character in turn, cycling -- and a chunk's
+zone name (four copies of each character in turn, cycling), and a chunk's
 nonce is the first eight bytes of its stream's current 20-byte block. After a
 chunk is decrypted its plaintext is hashed with SHA-1, the block index
 advances, and the hash is XORed into the block it lands on. So the nonces
@@ -85,8 +85,8 @@ CHUNKS_OFFSET = 0x13C
 #: found anywhere: the function at VMA 0x22f8d0 builds a 270-byte PKCS#1
 #: RSAPublicKey DER on its stack one `stb` at a time, hands it to
 #: `rsa_import`, and then calls `rsa_verify_hash_ex` at VMA 0x230248. The DER
-#: parses exactly -- SEQUENCE of 266, INTEGER of 257 with the usual leading
-#: zero, INTEGER 65537, nothing left over -- which is the check that it was
+#: parses exactly (SEQUENCE of 266, INTEGER of 257 with the usual leading
+#: zero, INTEGER 65537, nothing left over), which is the check that it was
 #: reassembled correctly.
 CONSOLE_KEY_MODULUS = int(
     "c9513aa85db84b36a02cecf736c66e76def3d3a898cbc97d4cf373e820435048"
@@ -111,7 +111,7 @@ PSS_HASH_SIZE = 32
 PSS_TRAILER = 0xBC
 
 #: The message the signature covers is a 4000-byte buffer, and what fills it
-#: is *not* established -- see the finding. Nothing here depends on knowing,
+#: is *not* established (see the finding). Nothing here depends on knowing,
 #: because nothing here can sign.
 CONSOLE_SIGNED_MESSAGE_SIZE = 4000
 
@@ -135,7 +135,6 @@ XCHUNK_WRITE_SIZE = 0xC000 - 0x40
 #: Kept under its old name for callers that split content themselves.
 XCHUNK_MAX_WRITE = XCHUNK_WRITE_SIZE
 
-# A chunk's size field.
 CHUNK_SIZE_FIELD = struct.Struct(">I")
 
 #: The file ends with the four terminators, then zeros: the length is the
@@ -163,7 +162,7 @@ RING_BUFFER_SIZE = 0x60000
 #: The deflate settings that reproduce every original chunk byte for byte:
 #: raw deflate, level 9, memLevel 9, default strategy, 32K window. Python's
 #: zlib defaults to memLevel 8, which gives a different block split on some
-#: chunks -- the cause of patch.ff's old repack mismatch at 0x66a6.
+#: chunks: the cause of patch.ff's old repack mismatch at 0x66a6.
 RAW_DEFLATE_WBITS = -15
 DEFAULT_LEVEL = 9
 DEFLATE_MEM_LEVEL = 9
@@ -206,8 +205,8 @@ def console_signature_of(header: bytes) -> ConsoleSignature | None:
 
     None when the field is not a well-formed PSS encoding, which is what a
     made-up or tampered signature gives. A successful decode is not proof the
-    signature matches this file -- that needs the signed message, which is not
-    known -- but it does say the field came from whoever holds the private
+    signature matches this file (that needs the signed message, which is not
+    known), but it does say the field came from whoever holds the private
     key, because the padding it recovers cannot be hit by chance.
     """
     if len(header) < OFFSET_SIGNATURE + SIGNATURE_SIZE:
@@ -495,8 +494,8 @@ def declared_size(content: bytes) -> int:
 def with_declared_size(content: bytes) -> bytes:
     """The content with its own length field made to agree with its length.
 
-    Derived rather than carried. A byte-identical repack is unaffected --
-    the number it computes is the number that was already there -- and a
+    Derived rather than carried. A byte-identical repack is unaffected (the
+    number it computes is the number that was already there), and a
     repack whose content changed length gets a header that matches what it
     actually sends instead of what the file it came from used to be.
     """
@@ -638,12 +637,8 @@ def pack(
     out = sys.stdout if out is None else out
     header = (directory / HEADER_NAME).read_bytes()
     content = (directory / CONTENT_NAME).read_bytes()
-    # The zone's own length field, derived from the content actually being
-    # packed rather than carried over from the file it was unpacked from.
     # Done here and not in write_fastfile: that one is a faithful primitive
-    # over arbitrary buffers, and this is the step that knows its input is a
-    # zone. A byte-identical repack is unaffected, because the number this
-    # computes is the number already there.
+    # over arbitrary buffers, and this is the step that knows its input is a zone.
     fixed = with_declared_size(content) if derive_size else content
     if fixed != content:
         print(

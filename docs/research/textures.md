@@ -26,7 +26,7 @@ R2b's ELF-backed layout wins.
 | Volume layout | 3D Morton (x, y, z bits interleaved) | CONFIRMED on a 32^3 identity LUT |
 | Mip chain | Levels packed with no per-level padding; each face padded to 128 bytes | CONFIRMED (size fields) |
 | Cube maps | Six faces back to back, each with its mips, each 128-aligned | CONFIRMED; face order INFERRED |
-| Linear (LN, pitch) textures | None in any examined zone (pitch = 0 everywhere) | — |
+| Linear (LN, pitch) textures | None in any examined zone (pitch = 0 everywhere) | n/a |
 | Encoder needed? | Yes for PNG input; carry DXT blocks straight from DDS when given one | Recommendation |
 
 ## 2. Where pixels live

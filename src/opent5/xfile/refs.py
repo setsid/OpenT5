@@ -14,8 +14,7 @@ A parse records, as it goes:
 
 ``Refs.resolve(value)`` turns a raw pointer value into a ``Target``: the asset
 an alias slot holds, or the node, key, element and byte offset of the data an
-offset pointer names. This is what the export track had to rebuild from the
-event log (``opent5.export.nodes.AliasResolver`` / ``MemoryMap``).
+offset pointer names.
 """
 
 from __future__ import annotations
