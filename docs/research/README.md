@@ -15,6 +15,7 @@ code is marked INFERRED.
 | R6 | wad.md | The online .wad container |
 | R7 | pak.md | The .pak container (streamed images and sound) |
 | P6 | box-map.md | A box map from the PC tools to a PS3 map zone |
+| P6 | box-lighting.md | Lightmaps, light grid, probes and compass: PC to PS3, proven on mp_nuked |
 | M2 | walk-all.md | Walking every zone |
 | M3 | rewrite-all.md | Writing every zone back |
 | M4 | fields.md | Typed fields over the parsed bytes |
