@@ -53,6 +53,14 @@ across all 178 zones at once, cached on disk in SQLite. Cold build about 47 s,
 warm about 0.3 s, queries 55 to 230 ms. CLI and a GUI panel are wired in the
 morning's final pass.
 
+### Mod patch format (commits c7d32b2, 8ea5e21)
+
+`opent5 patch create/apply/info`: share a mod as only the difference from a stock
+zone, so no game files are redistributed. A text edit makes a patch of a few
+hundred bytes (proven: a cfg edit is 309 bytes, reproducing the edited zone
+byte-identically). Apply refuses a source whose hash does not match. CLI wired
+and smoke-tested end to end; a GUI panel is in the final pass.
+
 ### Blocky-terrain map generator (commit 8b16d30)
 
 A seeded generator for blocky voxel terrain (hills, caves, trees, water, a small
