@@ -58,7 +58,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / ".oracle" / "r2b"))  # the emulator harness (scratch code)
 
-from emu import BLOCKBASE, BLOCKSTEP, G281, STREAM_POS, Emu  # noqa: E402
+from emu import BLOCKBASE, BLOCKSTEP, G281, Emu  # noqa: E402
 from ppc import M32  # noqa: E402
 
 from opent5 import env  # noqa: E402
@@ -142,7 +142,7 @@ class TracingEmu(Emu):
     def final_positions(self) -> list[int]:
         pos = [self.m.r32(SAVED_POS + 4 * i) for i in range(7)]
         pos[self.block()] = self.pos()
-        return [p - b for p, b in zip(pos, self.bbase)]
+        return [p - b for p, b in zip(pos, self.bbase, strict=False)]
 
     def image(self, b: int, size: int) -> bytes:
         return self.m.read(self.bbase[b], size)
@@ -231,7 +231,7 @@ class Relayout:
     def runs(self):
         """[old_start, delta] breakpoints: delta applies from old_start on."""
         out = []
-        for os_, ol, ns, nl, fo in self.segs:
+        for os_, _ol, ns, _nl, _fo in self.segs:
             d = ns - os_
             if not out or out[-1][1] != d:
                 out.append([os_, d])
@@ -264,7 +264,7 @@ def build(content: bytes, value_offset: int, old: bytes, new: bytes):
     pointers = []  # (file_offset, function, old_value, new_value)
     unresolved = 0
     by_block: dict[int, int] = {}
-    for fn, field, value, fo in tr.convs:
+    for fn, _field, value, fo in tr.convs:
         if fo is None:
             unresolved += 1
             continue
@@ -296,11 +296,12 @@ def build(content: bytes, value_offset: int, old: bytes, new: bytes):
         gap_hits=lay.gap_hits,
         alias_conversions=sum(1 for c in tr.convs if c[0] == TO_ALIAS),
         remapped_fields_in_block=_count(
-            block_of(c[1])[0] for c, p in zip(tr.convs, pointers) if p[3] != p[2]
+            block_of(c[1])[0] for c, p in zip(tr.convs, pointers, strict=False) if p[3] != p[2]
         ),
         pointers_to_string=sum(
-            1 for c in tr.convs if (c[2] - 1) & 0x1FFFFFFF == string_old_pos
-            and (c[2] - 1) >> 29 == VIRTUAL
+            1
+            for c in tr.convs
+            if (c[2] - 1) & 0x1FFFFFFF == string_old_pos and (c[2] - 1) >> 29 == VIRTUAL
         ),
     )
     seen, changes = alignment_effects(tr.ops, value_offset, delta)
@@ -321,7 +322,7 @@ def validate(orig: bytes, edited: bytes, tr0: TracingEmu, lay: Relayout, new_tex
     report["conversions_same_count"] = len(tr1.convs) == len(tr0.convs)
     # Pointers resolved in the edited run must be the mapped originals.
     bad = 0
-    for (f0, a0, v0, _), (f1, a1, v1, _) in zip(tr0.convs, tr1.convs, strict=True):
+    for (f0, _a0, v0, _), (f1, _a1, v1, _) in zip(tr0.convs, tr1.convs, strict=True):
         b0, o0 = (v0 - 1) >> 29, (v0 - 1) & 0x1FFFFFFF
         exp = ((b0 << 29) | (lay.map(o0) if b0 == VIRTUAL else o0)) + 1
         if f0 != f1 or v1 != exp:
@@ -331,7 +332,7 @@ def validate(orig: bytes, edited: bytes, tr0: TracingEmu, lay: Relayout, new_tex
     old_img = tr0.image(VIRTUAL, lay.old_end)
     new_img = tr1.image(VIRTUAL, lay.new_end)
     rebuilt = bytearray(old_img)
-    for os_, ol, ns, nl, fo in lay.segs:
+    for os_, ol, ns, nl, _fo in lay.segs:
         if nl == ol:
             rebuilt[os_ : os_ + ol] = new_img[ns : ns + nl]
     base_old, base_new = tr0.bbase[VIRTUAL], tr1.bbase[VIRTUAL]
@@ -349,7 +350,10 @@ def validate(orig: bytes, edited: bytes, tr0: TracingEmu, lay: Relayout, new_tex
             for j in range(max(0, i - 3), i + 1):
                 w0 = struct.unpack_from(">I", img_old, j)[0]
                 w1 = struct.unpack_from(">I", img_rebuilt, j)[0]
-                if base_old <= w0 <= base_old + lay.old_end and base_new <= w1 <= base_new + lay.new_end:
+                if (
+                    base_old <= w0 <= base_old + lay.old_end
+                    and base_new <= w1 <= base_new + lay.new_end
+                ):
                     try:
                         hit = base_new + lay.map(w0 - base_old) == w1
                     except ValueError:
@@ -372,7 +376,7 @@ def validate(orig: bytes, edited: bytes, tr0: TracingEmu, lay: Relayout, new_tex
     report["virtual_pointer_words_mapped_back"] = explained
     report["virtual_unexplained_bytes"] = unexplained
     report["virtual_diff_bytes_after_mapping"] = sum(
-        1 for x, y in zip(old_img, rebuilt) if x != y
+        1 for x, y in zip(old_img, rebuilt, strict=False) if x != y
     )
     report["grown_allocations"] = sum(1 for s in lay.segs if s[3] != s[1])
     report["string_loaded"] = new_img[grown[2] : grown[2] + grown[3]].rstrip(b"\0").decode()
@@ -385,9 +389,9 @@ def validate(orig: bytes, edited: bytes, tr0: TracingEmu, lay: Relayout, new_tex
         before = explained
         explain(o, n, hdr[2 + b])
         report[f"block{b}_pointer_words_mapped_back"] = explained - before
-        report[f"block{b}_diff_bytes"] = sum(1 for x, y in zip(o, n) if x != y)
+        report[f"block{b}_diff_bytes"] = sum(1 for x, y in zip(o, n, strict=False) if x != y)
     # Pointed-to content for every VIRTUAL pointer resolved in the edited run.
-    for (f0, a0, v0, _), (f1, a1, v1, _) in zip(tr0.convs, tr1.convs, strict=True):
+    for (_f0, _a0, v0, _), (_f1, _a1, v1, _) in zip(tr0.convs, tr1.convs, strict=True):
         b0, o0 = (v0 - 1) >> 29, (v0 - 1) & 0x1FFFFFFF
         if b0 != VIRTUAL:
             continue
@@ -428,7 +432,18 @@ def main(argv):
     same = bytes(back.content) == edited
     verify(out_path, expected=edited)
     sha = hashlib.sha1(out_path.read_bytes()).hexdigest()
-    print("saved", out_path, "chunks", result.chunks, "kept", result.kept, "reopen_equal", same, "sha1", sha)
+    print(
+        "saved",
+        out_path,
+        "chunks",
+        result.chunks,
+        "kept",
+        result.kept,
+        "reopen_equal",
+        same,
+        "sha1",
+        sha,
+    )
     if fixture:
         doc = {
             "block": VIRTUAL,
@@ -447,8 +462,10 @@ def main(argv):
             "pointers": [[fo, v, nv] for fo, fn, v, nv in pointers if nv != v],
             "conversions_total": stats["conversions"],
             "conversions_by_block": [stats["by_block"].get(b, 0) for b in range(7)],
-            "alignment_changes": [[a, m, b, c] for a, m, b, c in
-                                  alignment_effects(tr.ops, value_at, len(new) - len(old))[1]],
+            "alignment_changes": [
+                [a, m, b, c]
+                for a, m, b, c in alignment_effects(tr.ops, value_at, len(new) - len(old))[1]
+            ],
             # sha1 of the saved .ff as five big-endian u32
             "output_sha1": [int(sha[i : i + 8], 16) for i in range(0, 40, 8)],
         }
