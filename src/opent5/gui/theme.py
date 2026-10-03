@@ -18,6 +18,8 @@ from PySide6.QtWidgets import QApplication
 MONO_FAMILIES = ("Cascadia Mono", "Consolas", "JetBrains Mono", "DejaVu Sans Mono")
 MONO_POINT_SIZE = 9
 UI_POINT_SIZE = 9
+#: Interface families in order of preference; the platform default if none is installed.
+UI_FAMILIES = ("Segoe UI", "Inter", "Noto Sans", "DejaVu Sans")
 
 
 @dataclass(frozen=True)
@@ -159,6 +161,14 @@ def mono_family() -> str:
         if family in installed:
             return family
     return QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont).family()
+
+
+def ui_family() -> str:
+    installed = set(QFontDatabase.families())
+    for family in UI_FAMILIES:
+        if family in installed:
+            return family
+    return QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont).family()
 
 
 def mono_font(size: int = MONO_POINT_SIZE) -> QFont:

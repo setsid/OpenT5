@@ -31,6 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationVersion(opent5.__version__)
     app.setWindowIcon(icons.app_icon())
     font = app.font()
+    font.setFamily(theme.ui_family())
     font.setPointSize(theme.UI_POINT_SIZE)
     app.setFont(font)
     window = MainWindow()
