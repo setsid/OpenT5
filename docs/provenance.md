@@ -15,6 +15,8 @@ OpenAssetTools, which is GPL-3.0.
 |---|---|---|---|---|
 | docs/research/structs-content.md | OpenAssetTools @ ecfdab39 | src/Common/Game/T5/T5_Assets.h | Struct and field names for content asset types (layouts and offsets were measured from t5mp.elf and zone bytes) | Names only; PS3 offsets differ and are the document's own |
 | docs/research/structs-map.md | OpenAssetTools @ ecfdab39 | src/Common/Game/T5/T5_Assets.h | Field names for GfxWorld, ComWorld and other map types where PS3 data gives no name (sizes, order and offsets measured from t5mp.elf and zone bytes) | Names only |
+| src/opent5/export/ (material sampler names) | OpenAssetTools @ ecfdab39 | src/Common/Utils/Djb2.h, src/Common/Game/T5/CommonT5.h | The sampler-name hash algorithm (case-insensitive djb2 variant) and the sampler names it is applied to | Reimplemented in Python; confirmed against stored hashes in mp_nuked (docs/extract.md section 5) |
+| src/opent5/export/ (path nodes), docs/extract.md | OpenAssetTools @ ecfdab39 | src/Common/Game/T5/T5_Assets.h | pathnode_constant_t field names and order | Names only; offsets confirmed against the loader and mp_nuked data |
 
 ## Derived from game data, not copied
 
