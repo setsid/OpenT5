@@ -40,8 +40,9 @@ How it works.
    / PHYSICAL / TEMP images must equal the original ones once each allocation is moved
    back and each pointer value is mapped back.
 
-Usage:  .venv/bin/python tools/remap_oracle.py OUT.ff [FIXTURE.json]
-(defaults: code_post_gfx_mp, localize asset 4162, "PLAYER MATCH" -> "OPENT5 REMAP OK").
+Usage:  .venv/bin/python tools/remap_oracle.py OUT.ff [FIXTURE.json [LENGTH]]
+(code_post_gfx_mp, localize asset 4162, "PLAYER MATCH" -> "OPENT5 REMAP OK"; LENGTH pads the
+new value with trailing spaces to that many characters, e.g. 140 for a +0x80 edit).
 """
 
 from __future__ import annotations
@@ -414,6 +415,8 @@ def main(argv):
     asset_at = 0x34357F
     value_at = asset_at + 8
     old, new = b"PLAYER MATCH", b"OPENT5 REMAP OK"
+    if len(argv) > 3:  # pad the new value with trailing spaces to this many characters
+        new = new.ljust(int(argv[3], 0), b" ")
     edited, tr, lay, pointers, stats = build(content, value_at, old, new)
     print("build", json.dumps(stats))
     rep = validate(content, edited, tr, lay, new)

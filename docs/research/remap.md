@@ -115,3 +115,41 @@ list and a byte-identical .ff.
   replay for those blocks; the tool handles VIRTUAL only.
 - Hardware/RPCS3 behaviour is untested here; the signature is void, so the zone loads only on a
   client with the signature check patched out.
+
+## 7. Variant b2: an edit that changes blockSize[4]
+
+Same entry, value "OPENT5 REMAP OK" padded with trailing spaces to 140 characters: +0x80 bytes
+(`tools/remap_oracle.py OUT FIXTURE 140`). The largest VIRTUAL alignment met after the edit is
+16 (masks seen after VIRTUAL 0x9b2fa: 0 x13481, 1 x37, 3 x9804, 7 x1749, 15 x19), so a multiple
+of 0x80 cannot be absorbed by padding.
+
+| Item | Value |
+|---|---|
+| Relayout | [0, 0x9b307): +0; [0x9b307, end): +0x80; no alignment changed the shift (0 changes) |
+| Pointers remapped | 20680 of 47476 (fields: 805 in TEMP, 19875 in VIRTUAL), all to-pointer |
+| Header fields changed | size at content 0x0: 0x009bb0df -> 0x009bb15f; blockSize[4] at 0x18: 0x00276c61 -> 0x00276ce1. blockSize[0] (TEMP, 0xa98) and blockSize[6] (PHYSICAL, 0x6f8e00) unchanged |
+| Content length | 0x9bb103 -> 0x9bb183 |
+
+Validation (same checks as section 4): the loader consumes all 0x9bb183 bytes; final positions
+[0,0,0,0,0x276ce1,0,0x6f8e00] equal the new header; 47476 conversions, 0 value mismatches; VIRTUAL
+image identical after moving allocations back (34835 pointer words mapped back: the 19875 file
+pointers plus pointers the loader writes for inline data, which also move; 0 unexplained bytes);
+TEMP identical after mapping 14 such words; PHYSICAL byte-identical; all 47476 pointed-to windows
+equal after mapping (47380 raw-identical, the rest contain a moved pointer or the edited
+string); asset 4162 loads "OPENT5 REMAP OK" plus 125 spaces. `Zone.open` round trip and `verify()`
+pass. Output `out/hwtest/b2_blocksize/code_post_gfx_mp.ff`, sha1
+7e00990c394ee225716b90ef41419245d1332155. Fixture: `tests/fixtures/remap_code_post_gfx_mp_b2.json`.
+
+Other dependencies on absolute VIRTUAL positions. Checked:
+- No stored size or count spans the localize region: each LocalizeEntry is two string pointers
+  (structs-content.md section 5) and owns nothing else.
+- The old VIRTUAL size 0x00276c61 occurs in the content only at 0x18 (the header). The old
+  content size 0x009bb0df occurs only at 0x0. The full length 0x009bb103 does not occur.
+- Everything the loader leaves in memory, once mapped back, equals the original. A stored
+  absolute position would show up as an unexplained byte, and there were none.
+- Alignment relative to the block base is preserved modulo 0x80, which covers every mask the
+  loader applies after the edit (largest 16, vertex shader programs).
+- Not covered: what the post-load functions the harness stubs out do at runtime (asset
+  registration, script string remap, RSX offset conversion). They act on pointers the loader
+  has already resolved, so they should not need block positions. INFERRED; the hardware test
+  will confirm it.
