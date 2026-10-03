@@ -45,3 +45,13 @@ built as disjoint tracks to avoid file collisions:
 Cores (patch/, index/) are separate packages with their own tests; CLI and GUI
 wiring is done in single-owner passes so cli.py and gui/ have one editor at a
 time. Zone diff and GSC reference search are stretch, after the three above.
+
+**Integration landed (87af53d).** Verified independently: lint clean, fast suite
+712 in 40 s, full suite 982 in 20 m (watched it complete over the working tree),
+178/178 zones round-trip byte-identical. Committed. Stand-in `retail-english`
+given pinned retail copies of mp_nuked.ff and .pak so overnight tests do not
+depend on the live disc (the user is testing against it).
+
+**A/B fix honesty.** The primary-light fix makes the grid reference the room
+light but cod2rad bakes it darker than Nuketown (p50 174 vs 1151). Recorded as
+"dim, needs device run to confirm" rather than claimed fixed.
