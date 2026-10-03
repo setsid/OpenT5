@@ -8,24 +8,26 @@ from __future__ import annotations
 
 import struct
 import zlib
-from dataclasses import dataclass
 
 from opent5.xfile.constants import PTR_INLINE, AssetType, Block
-from opent5.xfile.handlers.base import Handler, register
+from opent5.xfile.handlers.base import Handler, array, register
 from opent5.xfile.stream import Chunk, XStream
-from opent5.xfile.writer import Writer
 
 
-@dataclass
-class RawFile:
-    name: str | None
-    #: Raw pointer values as stored (-1 inline, 0 null, else an offset pointer).
-    name_ptr: int
-    #: The len field: the buffer holds len + 1 bytes.
-    length: int
-    buffer_ptr: int
-    #: len + 1 bytes when the buffer is inline, else None.
-    buffer: bytes | None
+class RawFile(dict):
+    """Node: "header" (12 bytes), "name", "buffer" (len + 1 bytes or None)."""
+
+    @property
+    def name(self) -> str | None:
+        return self.get("name")
+
+    @property
+    def length(self) -> int:
+        return struct.unpack_from(">i", self["header"], 4)[0]
+
+    @property
+    def buffer(self) -> bytes | None:
+        return self.get("buffer")
 
     @property
     def compressed(self) -> bool:
@@ -47,34 +49,21 @@ class RawFile:
             return data
         return self.buffer[: self.length]
 
+    @classmethod
+    def build(cls, name: str, contents: bytes) -> RawFile:
+        """A plain (uncompressed) rawfile with an inline name and buffer."""
+        header = struct.pack(">IiI", PTR_INLINE, len(contents), PTR_INLINE)
+        return cls(header=header, name=name, buffer=bytes(contents) + b"\0")
+
 
 @register
 class RawFileHandler(Handler):
     asset_type = AssetType.RAWFILE
     header_size = 12
-    writable = True
+    node_type = RawFile
 
-    def read(self, st: XStream, header: Chunk) -> RawFile:
-        st.push(Block.VIRTUAL)
-        name = st.string(header, 0)
-        length = header.s32(4)
-        buffer = None
-        if st.follows(header, 8, owned=True):
-            st.alloc(15)
-            buffer = st.load(length + 1).bytes()
-        st.pop()
-        return RawFile(name, header.u32(0), length, header.u32(8), buffer)
-
-    def write(self, data: RawFile, writer: Writer) -> None:
-        writer.u32(data.name_ptr)
-        writer.s32(data.length)
-        writer.u32(data.buffer_ptr)
-        if data.name_ptr == PTR_INLINE:
-            writer.string(data.name or "")
-        if data.buffer_ptr != 0:
-            if data.buffer is None or len(data.buffer) != data.length + 1:
-                found = None if data.buffer is None else len(data.buffer)
-                raise ValueError(
-                    f"rawfile {data.name}: buffer expected {data.length + 1} bytes, found {found}"
-                )
-            writer.bytes(data.buffer)
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        array(io, h, 8, 15, h.s32(4) + 1, node, "buffer", owned=True)
+        io.pop()

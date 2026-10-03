@@ -3,9 +3,9 @@
 tests/fixtures/xfile_oracle.json holds, for every asset of nine zones, the file
 span and the seven block positions before and after it, recorded while the
 game's loader code (t5mp.elf Load_XAsset, run in a PowerPC interpreter) loaded
-the zone; numbers only. Here the parser must reproduce all of them, end every
-block at the header's size, and write every rawfile, stringtable and localize
-asset back to its exact bytes.
+the zone; numbers only. Here the parser must reproduce all of them and end every
+block at the header's size, and the writer must give back every asset's exact
+bytes, the whole content, and (through Zone.save) the original .ff.
 
 Skipped unless .env points at the zones.
 """
@@ -17,12 +17,14 @@ import pytest
 
 from opent5 import env
 from opent5.container.zone import Zone
-from opent5.xfile import REGISTRY, AssetType, Writer, parse
+from opent5.xfile import AssetType, parse, write, write_asset
 from opent5.xfile.events import EventKind, PtrKind
 
 FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "xfile_oracle.json").read_text())
 ZONES = sorted(FIXTURE["zones"])
 TIER1 = (AssetType.RAWFILE, AssetType.STRINGTABLE, AssetType.LOCALIZE)
+#: The container Zone each sample was inflated from, for the .ff rebuild.
+OPENED: dict = {}
 
 
 def candidates(name: str) -> list[Path]:
@@ -45,8 +47,10 @@ def sample(request):
     name = request.param
     want = FIXTURE["zones"][name]["length"]
     for path in candidates(name):
-        content = bytes(Zone.open(path).content)
+        zone = Zone.open(path)
+        content = bytes(zone.content)
         if len(content) == want:
+            OPENED[name] = zone
             return name, content, parse(content)
     pytest.skip(f"{name}.ff with a {want}-byte stream is not on this machine")
 
@@ -86,17 +90,27 @@ def test_the_walk_ends_where_the_header_says(sample):
     assert list(xfile.final_cursors[1:]) == list(xfile.header.block_sizes[1:])
 
 
-def test_tier1_assets_write_back_identically(sample):
+@pytest.mark.slow
+def test_every_asset_writes_back_identically(sample):
     name, content, xfile = sample
-    count = 0
     for asset in xfile.assets:
-        if asset.type not in TIER1:
-            continue
-        writer = Writer()
-        REGISTRY[asset.type].write(asset.data, writer)
-        assert writer.getvalue() == content[asset.file_start : asset.file_end], asset.name
-        count += 1
-    assert count == sum(1 for t in FIXTURE["zones"][name]["types"] if t in TIER1)
+        assert (
+            write_asset(asset) == content[asset.file_start : asset.file_end]
+        ), f"asset {asset.index} {asset.type_name} {asset.name}"
+    tier1 = sum(1 for a in xfile.assets if a.type in TIER1)
+    assert tier1 == sum(1 for t in FIXTURE["zones"][name]["types"] if t in TIER1)
+
+
+@pytest.mark.slow
+def test_the_whole_zone_writes_back_identically(sample):
+    name, content, xfile = sample
+    written = write(xfile)
+    assert written.content == content
+    assert written.header == xfile.header
+    assert (written.log.table() == xfile.log.table()).all()
+    zone = OPENED[name]
+    zone.content[:] = written.content
+    assert zone.build().identical
 
 
 def test_reads_tile_the_file(sample):

@@ -11,23 +11,13 @@ from opent5.xfile.handlers.base import Handler, asset_ref, register
 from opent5.xfile.stream import Chunk, XStream
 
 
-def read_lightdef(st: XStream, h: Chunk) -> dict:
-    st.push(Block.VIRTUAL)
-    name = st.string(h, 0)
-    image = asset_ref(st, h, 4, AssetType.IMAGE)
-    st.pop()
-    return {
-        "name": name,
-        "image": image,
-        "sampler_state": h.u8(8),
-        "lmap_lookup_start": h.s32(0xC),
-    }
-
-
 @register
 class LightDefHandler(Handler):
     asset_type = AssetType.LIGHTDEF
     header_size = 0x10
 
-    def read(self, st: XStream, header: Chunk) -> dict:
-        return read_lightdef(st, header)
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        asset_ref(io, h, 4, AssetType.IMAGE, node, "image")
+        io.pop()

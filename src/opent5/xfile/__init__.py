@@ -9,15 +9,23 @@ loads it, with a complete event log for re-layout.
 Package map: ``constants`` (blocks, pointer markers, asset types), ``stream``
 (the loader primitives), ``events`` (the event log), ``model`` (zone-level
 parse), ``handlers`` (one module per asset type or family, registered by
-type), ``writer`` (the write side's byte sink).
+type), ``write`` / ``write_asset`` (the same walk run by ``XWriter``).
 """
 
 from opent5.xfile.constants import ASSET_TYPE_NAMES, AssetType, Block
 from opent5.xfile.events import EventKind, EventLog, PtrKind
 from opent5.xfile.handlers import REGISTRY, Handler, handler_for
-from opent5.xfile.model import Asset, AssetError, XFile, XFileHeader, parse
-from opent5.xfile.stream import XFileError, XStream
-from opent5.xfile.writer import Writer
+from opent5.xfile.model import (
+    Asset,
+    AssetError,
+    Written,
+    XFile,
+    XFileHeader,
+    parse,
+    write,
+    write_asset,
+)
+from opent5.xfile.stream import XFileError, XStream, XWriter
 
 __all__ = [
     "ASSET_TYPE_NAMES",
@@ -30,11 +38,14 @@ __all__ = [
     "EventLog",
     "Handler",
     "PtrKind",
-    "Writer",
     "XFile",
     "XFileError",
     "XFileHeader",
     "XStream",
+    "XWriter",
+    "Written",
     "handler_for",
     "parse",
+    "write",
+    "write_asset",
 ]

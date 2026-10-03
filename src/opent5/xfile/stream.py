@@ -26,6 +26,17 @@ in queue order.
 Pointer fields are read through ``follows``, ``string`` and ``ref``, which
 apply the loader's test for that field (``== -1`` for shareable data, ``!= 0``
 for PS3 owned data, -1/-2/alias for asset references) and log the field.
+
+One description, two directions. Handlers are written once against these
+primitives, with every loaded thing given a home in a node (a dict):
+``load(size, node, key)``, ``items(size, count, node, key)``,
+``string(chunk, off, node, key)``, ``reserve(size, node, key)``. ``XStream``
+(reading) takes the bytes from the file and stores them in the node;
+``XWriter`` (writing, below) takes them from the node and emits them, with the
+same block, alignment, RUNTIME and deferred bookkeeping and the same event log.
+Because every decision a handler makes (counts, pointer tests, union tags) is
+computed from the bytes it has just loaded or emitted, the two directions cannot
+drift: writing a parsed node reproduces the bytes it was parsed from.
 """
 
 from __future__ import annotations
@@ -169,7 +180,9 @@ class AssetLink:
 
 class XStream:
     """The loader's view of the stream: file position, seven block positions,
-    the block stack, the deferred queue, and the event log."""
+    the block stack, the deferred queue, and the event log. Reads."""
+
+    reading = True
 
     def __init__(self, data: bytes, log: bool = True):
         self.data = data
@@ -196,6 +209,10 @@ class XStream:
         #: The first few strings met in the current asset (its name is usually the
         #: first), so a failure can say which asset it was.
         self.asset_strings: list[str | None] = []
+        #: Pointer fields met so far: the ordinal of the next one. Reading and
+        #: writing meet pointer fields in the same order, so an ordinal from a
+        #: parse's POINTER events names the same field in a write.
+        self.pointer_index = 0
 
     # -- position ---------------------------------------------------------------------------
 
@@ -255,9 +272,41 @@ class XStream:
             self._ev((INSERT, slot, 0, 0, 0, 0))
         return slot
 
-    def load(self, size: int) -> Chunk:
+    def load(self, size: int, node: Any = None, key: Any = None) -> Chunk:
         """Load_Stream(1, p, size) in a block that reads now (TEMP, VIRTUAL, LARGE,
-        PHYSICAL). Use ``reserve`` for RUNTIME and the deferred blocks."""
+        PHYSICAL); the bytes are stored as node[key] when a node is given. Use
+        ``reserve`` for RUNTIME and the deferred blocks."""
+        chunk = self._read(size)
+        if node is not None:
+            node[key] = chunk.bytes()
+        return chunk
+
+    def items(self, size: int, count: int, node: Any, key: Any) -> list[tuple[Chunk, dict]]:
+        """One Load_Stream of `count` structs of `size` bytes, stored as node[key] = a
+        list of element nodes, each {"raw": its bytes}; returns (chunk, element) pairs."""
+        chunk = self._read(size * count)
+        elements = [{"raw": chunk.data[size * i : size * (i + 1)].tobytes()} for i in range(count)]
+        node[key] = elements
+        return list(zip(chunk.items(size, count), elements, strict=True))
+
+    def note(self, node: Any, key: Any, value: Any) -> None:
+        """Store a decoded value for the reader's convenience (ignored when writing;
+        the bytes stay authoritative)."""
+        node[key] = value
+
+    def children(self, node: Any, key: Any) -> list:
+        """A list that holds child nodes: created when reading, fetched when writing."""
+        out: list = []
+        node[key] = out
+        return out
+
+    def child(self, items: list, index: int) -> dict:
+        """Element `index` of a child list: appended when reading, fetched when writing."""
+        element: dict = {}
+        items.append(element)
+        return element
+
+    def _read(self, size: int) -> Chunk:
         block = self.cur
         if not _FILE_BLOCKS[block]:
             raise self.fail(f"Load_Stream of {size} bytes: block {block} has no file bytes here")
@@ -282,13 +331,16 @@ class XStream:
         self.fp = end
         return Chunk(self.view[fp:end], fp, block, mem)
 
-    def reserve(self, size: int) -> RuntimeData | DeferredData | Chunk:
+    def reserve(
+        self, size: int, node: Any = None, key: Any = None
+    ) -> RuntimeData | DeferredData | Chunk:
         """Load_Stream in whatever block is current: RUNTIME gives RuntimeData (no
         file bytes), LARGE_RUNTIME / PHYSICAL_RUNTIME give DeferredData (bytes later),
-        the other blocks read now and give a Chunk."""
+        the other blocks read now and give a Chunk. node[key] holds the bytes (or the
+        DeferredData) when a node is given."""
         block = self.cur
         if _FILE_BLOCKS[block]:
-            return self.load(size)
+            return self.load(size, node, key)
         if size < 0:
             raise self.fail(f"Load_Stream size: expected >= 0, found {size}")
         mem = self.pos[block]
@@ -300,6 +352,8 @@ class XStream:
                 if self._ev is not None:
                     self._ev((DEFER, item.index, size, block, mem, self._mask))
             self._mask = NONE
+            if node is not None:
+                node[key] = item
             return item
         if size:
             self.pos[block] = mem + size
@@ -358,6 +412,10 @@ class XStream:
             if kind != PtrKind.NULL:
                 self._pending = len(self.log.words) // 6 - 1
 
+    def _raw(self, chunk: Chunk, off: int) -> int:
+        self.pointer_index += 1
+        return _U32(chunk.data, off)[0]
+
     def follows(self, chunk: Chunk, off: int, owned: bool = False) -> bool:
         """A pointer to sub-data: True when the data follows inline.
 
@@ -365,7 +423,7 @@ class XStream:
         values are offset pointers to data loaded earlier. PS3 owned fields
         (owned=True, the loader tests ``!= 0``) are inline for any non-zero value.
         """
-        raw = _U32(chunk.data, off)[0]
+        raw = self._raw(chunk, off)
         if raw == PTR_NULL:
             kind = PtrKind.NULL
         elif raw == PTR_INLINE:
@@ -377,27 +435,30 @@ class XStream:
         self._pointer(chunk, off, raw, kind)
         return kind == PtrKind.INLINE or kind == PtrKind.NONZERO_INLINE
 
-    def string(self, chunk: Chunk, off: int) -> str | None:
+    def string(self, chunk: Chunk, off: int, node: Any = None, key: Any = None) -> str | None:
         """A ``const char*`` field: -1 -> the string follows (align 1); an offset
-        pointer -> the string loaded earlier at that position; 0 -> None."""
-        raw = _U32(chunk.data, off)[0]
+        pointer -> the string loaded earlier at that position; 0 -> None. Stored as
+        node[key] when a node is given."""
+        raw = self._raw(chunk, off)
         if raw == PTR_INLINE:
             self._pointer(chunk, off, raw, PtrKind.INLINE)
             self.alloc(0)
             text = self.xstring()
         elif raw == PTR_NULL:
             self._pointer(chunk, off, raw, PtrKind.NULL)
-            return None
+            text = None
         else:
             self._pointer(chunk, off, raw, PtrKind.OFFSET)
             text = self.strings.get((raw - 1) & 0xFFFFFFFF)
-        if len(self.asset_strings) < 3:
+        if raw != PTR_NULL and len(self.asset_strings) < 3:
             self.asset_strings.append(text)
+        if node is not None:
+            node[key] = text
         return text
 
     def ref(self, chunk: Chunk, off: int) -> int:
         """An asset reference field: logs it and returns the raw value."""
-        raw = _U32(chunk.data, off)[0]
+        raw = self._raw(chunk, off)
         if raw == PTR_NULL:
             kind = PtrKind.NULL
         elif raw == PTR_INLINE:
@@ -414,7 +475,7 @@ class XStream:
         DB_ConvertOffsetToAlias when alias=True) and never loads from the stream:
         logged; returns the raw value. -1 / -2 there would mean inline data whose
         layout is not known, so they stop the parse."""
-        raw = _U32(chunk.data, off)[0]
+        raw = self._raw(chunk, off)
         if raw in (PTR_INLINE, PTR_INSERT):
             raise self.fail(
                 f"pointer at file {chunk.at + off:#x}: expected 0 or an offset pointer "
@@ -426,3 +487,172 @@ class XStream:
 
     def resolve_string(self, raw: int) -> str | None:
         return self.strings.get((raw - 1) & 0xFFFFFFFF)
+
+
+class XWriter(XStream):
+    """The same primitives, run the other way: every load takes its bytes from the
+    node a parse filled and appends them to ``out``, with the block positions,
+    alignment, RUNTIME reservations, deferred queue and event log kept exactly as
+    the reader keeps them. File offsets in chunks and events are output offsets.
+
+    ``pointer_values`` overrides pointer fields by ordinal (the n-th pointer field
+    met, counting from 0 in the order a parse logs POINTER events): the value is
+    written in place of the stored one before the field is tested, so it also
+    steers what follows. An override that keeps a field's kind (offset to offset,
+    inline to inline) leaves every later ordinal where it was; one that changes the
+    kind changes what is written after it, and the node must then hold (or stop
+    holding) the inline data to match.
+    """
+
+    reading = False
+
+    def __init__(self, log: bool = True, pointer_values: dict[int, int] | None = None):
+        super().__init__(b"", log=log)
+        self.out = bytearray()
+        self.pointer_values = pointer_values or {}
+        self._queued: list[tuple[DeferredData, bytes]] = []
+
+    def getvalue(self) -> bytes:
+        return bytes(self.out)
+
+    # -- emitting ---------------------------------------------------------------------------
+
+    def _emit(self, data: bytes | bytearray | memoryview) -> Chunk:
+        block = self.cur
+        if not _FILE_BLOCKS[block]:
+            raise self.fail(f"Load_Stream of {len(data)} bytes: block {block} has no file bytes")
+        size = len(data)
+        fp = len(self.out)
+        mem = self.pos[block]
+        copy = bytearray(data)
+        if size:
+            self.pos[block] = mem + size
+            if block == TEMP and mem + size > self.temp_high:
+                self.temp_high = mem + size
+            if self._ev is not None:
+                self._ev((READ, fp, size, block, mem, self._mask))
+            self._mask = NONE
+            self.out += copy
+        self.fp = len(self.out)
+        return Chunk(memoryview(copy), fp, block, mem)
+
+    def _stored(self, node: Any, key: Any, size: int) -> bytes:
+        if node is None:
+            raise self.fail(f"Load_Stream of {size} bytes: nothing to write (no node)")
+        try:
+            data = node[key]
+        except (KeyError, IndexError, TypeError):
+            data = None
+        if data is None:
+            raise self.fail(f"Load_Stream of {size} bytes: node has no {key!r} to write")
+        if len(data) != size:
+            raise self.fail(
+                f"{key!r}: expected {size} bytes (from the counts already written), "
+                f"found {len(data)}"
+            )
+        return data
+
+    def load(self, size: int, node: Any = None, key: Any = None) -> Chunk:
+        if size < 0:
+            raise self.fail(f"Load_Stream size: expected >= 0, found {size}")
+        if size == 0:
+            return self._emit(b"")
+        return self._emit(self._stored(node, key, size))
+
+    def items(self, size: int, count: int, node: Any, key: Any) -> list[tuple[Chunk, dict]]:
+        elements = node.get(key) if isinstance(node, dict) else node[key]
+        if elements is None or len(elements) != count:
+            found = None if elements is None else len(elements)
+            raise self.fail(f"{key!r}: expected {count} elements, found {found}")
+        for i, element in enumerate(elements):
+            if len(element["raw"]) != size:
+                raise self.fail(f"{key!r}[{i}]: expected {size} bytes, found {len(element['raw'])}")
+        chunk = self._emit(b"".join(e["raw"] for e in elements))
+        return list(zip(chunk.items(size, count), elements, strict=True))
+
+    def note(self, node: Any, key: Any, value: Any) -> None:
+        pass
+
+    def children(self, node: Any, key: Any) -> list:
+        items = node[key]
+        if items is None:
+            raise self.fail(f"{key!r}: expected a list of child nodes, found None")
+        return items
+
+    def child(self, items: list, index: int) -> dict:
+        if index >= len(items):
+            raise self.fail(f"child list: expected an element {index}, found {len(items)}")
+        return items[index]
+
+    def reserve(
+        self, size: int, node: Any = None, key: Any = None
+    ) -> RuntimeData | DeferredData | Chunk:
+        block = self.cur
+        if _FILE_BLOCKS[block]:
+            return self.load(size, node, key)
+        if not _DEFERRED_BLOCKS[block]:
+            return super().reserve(size)
+        item = super().reserve(size)
+        if size:
+            stored = node[key] if node is not None else None
+            data = stored.data if isinstance(stored, DeferredData) else stored
+            if data is None or len(data) != size:
+                found = None if data is None else len(data)
+                raise self.fail(f"deferred {key!r}: expected {size} bytes, found {found}")
+            self._queued.append((item, bytes(data)))
+        return item
+
+    def xstring(self) -> str:
+        raise self.fail("xstring: the writer emits strings through string()")
+
+    def string(self, chunk: Chunk, off: int, node: Any = None, key: Any = None) -> str | None:
+        raw = self._raw(chunk, off)
+        if raw == PTR_INLINE:
+            self._pointer(chunk, off, raw, PtrKind.INLINE)
+            self.alloc(0)
+            text = node[key] if node is not None else None
+            if text is None:
+                raise self.fail(f"string {key!r}: the pointer says inline, the node has none")
+            data = text.encode("latin-1") + b"\0"
+            block = self.cur
+            mem = self.pos[block]
+            fp = len(self.out)
+            self.pos[block] = mem + len(data)
+            if block == TEMP and mem + len(data) > self.temp_high:
+                self.temp_high = mem + len(data)
+            if self._ev is not None:
+                self._ev((STRING, fp, len(data), block, mem, self._mask))
+            self._mask = NONE
+            self.out += data
+            self.fp = len(self.out)
+            self.strings[(block << OFFSET_BLOCK_SHIFT) | mem] = text
+            return text
+        self._pointer(chunk, off, raw, PtrKind.NULL if raw == PTR_NULL else PtrKind.OFFSET)
+        return None if node is None else node[key]
+
+    def flush_deferred(self) -> None:
+        for item, data in self._queued:
+            fp = len(self.out)
+            item.file_offset = fp
+            if self._ev is not None:
+                self._ev((TAIL, fp, item.size, item.block, item.mem, item.index))
+            self.out += data
+        self.fp = len(self.out)
+
+    def raw(self, data: bytes) -> int:
+        """Bytes outside any block (the XFile header, the XAssetList); returns their offset."""
+        at = len(self.out)
+        self.out += data
+        self.fp = len(self.out)
+        return at
+
+    def _raw(self, chunk: Chunk, off: int) -> int:
+        index = self.pointer_index
+        self.pointer_index = index + 1
+        value = self.pointer_values.get(index)
+        if value is not None:
+            struct.pack_into(">I", chunk.data, off, value)
+            if chunk.at != NONE:
+                struct.pack_into(">I", self.out, chunk.at + off, value)
+            return value
+        return _U32(chunk.data, off)[0]

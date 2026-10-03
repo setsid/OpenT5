@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from opent5.xfile.constants import PTR_INLINE, PTR_NULL, AssetType
-from opent5.xfile.handlers.base import Handler, asset_ref, register
+from opent5.xfile.handlers.base import Handler, asset_ref, items, register
 from opent5.xfile.stream import Chunk, XStream
 
 PIECE_SIZE = 16
@@ -29,29 +29,20 @@ class XModelPiecesHandler(Handler):
     asset_type = AssetType.XMODELPIECES
     header_size = 12
 
-    def load_ptr(self, st: XStream, raw: int) -> Any:
+    def load_ptr(self, io: XStream, raw: int, node: Any = None) -> Any:
         if raw == PTR_NULL:
             return None
         if raw != PTR_INLINE:
-            return {"offset_pointer": raw}
-        st.trail.append(self.name)
-        st.alloc(3)
-        data = self.read(st, st.load(self.header_size))
-        st.trail.pop()
-        return data
+            return {"offset_pointer": raw} if io.reading else node
+        if io.reading:
+            node = {}
+        io.trail.append(self.name)
+        io.alloc(3)
+        self.body(io, io.load(self.header_size, node, "header"), node)
+        io.trail.pop()
+        return node
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        name = st.string(h, 0)
-        count = h.s32(4)
-        pieces = None
-        if st.follows(h, 8, owned=True):
-            st.alloc(3)
-            table = st.load(PIECE_SIZE * count)
-            pieces = [
-                {
-                    "model": asset_ref(st, p, 0, AssetType.XMODEL),
-                    "offset": (p.f32(4), p.f32(8), p.f32(12)),
-                }
-                for p in table.items(PIECE_SIZE, count)
-            ]
-        return {"name": name, "num_pieces": count, "pieces": pieces}
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.string(h, 0, node, "name")
+        for p, piece in items(io, h, 8, 3, PIECE_SIZE, h.s32(4), node, "pieces", owned=True) or ():
+            asset_ref(io, p, 0, AssetType.XMODEL, piece, "model")

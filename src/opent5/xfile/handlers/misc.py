@@ -6,7 +6,7 @@ section 14.
 from __future__ import annotations
 
 from opent5.xfile.constants import AssetType, Block
-from opent5.xfile.handlers.base import Handler, asset_ref, blob, register
+from opent5.xfile.handlers.base import Handler, array, asset_ref, items, register
 from opent5.xfile.stream import Chunk, XStream
 
 
@@ -18,62 +18,37 @@ class FontHandler(Handler):
     asset_type = AssetType.FONT
     header_size = 24
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        name = st.string(h, 0)
-        material = asset_ref(st, h, 12, AssetType.MATERIAL)
-        glow = asset_ref(st, h, 16, AssetType.MATERIAL)
-        glyphs = None
-        if st.follows(h, 20):
-            st.alloc(3)
-            glyphs = st.load(24 * h.s32(8)).bytes()
-        st.pop()
-        return {
-            "name": name,
-            "pixel_height": h.s32(4),
-            "glyph_count": h.s32(8),
-            "material": material,
-            "glow_material": glow,
-            "glyphs": glyphs,
-        }
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        asset_ref(io, h, 12, AssetType.MATERIAL, node, "material")
+        asset_ref(io, h, 16, AssetType.MATERIAL, node, "glow_material")
+        array(io, h, 20, 3, 24 * h.s32(8), node, "glyphs")
+        io.pop()
 
 
-def read_ddl_def(st: XStream) -> dict:
+def ddl_def_body(io: XStream, node: dict) -> None:
     """ddlDef_t (28): structList [nz] (16 each), enumList [nz] (12 each), next [nz]."""
-    d = st.load(28)
-    out: dict = {"raw": d.bytes(), "structs": None, "enums": None, "next": None}
-    if st.follows(d, 8, owned=True):
-        n = d.s32(12)
-        st.alloc(3)
-        structs = []
-        for sd in st.load(16 * n).items(16, n):
-            entry: dict = {"name": st.string(sd, 0), "size": sd.s32(4), "members": None}
-            if st.follows(sd, 12, owned=True):
-                m = sd.s32(8)
-                st.alloc(3)
-                members = st.load(48 * m)
-                entry["members"] = [
-                    {"name": st.string(mb, 0), "raw": mb.bytes()} for mb in members.items(48, m)
-                ]
-            structs.append(entry)
-        out["structs"] = structs
-    if st.follows(d, 16, owned=True):
-        n = d.s32(20)
-        st.alloc(3)
-        enums = []
-        for en in st.load(12 * n).items(12, n):
-            entry = {"name": st.string(en, 0), "members": None}
-            if st.follows(en, 8, owned=True):
-                m = en.s32(4)
-                st.alloc(3)
-                names = st.load(4 * m)
-                entry["members"] = [st.string(names, 4 * k) for k in range(m)]
-            enums.append(entry)
-        out["enums"] = enums
-    if st.follows(d, 24, owned=True):
-        st.alloc(3)
-        out["next"] = read_ddl_def(st)
-    return out
+    d = io.load(28, node, "raw")
+    for sd, struct_def in items(io, d, 8, 3, 16, d.s32(12), node, "structs", owned=True) or ():
+        io.string(sd, 0, struct_def, "name")
+        members = items(io, sd, 12, 3, 48, sd.s32(8), struct_def, "members", owned=True)
+        for mb, member in members or ():
+            io.string(mb, 0, member, "name")
+    for en, enum_def in items(io, d, 16, 3, 12, d.s32(20), node, "enums", owned=True) or ():
+        io.string(en, 0, enum_def, "name")
+        names = array(io, en, 8, 3, 4 * en.s32(4), enum_def, "member_ptrs", owned=True)
+        if names is not None:
+            members = enum_def.setdefault("members", {})
+            for k in range(en.s32(4)):
+                io.string(names, 4 * k, members, k)
+    if io.follows(d, 24, owned=True):
+        io.alloc(3)
+        if io.reading:
+            node["next"] = {}
+        ddl_def_body(io, node["next"])
+    elif io.reading:
+        node["next"] = None
 
 
 @register
@@ -83,15 +58,17 @@ class DdlHandler(Handler):
     asset_type = AssetType.DDL
     header_size = 8
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        name = st.string(h, 0)
-        ddl_def = None
-        if st.follows(h, 4, owned=True):
-            st.alloc(3)
-            ddl_def = read_ddl_def(st)
-        st.pop()
-        return {"name": name, "ddl_def": ddl_def}
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        if io.follows(h, 4, owned=True):
+            io.alloc(3)
+            if io.reading:
+                node["ddl_def"] = {}
+            ddl_def_body(io, node["ddl_def"])
+        elif io.reading:
+            node["ddl_def"] = None
+        io.pop()
 
 
 @register
@@ -101,61 +78,34 @@ class EmblemSetHandler(Handler):
     asset_type = AssetType.EMBLEMSET
     header_size = 44
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        out: dict = {"name": "emblemset", "header": h.bytes()}
-        out["layers"] = None
-        if st.follows(h, 8, owned=True):
-            st.alloc(3)
-            out["layers"] = st.load(12 * h.s32(4)).bytes()
-        out["categories"] = None
-        if st.follows(h, 16, owned=True):
-            n = h.s32(12)
-            st.alloc(3)
-            table = st.load(8 * n)
-            out["categories"] = [(st.string(c, 0), st.string(c, 4)) for c in table.items(8, n)]
-        out["icons"] = None
-        if st.follows(h, 24, owned=True):
-            n = h.s32(20)
-            st.alloc(3)
-            table = st.load(40 * n)
-            out["icons"] = [
-                {
-                    "image": asset_ref(st, ic, 0, AssetType.IMAGE),
-                    "description": st.string(ic, 4),
-                    "raw": ic.bytes(),
-                }
-                for ic in table.items(40, n)
-            ]
-        out["backgrounds"] = None
-        if st.follows(h, 32, owned=True):
-            n = h.s32(28)
-            st.alloc(3)
-            table = st.load(24 * n)
-            out["backgrounds"] = [
-                {
-                    "material": asset_ref(st, bg, 0, AssetType.MATERIAL),
-                    "description": st.string(bg, 4),
-                    "raw": bg.bytes(),
-                }
-                for bg in table.items(24, n)
-            ]
-        out["background_lookup"] = None
-        if st.follows(h, 40, owned=True):
-            st.alloc(1)
-            out["background_lookup"] = st.load(2 * h.s32(36)).bytes()
-        st.pop()
-        return out
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.note(node, "name", "emblemset")
+        array(io, h, 8, 3, 12 * h.s32(4), node, "layers", owned=True)
+        for c, category in items(io, h, 16, 3, 8, h.s32(12), node, "categories", owned=True) or ():
+            io.string(c, 0, category, "name")
+            io.string(c, 4, category, "description")
+        for ic, icon in items(io, h, 24, 3, 40, h.s32(20), node, "icons", owned=True) or ():
+            asset_ref(io, ic, 0, AssetType.IMAGE, icon, "image")
+            io.string(ic, 4, icon, "description")
+        for bg, back in items(io, h, 32, 3, 24, h.s32(28), node, "backgrounds", owned=True) or ():
+            asset_ref(io, bg, 0, AssetType.MATERIAL, back, "material")
+            io.string(bg, 4, back, "description")
+        array(io, h, 40, 1, 2 * h.s32(36), node, "background_lookup", owned=True)
+        io.pop()
+
+    def name_of(self, node) -> str:
+        return "emblemset"
 
 
-def read_glass_def(st: XStream, g: Chunk) -> dict:
-    return {
-        "name": st.string(g, 0),
-        "materials": [asset_ref(st, g, off, AssetType.MATERIAL) for off in (0x1C, 0x20, 0x24)],
-        "strings": [st.string(g, off) for off in (0x28, 0x2C, 0x30)],
-        "effects": [asset_ref(st, g, off, AssetType.FX) for off in (0x34, 0x38)],
-        "raw": g.bytes(),
-    }
+def glass_def_body(io: XStream, g: Chunk, node: dict) -> None:
+    io.string(g, 0, node, "name")
+    for off in (0x1C, 0x20, 0x24):
+        asset_ref(io, g, off, AssetType.MATERIAL, node, f"material_{off:#x}")
+    for off in (0x28, 0x2C, 0x30):
+        io.string(g, off, node, f"string_{off:#x}")
+    for off in (0x34, 0x38):
+        asset_ref(io, g, off, AssetType.FX, node, f"effect_{off:#x}")
 
 
 @register
@@ -166,37 +116,25 @@ class GlassesHandler(Handler):
     asset_type = AssetType.GLASSES
     header_size = 56
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        name = st.string(h, 0)
-        glasses = None
-        if st.follows(h, 8, owned=True):
-            n = h.u32(4)
-            st.alloc(3)
-            table = st.load(124 * n)
-            glasses = []
-            for g in table.items(124, n):
-                entry: dict = {"glass_def": None, "outline": None, "raw": g.bytes()}
-                if st.follows(g, 0):
-                    st.alloc(3)
-                    entry["glass_def"] = read_glass_def(st, st.load(60))
-                if st.follows(g, 0x40, owned=True):
-                    st.alloc(3)
-                    entry["outline"] = st.load(8 * g.u8(0x3D)).bytes()
-                glasses.append(entry)
-        work_memory = h.u32(16)
-        if st.follows(h, 12, owned=True):
-            st.push(Block.RUNTIME)
-            st.alloc(31)
-            st.reserve(work_memory)
-            st.pop()
-        st.pop()
-        return {
-            "name": name,
-            "glasses": glasses,
-            "work_memory_size": work_memory,
-            "header": h.bytes(),
-        }
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        for g, glass in items(io, h, 8, 3, 124, h.u32(4), node, "glasses", owned=True) or ():
+            if io.follows(g, 0):
+                io.alloc(3)
+                if io.reading:
+                    glass["glass_def"] = {}
+                glass_def = glass["glass_def"]
+                glass_def_body(io, io.load(60, glass_def, "raw"), glass_def)
+            elif io.reading:
+                glass["glass_def"] = None
+            array(io, g, 0x40, 3, 8 * g.u8(0x3D), glass, "outline", owned=True)
+        if io.follows(h, 12, owned=True):
+            io.push(Block.RUNTIME)
+            io.alloc(31)
+            io.reserve(h.u32(16))
+            io.pop()
+        io.pop()
 
 
 @register
@@ -206,25 +144,23 @@ class PackIndexHandler(Handler):
     asset_type = AssetType.PACKINDEX
     header_size = 12
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        name = st.string(h, 0)
-        st.pop()
-        return {"name": name, "value_4": h.u32(4), "pack_id": h.u32(8)}
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        io.pop()
 
 
 @register
 class XGlobalsHandler(Handler):
-    """XGlobals (40): +0 name, the rest plain data (layout from the ELF only)."""
+    """XGlobals (40): +0 name, the rest plain data (layout from the ELF; 14 zones agree)."""
 
     asset_type = AssetType.XGLOBALS
     header_size = 40
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        name = st.string(h, 0)
-        st.pop()
-        return {"name": name, "header": h.bytes()}
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        io.pop()
 
 
 @register
@@ -235,11 +171,11 @@ class TextureListHandler(Handler):
     asset_type = AssetType.TEXTURELIST
     header_size = 8
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        entries = None
-        if st.follows(h, 4, owned=True):
-            st.alloc(3)
-            entries = blob(st.load(4 * h.u32(0)))
-        st.pop()
-        return {"name": "texturelist", "count": h.u32(0), "entries": entries}
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.note(node, "name", "texturelist")
+        array(io, h, 4, 3, 4 * h.u32(0), node, "entries", owned=True)
+        io.pop()
+
+    def name_of(self, node) -> str:
+        return "texturelist"

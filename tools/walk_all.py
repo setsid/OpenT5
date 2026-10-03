@@ -98,8 +98,8 @@ def walk_one(path: str) -> dict:
     return row
 
 
-def _child(path: str, conn) -> None:
-    conn.send(walk_one(path))
+def _child(work, path: str, conn) -> None:
+    conn.send(work(path))
     conn.close()
 
 
@@ -112,8 +112,11 @@ def _failed(path: str, kind: str, message: str) -> dict:
     }
 
 
-def run(paths: list[Path], jobs: int, timeout: float, progress: bool = True) -> list[dict]:
-    """Walk zones in parallel, one process per zone, killing any that overrun."""
+def run(
+    paths: list[Path], jobs: int, timeout: float, progress: bool = True, work=walk_one
+) -> list[dict]:
+    """Run `work(path) -> row` over zones in parallel, one process per zone, killing
+    any that overrun."""
     ctx = mp.get_context("fork")
     pending = [str(p) for p in paths]
     running: dict = {}
@@ -122,7 +125,7 @@ def run(paths: list[Path], jobs: int, timeout: float, progress: bool = True) -> 
         while pending and len(running) < jobs:
             path = pending.pop(0)
             parent, child = ctx.Pipe(duplex=False)
-            proc = ctx.Process(target=_child, args=(path, child), daemon=True)
+            proc = ctx.Process(target=_child, args=(work, path, child), daemon=True)
             proc.start()
             child.close()
             running[path] = (proc, parent, time.monotonic())
@@ -228,13 +231,13 @@ def tables(rows: list[dict], stats: dict) -> str:
     return "\n".join(out)
 
 
-def write_doc(doc: Path, text: str) -> None:
+def write_doc(doc: Path, text: str, start: str = START, end: str = END) -> None:
     body = doc.read_text()
-    if START not in body or END not in body:
-        raise SystemExit(f"{doc}: expected the markers {START} and {END}")
-    head, rest = body.split(START, 1)
-    _, tail = rest.split(END, 1)
-    doc.write_text(f"{head}{START}\n{text}\n{END}{tail}")
+    if start not in body or end not in body:
+        raise SystemExit(f"{doc}: expected the markers {start} and {end}")
+    head, rest = body.split(start, 1)
+    _, tail = rest.split(end, 1)
+    doc.write_text(f"{head}{start}\n{text}\n{end}{tail}")
 
 
 def main(argv: list[str] | None = None) -> int:

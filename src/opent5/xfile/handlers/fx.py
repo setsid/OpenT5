@@ -8,6 +8,9 @@ four effect refs by name, trailDef, spawnSound. FxImpactTable (8): +0 name,
 Loaders: fx Ptr 0x24d748, FxEffectDef 0x24d498, FxElemDef 0x24d0a8, visuals
 0x24cc90, single visual 0x24ca90, trail 0x236fb0; impactfx Ptr 0x24e2f8,
 struct 0x24e140.
+
+Node: "header", "name", "elem_defs" (elements: "raw", "vel_samples",
+"vis_samples", "visual" or "visuals", effect names, "trail_def", "spawn_sound").
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from opent5.xfile.constants import AssetType, Block
-from opent5.xfile.handlers.base import Handler, asset_ref, register
+from opent5.xfile.handlers.base import Handler, array, asset_ref, items, register
 from opent5.xfile.stream import Chunk, XStream
 
 FX_ELEM_DEF_SIZE = 292
@@ -27,88 +30,52 @@ ELEM_TYPE_DECAL = 11
 ELEM_TYPE_RUNNER = 12
 
 
-def read_visual(st: XStream, chunk: Chunk, off: int, elem_type: int) -> Any:
+def visual(io: XStream, chunk: Chunk, off: int, elem_type: int, node: Any, key: Any) -> None:
     """One FxElemVisuals union member, by element type."""
     if elem_type == ELEM_TYPE_MODEL:
-        return asset_ref(st, chunk, off, AssetType.XMODEL)
-    if elem_type in (ELEM_TYPE_SOUND, ELEM_TYPE_RUNNER):
-        return st.string(chunk, off)
-    if elem_type in (ELEM_TYPE_OMNI_LIGHT, ELEM_TYPE_SPOT_LIGHT):
-        return None
-    return asset_ref(st, chunk, off, AssetType.MATERIAL)
+        asset_ref(io, chunk, off, AssetType.XMODEL, node, key)
+    elif elem_type in (ELEM_TYPE_SOUND, ELEM_TYPE_RUNNER):
+        io.string(chunk, off, node, key)
+    elif elem_type not in (ELEM_TYPE_OMNI_LIGHT, ELEM_TYPE_SPOT_LIGHT):
+        asset_ref(io, chunk, off, AssetType.MATERIAL, node, key)
 
 
-def read_elem_def(st: XStream, e: Chunk) -> dict:
+def elem_def_body(io: XStream, e: Chunk, node: dict) -> None:
     elem_type, visual_count = e.u8(184), e.u8(185)
-    out: dict = {"elem_type": elem_type, "visual_count": visual_count}
-    out["vel_samples"] = None
-    if st.follows(e, 188, owned=True):
-        st.alloc(3)
-        out["vel_samples"] = st.load(96 * (e.u8(186) + 1)).bytes()
-    out["vis_samples"] = None
-    if st.follows(e, 192, owned=True):
-        st.alloc(3)
-        out["vis_samples"] = st.load(48 * (e.u8(187) + 1)).bytes()
-    visuals: Any = None
+    array(io, e, 188, 3, 96 * (e.u8(186) + 1), node, "vel_samples", owned=True)
+    array(io, e, 192, 3, 48 * (e.u8(187) + 1), node, "vis_samples", owned=True)
     if elem_type == ELEM_TYPE_DECAL:
-        if st.follows(e, 196, owned=True):
-            st.alloc(3)
-            table = st.load(8 * visual_count)
-            visuals = [
-                (
-                    asset_ref(st, table, 8 * i, AssetType.MATERIAL),
-                    asset_ref(st, table, 8 * i + 4, AssetType.MATERIAL),
-                )
-                for i in range(visual_count)
-            ]
+        for d, decal in items(io, e, 196, 3, 8, visual_count, node, "visuals", owned=True) or ():
+            asset_ref(io, d, 0, AssetType.MATERIAL, decal, "material0")
+            asset_ref(io, d, 4, AssetType.MATERIAL, decal, "material1")
     elif visual_count > 1:
-        if st.follows(e, 196, owned=True):
-            st.alloc(3)
-            table = st.load(4 * visual_count)
-            visuals = [read_visual(st, table, 4 * i, elem_type) for i in range(visual_count)]
+        for v, element in items(io, e, 196, 3, 4, visual_count, node, "visuals", owned=True) or ():
+            visual(io, v, 0, elem_type, element, "visual")
     else:
-        visuals = read_visual(st, e, 196, elem_type)
-    out["visuals"] = visuals
-    out["effect_on_impact"] = st.string(e, 224)
-    out["effect_on_death"] = st.string(e, 228)
-    out["effect_emitted"] = st.string(e, 232)
-    out["effect_ref_252"] = st.string(e, 252)
-    out["trail_def"] = None
-    if st.follows(e, 256, owned=True):
-        st.alloc(3)
-        t = st.load(28)
-        trail: dict = {"raw": t.bytes(), "verts": None, "inds": None}
-        if st.follows(t, 16, owned=True):
-            st.alloc(3)
-            trail["verts"] = st.load(20 * t.s32(12)).bytes()
-        if st.follows(t, 24, owned=True):
-            st.alloc(1)
-            trail["inds"] = st.load(2 * t.s32(20)).bytes()
-        out["trail_def"] = trail
-    out["spawn_sound"] = st.string(e, 280)
-    out["raw"] = e.bytes()
-    return out
+        visual(io, e, 196, elem_type, node, "visual")
+    io.string(e, 224, node, "effect_on_impact")
+    io.string(e, 228, node, "effect_on_death")
+    io.string(e, 232, node, "effect_emitted")
+    io.string(e, 252, node, "effect_ref_252")
+    trail = None
+    if io.follows(e, 256, owned=True):
+        io.alloc(3)
+        trail = {} if io.reading else node["trail_def"]
+        t = io.load(28, trail, "raw")
+        array(io, t, 16, 3, 20 * t.s32(12), trail, "verts", owned=True)
+        array(io, t, 24, 1, 2 * t.s32(20), trail, "inds", owned=True)
+    io.note(node, "trail_def", trail)
+    io.string(e, 280, node, "spawn_sound")
 
 
-def read_fx(st: XStream, h: Chunk) -> dict:
-    st.push(Block.VIRTUAL)
-    name = st.string(h, 0)
-    counts = (h.s32(16), h.s32(20), h.s32(24))
-    elems = None
-    if st.follows(h, 0x1C, owned=True):
-        n = sum(counts)
-        st.alloc(3)
-        table = st.load(FX_ELEM_DEF_SIZE * n)
-        elems = [read_elem_def(st, e) for e in table.items(FX_ELEM_DEF_SIZE, n)]
-    st.pop()
-    return {
-        "name": name,
-        "elem_def_count_looping": counts[0],
-        "elem_def_count_one_shot": counts[1],
-        "elem_def_count_emission": counts[2],
-        "elem_defs": elems,
-        "header": h.bytes(),
-    }
+def fx_body(io: XStream, h: Chunk, node: dict) -> None:
+    io.push(Block.VIRTUAL)
+    io.string(h, 0, node, "name")
+    count = h.s32(16) + h.s32(20) + h.s32(24)
+    elems = items(io, h, 0x1C, 3, FX_ELEM_DEF_SIZE, count, node, "elem_defs", owned=True)
+    for e, element in elems or ():
+        elem_def_body(io, e, element)
+    io.pop()
 
 
 @register
@@ -116,32 +83,30 @@ class FxHandler(Handler):
     asset_type = AssetType.FX
     header_size = 60
 
-    def read(self, st: XStream, header: Chunk) -> dict:
-        return read_fx(st, header)
+    def body(self, io: XStream, header: Chunk, node: dict) -> None:
+        fx_body(io, header, node)
 
 
 IMPACT_ROWS = 21
 IMPACT_EFFECTS_PER_ROW = 35
+IMPACT_EFFECTS = IMPACT_ROWS * IMPACT_EFFECTS_PER_ROW
 
 
 @register
 class ImpactFxHandler(Handler):
+    """FxImpactTable; node "table" holds 735 effect refs (21 rows of 35)."""
+
     asset_type = AssetType.IMPACTFX
     header_size = 8
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        name = st.string(h, 0)
-        table = None
-        if st.follows(h, 4, owned=True):
-            st.alloc(3)
-            t = st.load(IMPACT_ROWS * IMPACT_EFFECTS_PER_ROW * 4)
-            table = [
-                [
-                    asset_ref(st, t, 4 * (row * IMPACT_EFFECTS_PER_ROW + k), AssetType.FX)
-                    for k in range(IMPACT_EFFECTS_PER_ROW)
-                ]
-                for row in range(IMPACT_ROWS)
-            ]
-        st.pop()
-        return {"name": name, "table": table}
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        table = array(io, h, 4, 3, 4 * IMPACT_EFFECTS, node, "table_raw", owned=True)
+        if table is not None:
+            effects = io.children(node, "table")
+            for i in range(IMPACT_EFFECTS):
+                if io.reading:
+                    effects.append(None)
+                asset_ref(io, table, 4 * i, AssetType.FX, effects, i)
+        io.pop()

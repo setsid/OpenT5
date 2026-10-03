@@ -13,96 +13,14 @@ GenericEventScript 0x254b80; ItemKeyHandler 0x254d70; UIAnimInfo 0x255230.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
 
 from opent5.xfile.constants import AssetType, Block
-from opent5.xfile.handlers.base import Handler, asset_ref, register
+from opent5.xfile.handlers.base import Handler, array, asset_ref, items, register
 from opent5.xfile.stream import Chunk, XStream
 
 RPN_CONSTANT = 0
 VAL_STRING = 2
-
-
-def read_expression(st: XStream, ex: Chunk) -> dict:
-    """ExpressionStatement (16): +0 filename, +4 line, +8 numRpn, +0xc rpn [-1]."""
-    out: dict = {"filename": st.string(ex, 0), "line": ex.s32(4), "rpn": None}
-    if st.follows(ex, 12):
-        n = ex.s32(8)
-        st.alloc(3)
-        table = st.load(12 * n)
-        rpn = []
-        for r in table.items(12, n):
-            item: dict = {"type": r.s32(0), "data_type": r.s32(4), "value": r.u32(8)}
-            if item["type"] == RPN_CONSTANT and item["data_type"] == VAL_STRING:
-                item["string"] = st.string(r, 8)
-            rpn.append(item)
-        out["rpn"] = rpn
-    return out
-
-
-def read_script_conditions(st: XStream, c: Chunk) -> list[bytes]:
-    """ScriptCondition (16) chain: +0xc next [nz]."""
-    chain = [c.bytes()]
-    while st.follows(c, 12, owned=True):
-        st.alloc(3)
-        c = st.load(16)
-        chain.append(c.bytes())
-    return chain
-
-
-def read_event_script(st: XStream) -> list[dict]:
-    """GenericEventScript (44) chain, the first one read here."""
-    scripts = []
-    s = st.load(44)
-    while True:
-        script: dict = {"prerequisites": None}
-        if st.follows(s, 0, owned=True):
-            st.alloc(3)
-            script["prerequisites"] = read_script_conditions(st, st.load(16))
-        script["condition"] = read_expression(st, s.sub(4, 16))
-        script["action"] = st.string(s, 28)
-        script["raw"] = s.bytes()
-        scripts.append(script)
-        if not st.follows(s, 40, owned=True):
-            break
-        st.alloc(3)
-        s = st.load(44)
-    return scripts
-
-
-def read_event_handler(st: XStream) -> list[dict]:
-    """GenericEventHandler (12) chain: +0 name, +4 eventScript [nz], +8 next [nz]."""
-    handlers = []
-    h = st.load(12)
-    while True:
-        handler: dict = {"name": st.string(h, 0), "script": None}
-        if st.follows(h, 4, owned=True):
-            st.alloc(3)
-            handler["script"] = read_event_script(st)
-        handlers.append(handler)
-        if not st.follows(h, 8, owned=True):
-            break
-        st.alloc(3)
-        h = st.load(12)
-    return handlers
-
-
-def read_key_handler(st: XStream) -> list[dict]:
-    """ItemKeyHandler (12) chain: +0 key, +4 keyScript [nz], +8 next [nz]."""
-    handlers = []
-    k = st.load(12)
-    while True:
-        handler: dict = {"key": k.s32(0), "script": None}
-        if st.follows(k, 4, owned=True):
-            st.alloc(3)
-            handler["script"] = read_event_script(st)
-        handlers.append(handler)
-        if not st.follows(k, 8, owned=True):
-            break
-        st.alloc(3)
-        k = st.load(12)
-    return handlers
-
 
 ITEM_TYPE_LISTBOX = 4
 ITEM_TYPE_MULTI = 10
@@ -119,196 +37,225 @@ EXPRESSION_TYPES = frozenset((2, 6))
 FOCUS_TYPES = frozenset((19, 21))
 
 
-def read_list_box(st: XStream) -> dict:
-    lb = st.load(700)
-    out: dict = {
-        "num_columns": lb.s32(60),
-        "select_icon": asset_ref(st, lb, 672, AssetType.MATERIAL),
-        "background_item_listbox": asset_ref(st, lb, 676, AssetType.MATERIAL),
-        "highlight_texture": asset_ref(st, lb, 680, AssetType.MATERIAL),
-        "rows": None,
-        "raw": lb.bytes(),
-    }
-    if st.follows(lb, 688, owned=True):
-        rows_count, columns = lb.s32(692), lb.s32(60)
-        st.alloc(3)
-        rows = []
-        for row in st.load(24 * rows_count).items(24, rows_count):
-            entry: dict = {"cells": None}
-            if st.follows(row, 0, owned=True):
-                st.alloc(3)
-                cells = []
-                for c in st.load(12 * columns).items(12, columns):
-                    value = None
-                    if st.follows(c, 8, owned=True):
-                        st.alloc(0)
-                        value = st.load(c.s32(4)).bytes()
-                    cells.append({"max_chars": c.s32(4), "string_value": value})
-                entry["cells"] = cells
-            for key, off in (("event_name", 4), ("on_focus_event_name", 8)):
-                entry[key] = None
-                if st.follows(row, off, owned=True):
-                    st.alloc(0)
-                    entry[key] = st.load(32).bytes()
-            rows.append(entry)
-        out["rows"] = rows
-    return out
+def sub(io: XStream, parent: Chunk, off: int, node: dict, key: str, mask: int = 3):
+    """An [nz] pointer to one sub-struct: align and return its node, or None."""
+    if io.follows(parent, off, owned=True):
+        io.alloc(mask)
+        if io.reading:
+            node[key] = {}
+        return node[key]
+    if io.reading:
+        node[key] = None
+    return None
 
 
-def read_focus_type_data(st: XStream, item_type: int, f: Chunk) -> Any:
-    if not st.follows(f, 4, owned=True):
-        return None
+def chain(
+    io: XStream,
+    node: dict,
+    key: str,
+    size: int,
+    next_off: int,
+    each: Callable[[XStream, Chunk, dict], None],
+) -> None:
+    """A linked list the loader reads element by element: LS size, the element's
+    pointers, then +next_off [nz] -> align 4 and the next one. node[key] lists them."""
+    elements = io.children(node, key)
+    index = 0
+    while True:
+        element = io.child(elements, index)
+        c = io.load(size, element, "raw")
+        each(io, c, element)
+        if not io.follows(c, next_off, owned=True):
+            return
+        io.alloc(3)
+        index += 1
+
+
+def expression(io: XStream, ex: Chunk, node: dict) -> None:
+    """ExpressionStatement (16): +0 filename, +4 line, +8 numRpn, +0xc rpn [-1]."""
+    io.string(ex, 0, node, "filename")
+    for r, rpn in items(io, ex, 12, 3, 12, ex.s32(8), node, "rpn") or ():
+        if r.s32(0) == RPN_CONSTANT and r.s32(4) == VAL_STRING:
+            io.string(r, 8, rpn, "string")
+
+
+def _no_pointers(io: XStream, c: Chunk, node: dict) -> None:
+    pass
+
+
+def event_script(io: XStream, s: Chunk, node: dict) -> None:
+    """GenericEventScript (44): prerequisites, condition, action; +0x28 next."""
+    prerequisites = sub(io, s, 0, node, "prerequisites")
+    if prerequisites is not None:
+        chain(io, prerequisites, "conditions", 16, 12, _no_pointers)
+    expression(io, s.sub(4, 16), node.setdefault("condition", {}))
+    io.string(s, 28, node, "action")
+
+
+def event_handler(io: XStream, h: Chunk, node: dict) -> None:
+    """GenericEventHandler (12): +0 name, +4 eventScript [nz]; +8 next."""
+    io.string(h, 0, node, "name")
+    script = sub(io, h, 4, node, "script")
+    if script is not None:
+        chain(io, script, "scripts", 44, 40, event_script)
+
+
+def key_handler(io: XStream, k: Chunk, node: dict) -> None:
+    """ItemKeyHandler (12): +0 key, +4 keyScript [nz]; +8 next."""
+    script = sub(io, k, 4, node, "script")
+    if script is not None:
+        chain(io, script, "scripts", 44, 40, event_script)
+
+
+def event_handlers(io: XStream, parent: Chunk, off: int, node: dict, key: str) -> None:
+    target = sub(io, parent, off, node, key)
+    if target is not None:
+        chain(io, target, "handlers", 12, 8, event_handler)
+
+
+def key_handlers(io: XStream, parent: Chunk, off: int, node: dict, key: str) -> None:
+    target = sub(io, parent, off, node, key)
+    if target is not None:
+        chain(io, target, "handlers", 12, 8, key_handler)
+
+
+def list_box(io: XStream, node: dict) -> None:
+    lb = io.load(700, node, "raw")
+    asset_ref(io, lb, 672, AssetType.MATERIAL, node, "select_icon")
+    asset_ref(io, lb, 676, AssetType.MATERIAL, node, "background_item_listbox")
+    asset_ref(io, lb, 680, AssetType.MATERIAL, node, "highlight_texture")
+    columns = lb.s32(60)
+    for row, element in items(io, lb, 688, 3, 24, lb.s32(692), node, "rows", owned=True) or ():
+        for c, cell in items(io, row, 0, 3, 12, columns, element, "cells", owned=True) or ():
+            array(io, c, 8, 0, c.s32(4), cell, "string_value", owned=True)
+        array(io, row, 4, 0, 32, element, "event_name", owned=True)
+        array(io, row, 8, 0, 32, element, "on_focus_event_name", owned=True)
+
+
+def focus_type_data(io: XStream, item_type: int, f: Chunk, node: dict) -> None:
+    if not io.follows(f, 4, owned=True):
+        return
+    data = node.setdefault("type_data", {})
     if item_type == ITEM_TYPE_LISTBOX:
-        st.alloc(3)
-        return {"list_box": read_list_box(st)}
-    if item_type == ITEM_TYPE_MULTI:
-        st.alloc(3)
-        md = st.load(396)
-        strings = [st.string(md, 4 * i) for i in range(64)]
-        return {"multi": {"dvar_list": strings[:32], "dvar_str": strings[32:], "raw": md.bytes()}}
-    if item_type in EDITFIELD_TYPES:
-        st.alloc(3)
-        return {"edit_field": st.load(48).bytes()}
-    if item_type == ITEM_TYPE_DVARENUM:
-        st.alloc(3)
-        e = st.load(4)
-        return {"enum_dvar_name": st.string(e, 0)}
-    return None
+        io.alloc(3)
+        list_box(io, data.setdefault("list_box", {}))
+    elif item_type == ITEM_TYPE_MULTI:
+        io.alloc(3)
+        multi = data.setdefault("multi", {})
+        md = io.load(396, multi, "raw")
+        strings = multi.setdefault("strings", {})
+        for i in range(64):
+            io.string(md, 4 * i, strings, i)
+    elif item_type in EDITFIELD_TYPES:
+        io.alloc(3)
+        io.load(48, data, "edit_field")
+    elif item_type == ITEM_TYPE_DVARENUM:
+        io.alloc(3)
+        enum = data.setdefault("enum_dvar", {})
+        e = io.load(4, enum, "raw")
+        io.string(e, 0, enum, "name")
 
 
-def read_focus_item(st: XStream, item_type: int) -> dict:
+def focus_item(io: XStream, item_type: int, node: dict) -> None:
     """focusItemDef_s (8 on PS3): +0 onKey [nz], +4 focusTypeData [nz]."""
-    f = st.load(8)
-    out: dict = {"on_key": None}
-    if st.follows(f, 0, owned=True):
-        st.alloc(3)
-        out["on_key"] = read_key_handler(st)
-    out["type_data"] = read_focus_type_data(st, item_type, f)
-    return out
+    f = io.load(8, node, "raw")
+    key_handlers(io, f, 0, node, "on_key")
+    focus_type_data(io, item_type, f, node)
 
 
-def read_item_data(st: XStream, item_type: int, it: Chunk) -> Any:
-    if not st.follows(it, 204, owned=True):
-        return None
+def item_data(io: XStream, item_type: int, it: Chunk, node: dict) -> None:
+    if not io.follows(it, 204, owned=True):
+        return
+    data = node.setdefault("type_data", {})
     if item_type in TEXT_TYPES:
-        st.alloc(3)
-        t = st.load(140)
-        text: dict = {"text": st.string(t, 128), "text_exp": None, "type_data": None}
-        if st.follows(t, 132, owned=True):
-            st.alloc(3)
-            text["text_exp"] = read_expression(st, st.load(16))
-        if st.follows(t, 136, owned=True):
+        io.alloc(3)
+        text = data.setdefault("text_def", {})
+        t = io.load(140, text, "raw")
+        io.string(t, 128, text, "text")
+        exp = sub(io, t, 132, text, "text_exp")
+        if exp is not None:
+            expression(io, io.load(16, exp, "raw"), exp)
+        if io.follows(t, 136, owned=True):
             if item_type in TEXT_FOCUS_TYPES:
-                st.alloc(3)
-                text["type_data"] = {"focus": read_focus_item(st, item_type)}
+                io.alloc(3)
+                focus_item(io, item_type, text.setdefault("focus", {}))
             elif item_type == ITEM_TYPE_GAME_MESSAGE_WINDOW:
-                st.alloc(3)
-                text["type_data"] = {"game_msg": st.load(8).bytes()}
-        text["raw"] = t.bytes()
-        return {"text_def": text}
-    if item_type in EXPRESSION_TYPES:
-        st.alloc(3)
-        return {"expression": read_expression(st, st.load(16))}
-    if item_type in FOCUS_TYPES:
-        st.alloc(3)
-        return {"focus": read_focus_item(st, item_type)}
-    return None
+                io.alloc(3)
+                io.load(8, text, "game_msg")
+    elif item_type in EXPRESSION_TYPES:
+        io.alloc(3)
+        exp = data.setdefault("expression", {})
+        expression(io, io.load(16, exp, "raw"), exp)
+    elif item_type in FOCUS_TYPES:
+        io.alloc(3)
+        focus_item(io, item_type, data.setdefault("focus", {}))
 
 
-def read_window(st: XStream, w: Chunk) -> dict:
+def window(io: XStream, w: Chunk, node: dict) -> None:
     """windowDef_t (176): name, group, background (in that load order)."""
-    return {
-        "name": st.string(w, 0),
-        "group": st.string(w, 52),
-        "background": asset_ref(st, w, 172, AssetType.MATERIAL),
-    }
+    io.string(w, 0, node, "name")
+    io.string(w, 52, node, "group")
+    asset_ref(io, w, 172, AssetType.MATERIAL, node, "background")
 
 
-def read_anim_info(st: XStream) -> dict:
-    a = st.load(236)
-    out: dict = {"anim_states": None, "raw": a.bytes()}
-    if st.follows(a, 4, owned=True):
-        n = a.s32(0)
-        st.alloc(3)
-        table = st.load(4 * n)
-        states = []
-        for i in range(n):
-            state = None
-            if st.follows(table, 4 * i, owned=True):
-                st.alloc(3)
-                p = st.load(108)
-                state = {"name": st.string(p, 0), "on_event": None, "raw": p.bytes()}
-                if st.follows(p, 104, owned=True):
-                    st.alloc(3)
-                    state["on_event"] = read_event_handler(st)
-            states.append(state)
-        out["anim_states"] = states
-    return out
+def anim_info(io: XStream, node: dict) -> None:
+    a = io.load(236, node, "raw")
+    table = array(io, a, 4, 3, 4 * a.s32(0), node, "anim_state_ptrs", owned=True)
+    if table is None:
+        return
+    states = io.children(node, "anim_states")
+    for i in range(a.s32(0)):
+        state = io.child(states, i)
+        if io.follows(table, 4 * i, owned=True):
+            io.alloc(3)
+            p = io.load(108, state, "raw")
+            io.string(p, 0, state, "name")
+            event_handlers(io, p, 104, state, "on_event")
 
 
-def read_item(st: XStream) -> dict:
-    it = st.load(280)
-    out: dict = {"window": read_window(st, it)}
-    out["dvar"] = st.string(it, 188)
-    out["dvar_test"] = st.string(it, 192)
-    out["enable_dvar"] = st.string(it, 196)
-    item_type = it.s32(176)
-    out["type"] = item_type
-    out["type_data"] = read_item_data(st, item_type, it)
-    out["rect_exp_data"] = None
-    if st.follows(it, 212, owned=True):
-        st.alloc(3)
-        r = st.load(64)
-        out["rect_exp_data"] = [read_expression(st, r.sub(16 * k, 16)) for k in range(4)]
-    out["visible_exp"] = read_expression(st, it.sub(216, 16))
-    out["text_align_y_exp"] = read_expression(st, it.sub(248, 16))
-    out["on_event"] = None
-    if st.follows(it, 268, owned=True):
-        st.alloc(3)
-        out["on_event"] = read_event_handler(st)
-    out["anim_info"] = None
-    if st.follows(it, 272, owned=True):
-        st.alloc(3)
-        out["anim_info"] = read_anim_info(st)
-    out["raw"] = it.bytes()
-    return out
+def item(io: XStream, node: dict) -> None:
+    it = io.load(280, node, "raw")
+    window(io, it, node.setdefault("window", {}))
+    io.string(it, 188, node, "dvar")
+    io.string(it, 192, node, "dvar_test")
+    io.string(it, 196, node, "enable_dvar")
+    item_data(io, it.s32(176), it, node)
+    rect = sub(io, it, 212, node, "rect_exp_data")
+    if rect is not None:
+        r = io.load(64, rect, "raw")
+        for k in range(4):
+            expression(io, r.sub(16 * k, 16), rect.setdefault(k, {}))
+    expression(io, it.sub(216, 16), node.setdefault("visible_exp", {}))
+    expression(io, it.sub(248, 16), node.setdefault("text_align_y_exp", {}))
+    event_handlers(io, it, 268, node, "on_event")
+    info = sub(io, it, 272, node, "anim_info")
+    if info is not None:
+        anim_info(io, info)
 
 
-def read_menu(st: XStream, m: Chunk) -> dict:
-    st.push(Block.VIRTUAL)
-    out: dict = {"window": read_window(st, m)}
-    out["name"] = out["window"]["name"]
-    out["font"] = st.string(m, 176)
-    out["on_open"] = None
-    if st.follows(m, 292, owned=True):
-        st.alloc(3)
-        out["on_open"] = read_event_handler(st)
-    out["on_key"] = None
-    if st.follows(m, 296, owned=True):
-        st.alloc(3)
-        out["on_key"] = read_key_handler(st)
-    out["visible_exp"] = read_expression(st, m.sub(300, 16))
-    out["allowed_binding"] = st.string(m, 336)
-    out["sound_name"] = st.string(m, 340)
-    out["rect_x_exp"] = read_expression(st, m.sub(384, 16))
-    out["rect_y_exp"] = read_expression(st, m.sub(400, 16))
-    out["item_count"] = m.s32(188)
-    out["items"] = None
-    if st.follows(m, 416, owned=True):
-        n = m.s32(188)
-        st.alloc(3)
-        table = st.load(4 * n)
-        items = []
-        for i in range(n):
-            item = None
-            if st.follows(table, 4 * i, owned=True):
-                st.alloc(7)
-                item = read_item(st)
-            items.append(item)
-        out["items"] = items
-    out["header"] = m.bytes()
-    st.pop()
-    return out
+def menu_body(io: XStream, m: Chunk, node: dict) -> None:
+    io.push(Block.VIRTUAL)
+    win = node.setdefault("window", {})
+    window(io, m, win)
+    io.note(node, "name", win.get("name"))
+    io.string(m, 176, node, "font")
+    event_handlers(io, m, 292, node, "on_open")
+    key_handlers(io, m, 296, node, "on_key")
+    expression(io, m.sub(300, 16), node.setdefault("visible_exp", {}))
+    io.string(m, 336, node, "allowed_binding")
+    io.string(m, 340, node, "sound_name")
+    expression(io, m.sub(384, 16), node.setdefault("rect_x_exp", {}))
+    expression(io, m.sub(400, 16), node.setdefault("rect_y_exp", {}))
+    count = m.s32(188)
+    table = array(io, m, 416, 3, 4 * count, node, "item_ptrs", owned=True)
+    if table is not None:
+        elements = io.children(node, "items")
+        for i in range(count):
+            element = io.child(elements, i)
+            if io.follows(table, 4 * i, owned=True):
+                io.alloc(7)
+                item(io, element)
+    io.pop()
 
 
 @register
@@ -317,8 +264,11 @@ class MenuHandler(Handler):
     header_size = 424
     align = 7
 
-    def read(self, st: XStream, header: Chunk) -> dict:
-        return read_menu(st, header)
+    def body(self, io: XStream, header: Chunk, node: dict) -> None:
+        menu_body(io, header, node)
+
+    def name_of(self, node) -> str | None:
+        return node.get("window", {}).get("name") if isinstance(node, dict) else None
 
 
 @register
@@ -329,14 +279,15 @@ class MenuFileHandler(Handler):
     asset_type = AssetType.MENUFILE
     header_size = 12
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        name = st.string(h, 0)
-        menus = None
-        if st.follows(h, 8, owned=True):
-            n = h.s32(4)
-            st.alloc(3)
-            table = st.load(4 * n)
-            menus = [asset_ref(st, table, 4 * i, AssetType.MENU) for i in range(n)]
-        st.pop()
-        return {"name": name, "menu_count": h.s32(4), "menus": menus}
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        count = h.s32(4)
+        table = array(io, h, 8, 3, 4 * count, node, "menu_ptrs", owned=True)
+        if table is not None:
+            menus = io.children(node, "menus")
+            for i in range(count):
+                if io.reading:
+                    menus.append(None)
+                asset_ref(io, table, 4 * i, AssetType.MENU, menus, i)
+        io.pop()

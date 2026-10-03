@@ -12,58 +12,34 @@ carry a u16 list at +0xc of u32 +0x8). Loaders: SP Ptr 0x24b8f8, MP Ptr
 from __future__ import annotations
 
 from opent5.xfile.constants import AssetType, Block
-from opent5.xfile.handlers.base import Handler, array, blob, register, runtime
+from opent5.xfile.handlers.base import Handler, array, items, register, runtime
 from opent5.xfile.stream import Chunk, XStream
 
 PATHNODE_SIZE = 0x80
 EXTRA_NODES = 128
 
 
-def read_gameworld(st: XStream, h: Chunk) -> dict:
-    st.push(Block.VIRTUAL)
-    name = st.string(h, 0)
+def gameworld_body(io: XStream, h: Chunk, node: dict) -> None:
+    """Node: "header", "name", "nodes" (elements with "links"), "chain_node_for_node",
+    "node_for_chain_node", "path_vis", "node_tree" (elements; leaves carry "nodes")."""
+    io.push(Block.VIRTUAL)
+    io.string(h, 0, node, "name")
     node_count = h.u32(4)
     total = node_count + EXTRA_NODES
-    nodes = array(st, h, 8, 3, PATHNODE_SIZE * total)
-    links = None
-    if nodes is not None:
-        links = []
-        for node in nodes.items(PATHNODE_SIZE, total):
-            links.append(blob(array(st, node, 0x40, 3, 12 * node.u16(0x3E))))
-    runtime(st, h, 0xC, 15, 16 * total)
-    chain_for_node = array(st, h, 0x14, 1, 2 * node_count)
-    node_for_chain = array(st, h, 0x18, 1, 2 * node_count)
-    path_vis = array(st, h, 0x20, 0, h.u32(0x1C))
-    tree_count = h.u32(0x24)
-    tree = array(st, h, 0x28, 3, 0x10 * tree_count)
-    leaves = None
-    if tree is not None:
-        leaves = []
-        for t in tree.items(0x10, tree_count):
-            if t.s32(0) < 0:
-                leaves.append(blob(array(st, t, 0xC, 1, 2 * t.u32(8))))
-            else:
-                # Interior node: two child pointers, converted only.
-                st.convert(t, 0x8)
-                st.convert(t, 0xC)
-                leaves.append(None)
-    st.pop()
-    return {
-        "name": name,
-        "path": {
-            "node_count": node_count,
-            "nodes": blob(nodes),
-            "node_links": links,
-            "chain_node_count": h.u32(0x10),
-            "chain_node_for_node": blob(chain_for_node),
-            "node_for_chain_node": blob(node_for_chain),
-            "vis_bytes": h.u32(0x1C),
-            "path_vis": blob(path_vis),
-            "node_tree_count": tree_count,
-            "node_tree": blob(tree),
-            "node_tree_leaves": leaves,
-        },
-    }
+    for n, element in items(io, h, 8, 3, PATHNODE_SIZE, total, node, "nodes") or ():
+        array(io, n, 0x40, 3, 12 * n.u16(0x3E), element, "links")
+    runtime(io, h, 0xC, 15, 16 * total)  # basenodes
+    array(io, h, 0x14, 1, 2 * node_count, node, "chain_node_for_node")
+    array(io, h, 0x18, 1, 2 * node_count, node, "node_for_chain_node")
+    array(io, h, 0x20, 0, h.u32(0x1C), node, "path_vis")
+    for t, element in items(io, h, 0x28, 3, 0x10, h.u32(0x24), node, "node_tree") or ():
+        if t.s32(0) < 0:
+            array(io, t, 0xC, 1, 2 * t.u32(8), element, "nodes")
+        else:
+            # Interior node: two child pointers, converted only.
+            io.convert(t, 0x8)
+            io.convert(t, 0xC)
+    io.pop()
 
 
 @register
@@ -71,8 +47,8 @@ class GameWorldSpHandler(Handler):
     asset_type = AssetType.GAME_MAP_SP
     header_size = 0x2C
 
-    def read(self, st: XStream, header: Chunk) -> dict:
-        return read_gameworld(st, header)
+    def body(self, io: XStream, header: Chunk, node: dict) -> None:
+        gameworld_body(io, header, node)
 
 
 @register
@@ -80,5 +56,5 @@ class GameWorldMpHandler(Handler):
     asset_type = AssetType.GAME_MAP_MP
     header_size = 0x2C
 
-    def read(self, st: XStream, header: Chunk) -> dict:
-        return read_gameworld(st, header)
+    def body(self, io: XStream, header: Chunk, node: dict) -> None:
+        gameworld_body(io, header, node)

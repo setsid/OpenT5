@@ -36,7 +36,7 @@ from opent5.xfile.constants import (
 )
 from opent5.xfile.events import NONE, EventKind, EventLog
 from opent5.xfile.handlers.base import REGISTRY
-from opent5.xfile.stream import Chunk, DeferredData, XFileError, XStream
+from opent5.xfile.stream import Chunk, DeferredData, XFileError, XStream, XWriter
 
 #: blockSize[0] (TEMP) is the TEMP high-water mark plus 16 in every zone walked
 #: (TEMP rewinds after each asset, so the final position is 0). INFERRED: the
@@ -133,6 +133,11 @@ class XFile:
     final_cursors: tuple[int, ...]
     temp_high_water: int
     log: EventLog | None = field(repr=False, default=None)
+    #: What the writer needs beyond the assets: the raw XAssetList (16 bytes), the
+    #: script string pointer array and the asset array, as read.
+    asset_list: bytes = b""
+    script_string_ptrs: bytes | None = field(repr=False, default=None)
+    asset_entries: bytes | None = field(repr=False, default=None)
 
     def problems(self) -> list[str]:
         """Every way the walk disagrees with the header; empty when the parse is exact."""
@@ -183,87 +188,173 @@ def parse(content: bytes | bytearray | memoryview, log: bool = True) -> XFile:
         )
     st = XStream(data, log=log)
     # The XAssetList is read raw: it occupies no block memory.
-    asset_list = Chunk(
-        st.view[ASSET_LIST_OFFSET : ASSET_LIST_OFFSET + ASSET_LIST_SIZE],
-        ASSET_LIST_OFFSET,
-        NONE,
-        NONE,
-    )
+    list_bytes = data[ASSET_LIST_OFFSET : ASSET_LIST_OFFSET + ASSET_LIST_SIZE]
     st.fp = ASSET_LIST_OFFSET + ASSET_LIST_SIZE
-    string_count, asset_count = asset_list.u32(0), asset_list.u32(8)
-
-    st.push(Block.VIRTUAL)
-    script_strings: list[str | None] = []
-    strings_at = st.fp
-    if st.follows(asset_list, 4, owned=True):
-        st.alloc(3)
-        pointers = st.load(4 * string_count)
-        script_strings = [st.string(pointers, 4 * i) for i in range(string_count)]
-    st.pop()
-
-    st.push(Block.VIRTUAL)
-    assets: list[Asset] = []
-    array_at = st.fp
-    if st.follows(asset_list, 12, owned=True):
-        st.alloc(3)
-        entries = st.load(8 * asset_count)
-        for index in range(asset_count):
-            assets.append(_load_entry(st, entries, index))
-    st.pop()
-
-    tail = st.fp
-    st.flush_deferred()
+    parts: dict = {}
+    walked = _walk(st, list_bytes, ASSET_LIST_OFFSET, parts, None)
     return XFile(
         header=header,
-        script_strings=script_strings,
-        assets=assets,
-        script_strings_offset=strings_at,
-        asset_array_offset=array_at,
-        tail_offset=tail,
+        script_strings=parts.get("script_strings") or [],
+        assets=walked.assets,
+        script_strings_offset=walked.strings_at,
+        asset_array_offset=walked.array_at,
+        tail_offset=walked.tail,
         end_offset=st.fp,
         length=len(data),
         deferred=st.deferred,
         final_cursors=st.cursors(),
         temp_high_water=st.temp_high,
         log=st.log,
+        asset_list=list_bytes,
+        script_string_ptrs=parts.get("script_string_ptrs"),
+        asset_entries=parts.get("asset_entries"),
     )
 
 
-def _load_entry(st: XStream, entries: Chunk, index: int) -> Asset:
+@dataclass
+class _Walked:
+    assets: list[Asset]
+    strings_at: int
+    array_at: int
+    tail: int
+
+
+def _walk(io: XStream, list_bytes: bytes, list_at: int, parts: dict, source: XFile | None):
+    """Script strings, the asset array, every asset, the deferred tail: both directions.
+    Reading fills `parts` and returns new Assets; writing takes them from `source`."""
+    asset_list = Chunk(memoryview(bytearray(list_bytes)), list_at, NONE, NONE)
+    string_count, asset_count = asset_list.u32(0), asset_list.u32(8)
+
+    io.push(Block.VIRTUAL)
+    strings_at = io.fp
+    if io.follows(asset_list, 4, owned=True):
+        io.alloc(3)
+        pointers = io.load(4 * string_count, parts, "script_string_ptrs")
+        strings = io.children(parts, "script_strings")
+        for i in range(string_count):
+            if io.reading:
+                strings.append(None)
+            io.string(pointers, 4 * i, strings, i)
+    io.pop()
+
+    io.push(Block.VIRTUAL)
+    assets: list[Asset] = []
+    array_at = io.fp
+    if io.follows(asset_list, 12, owned=True):
+        io.alloc(3)
+        entries = io.load(8 * asset_count, parts, "asset_entries")
+        for index in range(asset_count):
+            data = None if source is None else source.assets[index].data
+            assets.append(_entry(io, entries, index, data))
+    io.pop()
+
+    tail = io.fp
+    io.flush_deferred()
+    return _Walked(assets, strings_at, array_at, tail)
+
+
+def write(
+    xfile: XFile,
+    log: bool = True,
+    pointer_values: dict[int, int] | None = None,
+    derive_header: bool = True,
+) -> Written:
+    """Serialise a parsed (possibly edited) zone back to its content bytes.
+
+    Every asset is emitted from its node by the same handler code that parsed it,
+    with block positions tracked as the loader tracks them. With derive_header the
+    XFile header is computed from the result (size from the length, blockSize[]
+    from the final block positions, TEMP as its high-water mark plus 16); for an
+    unedited parse that is the original header. pointer_values overrides pointer
+    fields by ordinal (see XWriter)."""
+    writer = XWriter(log=log, pointer_values=pointer_values)
+    writer.raw(xfile.header.pack())
+    list_at = writer.raw(xfile.asset_list)
+    parts = {
+        "script_string_ptrs": xfile.script_string_ptrs,
+        "script_strings": xfile.script_strings,
+        "asset_entries": xfile.asset_entries,
+    }
+    walked = _walk(writer, xfile.asset_list, list_at, parts, xfile)
+    content = writer.out
+    if derive_header:
+        sizes = list(writer.pos)
+        sizes[Block.TEMP] = writer.temp_high + TEMP_SLACK
+        header = XFileHeader(len(content) - HEADER_SIZE, xfile.header.external_size, tuple(sizes))
+    else:
+        header = xfile.header
+    content[0:HEADER_SIZE] = header.pack()
+    return Written(
+        content=bytes(content),
+        header=header,
+        assets=walked.assets,
+        tail_offset=walked.tail,
+        final_cursors=writer.cursors(),
+        temp_high_water=writer.temp_high,
+        log=writer.log,
+    )
+
+
+@dataclass
+class Written:
+    """The result of ``write``: the content and where everything went."""
+
+    content: bytes
+    header: XFileHeader
+    #: Each asset's span and block positions in the written stream.
+    assets: list[Asset]
+    tail_offset: int
+    final_cursors: tuple[int, ...]
+    temp_high_water: int
+    #: The writer's event log: the same records as a parse's, in output offsets.
+    log: EventLog | None = field(repr=False, default=None)
+
+
+def write_asset(asset: Asset, log: bool = False) -> bytes:
+    """One asset's own bytes (its file span; deferred bytes it queues are not
+    included), from its node."""
+    handler = REGISTRY[asset.type]
+    writer = XWriter(log=log)
+    writer.push(Block.VIRTUAL)
+    handler.write(asset.data, writer, asset.header_ptr)
+    writer.pop()
+    return writer.getvalue()
+
+
+def _entry(io: XStream, entries: Chunk, index: int, data: Any) -> Asset:
     asset_type = entries.u32(8 * index)
-    start = st.fp
-    before = st.cursors()
-    st.asset_index = index
-    st.asset_strings = []
+    start = io.fp
+    before = io.cursors()
+    io.asset_index = index
+    io.asset_strings = []
     event_start = -1
-    if st.log is not None:
-        event_start = len(st.log)
-        st.log.append(EventKind.ASSET, index, asset_type, start)
+    if io.log is not None:
+        event_start = len(io.log)
+        io.log.append(EventKind.ASSET, index, asset_type, start)
     handler = REGISTRY.get(asset_type)
     raw = entries.u32(8 * index + 4)
-    data = None
     try:
         if handler is None:
             # Load_XAssetHeader has no case for this type: the game loads nothing.
-            raise st.fail(
+            raise io.fail(
                 f"asset {index}: type {asset_type} ({type_name(asset_type)}) has no loader "
                 "in the game; expected one of the loaded types"
             )
         # Load_XAsset passes the header pointer already read with the array.
-        st.ref(entries, 8 * index + 4)
-        data = handler.load_ptr(st, raw)
+        raw = io.ref(entries, 8 * index + 4)
+        data = handler.load_ptr(io, raw, data)
     except AssetError:
         raise
     except (XFileError, IndexError, ValueError, struct.error) as exc:
-        name = st.trail[:]
+        name = io.trail[:]
         raise AssetError(
             f"asset {index} ({type_name(asset_type)}) starting at {start:#x}: {exc}",
             index,
             asset_type,
             start,
             name,
-            st.fp,
-            list(st.asset_strings),
+            io.fp,
+            list(io.asset_strings),
             before,
         ) from exc
     name = None
@@ -277,9 +368,9 @@ def _load_entry(st: XStream, entries: Chunk, index: int) -> Asset:
         header_ptr=raw,
         name=name,
         file_start=start,
-        file_end=st.fp,
+        file_end=io.fp,
         cursors_before=before,
-        cursors_after=st.cursors(),
+        cursors_after=io.cursors(),
         data=data,
         event_start=event_start,
     )

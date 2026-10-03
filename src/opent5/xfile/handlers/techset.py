@@ -7,12 +7,17 @@ MaterialPass (24): +0 vertexDecl [-1] (align 4, LS 34), +4 vertex shader ref,
 +8 pixel shader ref, +0xc three arg counts, +0x14 args [nz] (align 4, LS 8 x
 args; literal args of type 1 or 7 with +4 == -1: align 4, LS 16).
 Loaders: Ptr 0x248878, struct 0x2486d8, technique 0x2483c8, pass 0x2480c0.
+
+Node: "header", "name", "techniques" (71 entries: a technique node or None).
+Technique: "head" (8 bytes), "passes" (elements), "name". Pass element: "raw",
+"vertex_decl", "vertex_shader", "pixel_shader", "args" (elements: "raw",
+"literal").
 """
 
 from __future__ import annotations
 
 from opent5.xfile.constants import AssetType, Block
-from opent5.xfile.handlers.base import Handler, asset_ref, register
+from opent5.xfile.handlers.base import Handler, array, asset_ref, items, register
 from opent5.xfile.stream import Chunk, XStream
 
 TECHNIQUE_COUNT = 71
@@ -20,67 +25,36 @@ TECHNIQUE_COUNT = 71
 LITERAL_ARG_TYPES = (1, 7)
 
 
-def read_pass(st: XStream, p: Chunk) -> dict:
-    decl = None
-    if st.follows(p, 0):
-        st.alloc(3)
-        decl = st.load(34).bytes()
-    vertex_shader = asset_ref(st, p, 4, AssetType.VERTEXSHADER)
-    pixel_shader = asset_ref(st, p, 8, AssetType.PIXELSHADER)
-    counts = (p.u8(12), p.u8(13), p.u8(14))
-    args = None
-    if st.follows(p, 20, owned=True):
-        n = sum(counts)
-        st.alloc(3)
-        table = st.load(8 * n)
-        args = []
-        for a in table.items(8, n):
-            arg = {"type": a.u16(0), "dest": a.u16(2), "u": a.u32(4)}
-            if arg["type"] in LITERAL_ARG_TYPES and st.follows(a, 4):
-                st.alloc(3)
-                literal = st.load(16)
-                arg["literal"] = tuple(literal.f32(4 * k) for k in range(4))
-            args.append(arg)
-    return {
-        "vertex_decl": decl,
-        "vertex_shader": vertex_shader,
-        "pixel_shader": pixel_shader,
-        "per_prim_arg_count": counts[0],
-        "per_obj_arg_count": counts[1],
-        "stable_arg_count": counts[2],
-        "args": args,
-        "raw": p.bytes(),
-    }
+def pass_body(io: XStream, p: Chunk, node: dict) -> None:
+    array(io, p, 0, 3, 34, node, "vertex_decl")
+    asset_ref(io, p, 4, AssetType.VERTEXSHADER, node, "vertex_shader")
+    asset_ref(io, p, 8, AssetType.PIXELSHADER, node, "pixel_shader")
+    count = p.u8(12) + p.u8(13) + p.u8(14)
+    for a, arg in items(io, p, 20, 3, 8, count, node, "args", owned=True) or ():
+        if a.u16(0) in LITERAL_ARG_TYPES:
+            array(io, a, 4, 3, 16, arg, "literal")
 
 
-def read_technique(st: XStream) -> dict:
-    head = st.load(8)
-    count = head.u16(6)
-    passes = st.load(24 * count)
-    pass_list = [read_pass(st, p) for p in passes.items(24, count)]
-    name = st.string(head, 0)
-    return {"name": name, "flags": head.u16(4), "passes": pass_list}
+def technique_body(io: XStream, node: dict) -> None:
+    head = io.load(8, node, "head")
+    for p, element in io.items(24, head.u16(6), node, "passes"):
+        pass_body(io, p, element)
+    io.string(head, 0, node, "name")
 
 
-def read_techset(st: XStream, h: Chunk) -> dict:
-    st.push(Block.VIRTUAL)
-    name = st.string(h, 0)
-    techniques: list = []
+def techset_body(io: XStream, h: Chunk, node: dict) -> None:
+    io.push(Block.VIRTUAL)
+    io.string(h, 0, node, "name")
+    techniques = io.children(node, "techniques")
     for i in range(TECHNIQUE_COUNT):
-        off = 8 + 4 * i
-        if st.follows(h, off):
-            st.alloc(3)
-            techniques.append(read_technique(st))
-        else:
-            raw = h.u32(off)
-            techniques.append(raw or None)
-    st.pop()
-    return {
-        "name": name,
-        "world_vert_format": h.u8(4),
-        "flags": h.data[4:8].tobytes(),
-        "techniques": techniques,
-    }
+        if io.reading:
+            techniques.append(None)
+        if io.follows(h, 8 + 4 * i):
+            io.alloc(3)
+            if io.reading:
+                techniques[i] = {}
+            technique_body(io, techniques[i])
+    io.pop()
 
 
 @register
@@ -88,5 +62,5 @@ class TechsetHandler(Handler):
     asset_type = AssetType.TECHSET
     header_size = 292
 
-    def read(self, st: XStream, header: Chunk) -> dict:
-        return read_techset(st, header)
+    def body(self, io: XStream, header: Chunk, node: dict) -> None:
+        techset_body(io, header, node)

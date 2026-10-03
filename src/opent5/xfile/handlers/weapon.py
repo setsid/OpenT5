@@ -10,139 +10,144 @@ FlameTable 0x249810.
 from __future__ import annotations
 
 from opent5.xfile.constants import AssetType, Block
-from opent5.xfile.handlers.base import Handler, asset_ref, register
+from opent5.xfile.handlers.base import Handler, array, asset_ref, register
 from opent5.xfile.stream import Chunk, XStream
 
 WEAPON_DEF_SIZE = 2056
 FLAME_TABLE_SIZE = 476
 
 
-def read_flame_table(st: XStream) -> dict:
-    f = st.load(FLAME_TABLE_SIZE)
-    out: dict = {"name": st.string(f, 424)}
-    out["materials"] = [asset_ref(st, f, off, AssetType.MATERIAL) for off in range(428, 460, 4)]
-    out["strings"] = [st.string(f, off) for off in (460, 464, 468, 472)]
-    out["raw"] = f.bytes()
-    return out
-
-
-def read_xmodel_array16(st: XStream, chunk: Chunk, off: int):
-    if st.follows(chunk, off):
-        st.alloc(3)
-        table = st.load(64)
-        return [asset_ref(st, table, 4 * i, AssetType.XMODEL) for i in range(16)]
+def _sub(io: XStream, parent: Chunk, off: int, node: dict, key: str) -> dict | None:
+    if io.follows(parent, off):
+        io.alloc(3)
+        if io.reading:
+            node[key] = {}
+        return node[key]
+    if io.reading:
+        node[key] = None
     return None
 
 
-def read_fixed(st: XStream, chunk: Chunk, off: int, mask: int, size: int) -> bytes | None:
-    if st.follows(chunk, off):
-        st.alloc(mask)
-        return st.load(size).bytes()
-    return None
+def flame_table_body(io: XStream, node: dict) -> None:
+    f = io.load(FLAME_TABLE_SIZE, node, "raw")
+    io.string(f, 424, node, "name")
+    materials = node.setdefault("materials", {})
+    for off in range(428, 460, 4):
+        asset_ref(io, f, off, AssetType.MATERIAL, materials, off)
+    strings = node.setdefault("strings", {})
+    for off in (460, 464, 468, 472):
+        io.string(f, off, strings, off)
 
 
-def read_weapon_def(st: XStream, d: Chunk) -> dict:
-    s = st.string
-    out: dict = {}
-    strings: dict[int, str | None] = {}
-    fx: dict[int, object] = {}
-    materials: dict[int, object] = {}
-    models: dict[int, object] = {}
-    out["szOverlayName"] = s(d, 0)
-    out["gunXModel"] = read_xmodel_array16(st, d, 4)
-    models[8] = asset_ref(st, d, 8, AssetType.XMODEL)  # handXModel
-    out["szModeName"] = s(d, 12)
-    out["notetrackSoundMapKeys"] = read_fixed(st, d, 16, 1, 40)
-    out["notetrackSoundMapValues"] = read_fixed(st, d, 20, 1, 40)
-    out["parentWeaponName"] = s(d, 60)
-    fx[116] = asset_ref(st, d, 116, AssetType.FX)  # viewFlashEffect
-    fx[120] = asset_ref(st, d, 120, AssetType.FX)  # worldFlashEffect
+def xmodel_array16(io: XStream, chunk: Chunk, off: int, node: dict, key: str) -> None:
+    table = array(io, chunk, off, 3, 64, node, key + "_ptrs")
+    if table is not None:
+        models = node.setdefault(key, {})
+        for i in range(16):
+            asset_ref(io, table, 4 * i, AssetType.XMODEL, models, i)
+
+
+def weapon_def_body(io: XStream, d: Chunk, node: dict) -> None:
+    strings = node.setdefault("strings", {})
+    fx = node.setdefault("fx", {})
+    materials = node.setdefault("materials", {})
+    models = node.setdefault("models", {})
+
+    def s(off: int) -> None:
+        io.string(d, off, strings, off)
+
+    def effect(off: int) -> None:
+        asset_ref(io, d, off, AssetType.FX, fx, off)
+
+    def material(off: int) -> None:
+        asset_ref(io, d, off, AssetType.MATERIAL, materials, off)
+
+    def model(off: int) -> None:
+        asset_ref(io, d, off, AssetType.XMODEL, models, off)
+
+    s(0)  # szOverlayName
+    xmodel_array16(io, d, 4, node, "gunXModel")
+    model(8)  # handXModel
+    s(12)  # szModeName
+    array(io, d, 16, 1, 40, node, "notetrackSoundMapKeys")
+    array(io, d, 20, 1, 40, node, "notetrackSoundMapValues")
+    s(60)  # parentWeaponName
+    effect(116)  # viewFlashEffect
+    effect(120)  # worldFlashEffect
     for off in range(124, 372, 4):  # 62 sound names
-        strings[off] = s(d, off)
-    out["bounceSound"] = None
-    if st.follows(d, 372):
-        st.alloc(3)
-        table = st.load(124)
-        out["bounceSound"] = [s(table, 4 * i) for i in range(31)]
+        s(off)
+    bounce = array(io, d, 372, 3, 124, node, "bounceSound_ptrs")
+    if bounce is not None:
+        names = node.setdefault("bounceSound", {})
+        for i in range(31):
+            io.string(bounce, 4 * i, names, i)
     for off in (376, 380, 384):  # stand / crouch / prone mounted weapdef
-        strings[off] = s(d, off)
+        s(off)
     for off in (400, 404, 408, 412):  # shell-eject effects
-        fx[off] = asset_ref(st, d, off, AssetType.FX)
-    materials[416] = asset_ref(st, d, 416, AssetType.MATERIAL)  # reticleCenter
-    materials[420] = asset_ref(st, d, 420, AssetType.MATERIAL)  # reticleSide
-    out["worldModel"] = read_xmodel_array16(st, d, 780)
+        effect(off)
+    material(416)  # reticleCenter
+    material(420)  # reticleSide
+    xmodel_array16(io, d, 780, node, "worldModel")
     for off in (784, 788, 792, 796):  # worldClip, rocket, mounted, additionalMelee models
-        models[off] = asset_ref(st, d, off, AssetType.XMODEL)
-    materials[800] = asset_ref(st, d, 800, AssetType.MATERIAL)  # hudIcon
-    materials[816] = asset_ref(st, d, 816, AssetType.MATERIAL)  # ammoCounterIcon
-    strings[844] = s(d, 844)  # szSharedAmmoCapName
+        model(off)
+    material(800)  # hudIcon
+    material(816)  # ammoCounterIcon
+    s(844)  # szSharedAmmoCapName
     for off in (916, 920, 924, 928, 932, 936, 1164):
-        strings[off] = s(d, off)
-    materials[1400] = asset_ref(st, d, 1400, AssetType.MATERIAL)  # killIcon
-    materials[808] = asset_ref(st, d, 808, AssetType.MATERIAL)  # indicatorIcon
-    strings[1420] = s(d, 1420)
-    strings[1424] = s(d, 1424)
-    models[1512] = asset_ref(st, d, 1512, AssetType.XMODEL)
+        s(off)
+    material(1400)  # killIcon
+    material(808)  # indicatorIcon
+    s(1420)
+    s(1424)
+    model(1512)
     for off in (1520, 1528, 1536, 1544, 1552, 1560):  # projectile effects
-        fx[off] = asset_ref(st, d, off, AssetType.FX)
+        effect(off)
     for off in (1564, 1568, 1572, 1576):  # projectile sounds
-        strings[off] = s(d, off)
-    out["parallelBounce"] = read_fixed(st, d, 1616, 3, 124)
-    out["perpendicularBounce"] = read_fixed(st, d, 1620, 3, 124)
-    fx[1624] = asset_ref(st, d, 1624, AssetType.FX)
-    fx[1652] = asset_ref(st, d, 1652, AssetType.FX)
-    strings[1656] = s(d, 1656)  # projIgnitionSound
-    out["aiVsAiAccuracyGraphName"] = s(d, 1812)
-    out["aiVsAiAccuracyGraphKnots"] = read_fixed(st, d, 1820, 3, 8 * d.s32(1836))
-    out["originalAiVsAiAccuracyGraphKnots"] = read_fixed(st, d, 1828, 3, 8 * d.s32(1836))
-    out["aiVsPlayerAccuracyGraphName"] = s(d, 1816)
-    out["aiVsPlayerAccuracyGraphKnots"] = read_fixed(st, d, 1824, 3, 8 * d.s32(1840))
-    out["originalAiVsPlayerAccuracyGraphKnots"] = read_fixed(st, d, 1832, 3, 8 * d.s32(1840))
+        s(off)
+    array(io, d, 1616, 3, 124, node, "parallelBounce")
+    array(io, d, 1620, 3, 124, node, "perpendicularBounce")
+    effect(1624)
+    effect(1652)
+    s(1656)  # projIgnitionSound
+    s(1812)  # aiVsAiAccuracyGraphName
+    array(io, d, 1820, 3, 8 * d.s32(1836), node, "aiVsAiAccuracyGraphKnots")
+    array(io, d, 1828, 3, 8 * d.s32(1836), node, "originalAiVsAiAccuracyGraphKnots")
+    s(1816)  # aiVsPlayerAccuracyGraphName
+    array(io, d, 1824, 3, 8 * d.s32(1840), node, "aiVsPlayerAccuracyGraphKnots")
+    array(io, d, 1832, 3, 8 * d.s32(1840), node, "originalAiVsPlayerAccuracyGraphKnots")
     for off in (1924, 1928, 1948):  # use / drop hints, script
-        strings[off] = s(d, off)
-    out["locationDamageMultipliers"] = read_fixed(st, d, 1980, 3, 76)
+        s(off)
+    array(io, d, 1980, 3, 76, node, "locationDamageMultipliers")
     for off in (1984, 1988, 1992, 2024, 2028):  # rumbles, flame table names
-        strings[off] = s(d, off)
+        s(off)
     for key, off in (("flameTableFirstPerson", 2032), ("flameTableThirdPerson", 2036)):
-        out[key] = None
-        if st.follows(d, off):
-            st.alloc(3)
-            out[key] = read_flame_table(st)
-    fx[2040] = asset_ref(st, d, 2040, AssetType.FX)
-    fx[2044] = asset_ref(st, d, 2044, AssetType.FX)
-    out["strings"] = strings
-    out["fx"] = fx
-    out["materials"] = materials
-    out["models"] = models
-    out["raw"] = d.bytes()
-    return out
+        table = _sub(io, d, off, node, key)
+        if table is not None:
+            flame_table_body(io, table)
+    effect(2040)
+    effect(2044)
 
 
-def read_weapon(st: XStream, h: Chunk) -> dict:
-    st.push(Block.VIRTUAL)
-    out: dict = {"name": st.string(h, 0)}
-    out["weapDef"] = None
-    if st.follows(h, 8):
-        st.alloc(3)
-        out["weapDef"] = read_weapon_def(st, st.load(WEAPON_DEF_SIZE))
-    out["szDisplayName"] = st.string(h, 12)
-    out["szAltWeaponName"] = st.string(h, 20)
-    out["szXAnims"] = None
-    if st.follows(h, 16):
-        st.alloc(3)
-        table = st.load(264)
-        out["szXAnims"] = [st.string(table, 4 * i) for i in range(66)]
-    out["hideTags"] = None
-    if st.follows(h, 24):
-        st.alloc(1)
-        tags = st.load(64)
-        out["hideTags"] = [tags.u16(2 * i) for i in range(32)]
-    out["szAmmoName"] = st.string(h, 64)
-    out["szClipName"] = st.string(h, 72)
-    out["materials"] = [asset_ref(st, h, off, AssetType.MATERIAL) for off in (140, 144, 148)]
-    out["header"] = h.bytes()
-    st.pop()
-    return out
+def weapon_body(io: XStream, h: Chunk, node: dict) -> None:
+    io.push(Block.VIRTUAL)
+    io.string(h, 0, node, "name")
+    weap_def = _sub(io, h, 8, node, "weapDef")
+    if weap_def is not None:
+        weapon_def_body(io, io.load(WEAPON_DEF_SIZE, weap_def, "raw"), weap_def)
+    io.string(h, 12, node, "szDisplayName")
+    io.string(h, 20, node, "szAltWeaponName")
+    anims = array(io, h, 16, 3, 264, node, "szXAnims_ptrs")
+    if anims is not None:
+        names = node.setdefault("szXAnims", {})
+        for i in range(66):
+            io.string(anims, 4 * i, names, i)
+    array(io, h, 24, 1, 64, node, "hideTags")
+    io.string(h, 64, node, "szAmmoName")
+    io.string(h, 72, node, "szClipName")
+    materials = node.setdefault("materials", {})
+    for off in (140, 144, 148):
+        asset_ref(io, h, off, AssetType.MATERIAL, materials, off)
+    io.pop()
 
 
 @register
@@ -150,5 +155,5 @@ class WeaponHandler(Handler):
     asset_type = AssetType.WEAPON
     header_size = 228
 
-    def read(self, st: XStream, header: Chunk) -> dict:
-        return read_weapon(st, header)
+    def body(self, io: XStream, header: Chunk, node: dict) -> None:
+        weapon_body(io, header, node)

@@ -14,62 +14,57 @@ SndDriverGlobals 0x2443a0.
 from __future__ import annotations
 
 from opent5.xfile.constants import AssetType, Block
-from opent5.xfile.handlers.base import Handler, register
+from opent5.xfile.handlers.base import Handler, array, items, register
 from opent5.xfile.stream import Chunk, XStream
 
 SAT_LOADED = 1
 
 
-def read_sound_file(st: XStream, sf: Chunk) -> dict:
-    kind = sf.u8(4)
-    out: dict = {"type": kind, "exists": sf.u8(5), "u": sf.u32(0)}
-    if kind == SAT_LOADED:
-        if st.follows(sf, 0):
-            st.alloc(3)
-            ls = st.load(60)
-            loaded: dict = {"name": st.string(ls, 0), "raw": ls.bytes(), "seek_table": None}
-            if st.follows(ls, 0x30, owned=True):
-                st.alloc(3)
-                loaded["seek_table"] = st.load(4 * ls.u32(0x2C)).bytes()
-            st.push(Block.LARGE)
-            st.push(Block.PHYSICAL)
-            loaded["data"] = None
-            if st.follows(ls, 0x38, owned=True):
-                st.alloc(2047)
-                loaded["data"] = st.load(ls.u32(0x34)).bytes()
-            st.pop()
-            st.pop()
-            out["loaded"] = loaded
-    elif st.follows(sf, 0):
-        st.alloc(3)
-        ss = st.load(24)
-        streamed: dict = {"filename": st.string(ss, 0), "raw": ss.bytes(), "prime_snd": None}
-        if st.follows(ss, 4):
-            st.alloc(3)
-            ps = st.load(12)
-            prime: dict = {"name": st.string(ps, 0), "size": ps.u32(8), "buffer": None}
-            st.push(Block.PHYSICAL)
-            if st.follows(ps, 4, owned=True):
-                st.alloc(2047)
-                prime["buffer"] = st.load(ps.u32(8)).bytes()
-            st.pop()
-            streamed["prime_snd"] = prime
-        out["streamed"] = streamed
-    return out
+def _sub(io: XStream, parent: Chunk, off: int, node: dict, key: str, owned: bool = False):
+    """A pointer to one sub-struct: align 4 and return its node, or None."""
+    if io.follows(parent, off, owned):
+        io.alloc(3)
+        if io.reading:
+            node[key] = {}
+        return node[key]
+    if io.reading:
+        node[key] = None
+    return None
 
 
-def read_alias(st: XStream, a: Chunk) -> dict:
-    out = {
-        "name": st.string(a, 0),
-        "subtitle": st.string(a, 8),
-        "secondary_name": st.string(a, 12),
-        "sound_file": None,
-        "raw": a.bytes(),
-    }
-    if st.follows(a, 16):
-        st.alloc(3)
-        out["sound_file"] = read_sound_file(st, st.load(8))
-    return out
+def sound_file_body(io: XStream, sf: Chunk, node: dict) -> None:
+    if sf.u8(4) == SAT_LOADED:
+        loaded = _sub(io, sf, 0, node, "loaded")
+        if loaded is not None:
+            ls = io.load(60, loaded, "raw")
+            io.string(ls, 0, loaded, "name")
+            array(io, ls, 0x30, 3, 4 * ls.u32(0x2C), loaded, "seek_table", owned=True)
+            io.push(Block.LARGE)
+            io.push(Block.PHYSICAL)
+            array(io, ls, 0x38, 2047, ls.u32(0x34), loaded, "data", owned=True)
+            io.pop()
+            io.pop()
+    else:
+        streamed = _sub(io, sf, 0, node, "streamed")
+        if streamed is not None:
+            ss = io.load(24, streamed, "raw")
+            io.string(ss, 0, streamed, "filename")
+            prime = _sub(io, ss, 4, streamed, "prime_snd")
+            if prime is not None:
+                ps = io.load(12, prime, "raw")
+                io.string(ps, 0, prime, "name")
+                io.push(Block.PHYSICAL)
+                array(io, ps, 4, 2047, ps.u32(8), prime, "buffer", owned=True)
+                io.pop()
+
+
+def alias_body(io: XStream, a: Chunk, node: dict) -> None:
+    io.string(a, 0, node, "name")
+    io.string(a, 8, node, "subtitle")
+    io.string(a, 12, node, "secondary_name")
+    sound_file = _sub(io, a, 16, node, "sound_file")
+    if sound_file is not None:
+        sound_file_body(io, io.load(8, sound_file, "raw"), sound_file)
 
 
 @register
@@ -77,46 +72,21 @@ class SoundHandler(Handler):
     asset_type = AssetType.SOUND
     header_size = 40
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        name = st.string(h, 0)
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
         count = h.u32(4)
-        lists = None
-        if st.follows(h, 8, owned=True):
-            st.alloc(3)
-            table = st.load(20 * count)
-            lists = []
-            for entry in table.items(20, count):
-                alias_list: dict = {"name": st.string(entry, 0), "aliases": None}
-                if st.follows(entry, 8, owned=True):
-                    n = entry.s32(12)
-                    st.alloc(3)
-                    aliases = st.load(84 * n)
-                    alias_list["aliases"] = [read_alias(st, a) for a in aliases.items(84, n)]
-                lists.append(alias_list)
-        alias_index = None
-        if st.follows(h, 12, owned=True):
-            st.alloc(3)
-            alias_index = st.load(4 * count).bytes()
-        radverbs = None
-        if st.follows(h, 0x1C, owned=True):
-            st.alloc(3)
-            radverbs = st.load(96 * h.u32(0x18)).bytes()
-        snapshots = None
-        if st.follows(h, 0x24, owned=True):
-            st.alloc(3)
-            snapshots = st.load(348 * h.u32(0x20)).bytes()
-        st.pop()
-        return {
-            "name": name,
-            "alias_count": count,
-            "alias_lists": lists,
-            "alias_index": alias_index,
-            "pack_hash": h.u32(0x10),
-            "pack_location": h.u32(0x14),
-            "radverbs": radverbs,
-            "snapshots": snapshots,
-        }
+        for entry, alias_list in (
+            items(io, h, 8, 3, 20, count, node, "alias_lists", owned=True) or ()
+        ):
+            io.string(entry, 0, alias_list, "name")
+            n = entry.s32(12)
+            for a, alias in items(io, entry, 8, 3, 84, n, alias_list, "aliases", owned=True) or ():
+                alias_body(io, a, alias)
+        array(io, h, 12, 3, 4 * count, node, "alias_index", owned=True)
+        array(io, h, 0x1C, 3, 96 * h.u32(0x18), node, "radverbs", owned=True)
+        array(io, h, 0x24, 3, 348 * h.u32(0x20), node, "snapshots", owned=True)
+        io.pop()
 
 
 @register
@@ -124,21 +94,13 @@ class SoundPatchHandler(Handler):
     asset_type = AssetType.SOUND_PATCH
     header_size = 20
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        name = st.string(h, 0)
-        elements = None
-        if st.follows(h, 8, owned=True):
-            st.alloc(3)
-            elements = st.load(4 * h.u32(4)).bytes()
-        files = None
-        if st.follows(h, 16):
-            n = h.u32(12)
-            st.alloc(3)
-            table = st.load(8 * n)
-            files = [read_sound_file(st, f) for f in table.items(8, n)]
-        st.pop()
-        return {"name": name, "elements": elements, "files": files}
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        array(io, h, 8, 3, 4 * h.u32(4), node, "elements", owned=True)
+        for f, element in items(io, h, 16, 3, 8, h.u32(12), node, "files") or ():
+            sound_file_body(io, f, element)
+        io.pop()
 
 
 #: SndDriverGlobals arrays: (name, count offset, pointer offset, element size), in load order.
@@ -157,13 +119,9 @@ class SndDriverGlobalsHandler(Handler):
     asset_type = AssetType.SNDDRIVERGLOBALS
     header_size = 52
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        out: dict = {"name": st.string(h, 0)}
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
         for key, count_at, ptr_at, size in DRIVER_ARRAYS:
-            out[key] = None
-            if st.follows(h, ptr_at, owned=True):
-                st.alloc(3)
-                out[key] = st.load(size * h.u32(count_at)).bytes()
-        st.pop()
-        return out
+            array(io, h, ptr_at, 3, size * h.u32(count_at), node, key, owned=True)
+        io.pop()

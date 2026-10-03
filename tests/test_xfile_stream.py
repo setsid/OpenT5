@@ -14,7 +14,7 @@ from opent5.xfile.constants import (
     encode_offset_pointer,
 )
 from opent5.xfile.events import NONE, EventKind, PtrKind
-from opent5.xfile.stream import Chunk, DeferredData, RuntimeData, XFileError, XStream
+from opent5.xfile.stream import Chunk, DeferredData, RuntimeData, XFileError, XStream, XWriter
 
 
 def u32s(*values):
@@ -252,3 +252,81 @@ class TestEventLog:
         part = c.sub(6, 4)
         assert part.at == 16 and part.u32(0) == 0xDEADBEEF
         assert [x.bytes() for x in chunk_of(b"aabbcc").items(2, 3)] == [b"aa", b"bb", b"cc"]
+
+
+def sample_body(io, node):
+    """A miniature handler: header, inline string, owned array, RUNTIME, deferred."""
+    io.push(Block.VIRTUAL)
+    head = io.load(16, node, "header")
+    io.string(head, 0, node, "name")
+    if io.follows(head, 4, owned=True):
+        io.alloc(15)
+        io.load(head.u32(8), node, "array")
+    io.push(Block.RUNTIME)
+    io.alloc(31)
+    io.reserve(64)
+    io.pop()
+    io.push(Block.PHYSICAL_RUNTIME)
+    if io.follows(head, 12, owned=True):
+        io.alloc(127)
+        io.reserve(4, node, "pixels")
+    io.pop()
+    io.pop()
+    io.flush_deferred()
+
+
+SAMPLE = u32s(PTR_INLINE, PTR_INLINE, 5, PTR_INLINE) + b"abc\0" + b"12345" + b"PIX!"
+
+
+class TestWriter:
+    def test_reading_then_writing_gives_the_same_bytes_and_events(self):
+        reader = XStream(SAMPLE)
+        node = {}
+        sample_body(reader, node)
+        assert reader.fp == len(SAMPLE)
+        assert node["name"] == "abc" and node["array"] == b"12345"
+        writer = XWriter()
+        sample_body(writer, node)
+        assert writer.getvalue() == SAMPLE
+        assert writer.cursors() == reader.cursors()
+        assert (writer.log.table() == reader.log.table()).all()
+
+    def test_an_edited_node_moves_what_follows(self):
+        node = {}
+        sample_body(XStream(SAMPLE), node)
+        node["name"] = "abcdef"
+        writer = XWriter()
+        sample_body(writer, node)
+        out = writer.getvalue()
+        assert out == SAMPLE[:16] + b"abcdef\0" + b"12345" + b"PIX!"
+        assert writer.pos[Block.VIRTUAL] == 32 + 5
+
+    def test_sizes_come_from_the_bytes_already_written(self):
+        node = {}
+        sample_body(XStream(SAMPLE), node)
+        node["array"] = b"1234"
+        with pytest.raises(XFileError, match="expected 5 bytes.*found 4"):
+            sample_body(XWriter(), node)
+
+    def test_missing_inline_data_is_named(self):
+        node = {}
+        sample_body(XStream(SAMPLE), node)
+        node["name"] = None
+        with pytest.raises(XFileError, match="name"):
+            sample_body(XWriter(), node)
+
+    def test_pointer_override_patches_the_output_and_steers_the_walk(self):
+        node = {}
+        sample_body(XStream(SAMPLE), node)
+        # Pointer ordinals: 0 name, 1 array, 2 pixels. Null the array pointer.
+        writer = XWriter(pointer_values={1: 0})
+        sample_body(writer, node)
+        out = writer.getvalue()
+        assert out[4:8] == u32s(0)
+        assert out == SAMPLE[:4] + u32s(0) + SAMPLE[8:20] + b"PIX!"
+
+    def test_runtime_reserves_memory_but_writes_nothing(self):
+        writer = XWriter()
+        writer.push(Block.RUNTIME)
+        writer.reserve(100)
+        assert writer.getvalue() == b"" and writer.pos[Block.RUNTIME] == 100

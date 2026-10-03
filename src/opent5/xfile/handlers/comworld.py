@@ -9,7 +9,7 @@ Loaders: Ptr 0x2457a0, struct 0x2452d0.
 from __future__ import annotations
 
 from opent5.xfile.constants import AssetType, Block
-from opent5.xfile.handlers.base import Handler, register
+from opent5.xfile.handlers.base import Handler, array, items, register
 from opent5.xfile.stream import Chunk, XStream
 
 PRIMARY_LIGHT_SIZE = 0xDC
@@ -20,41 +20,17 @@ class ComWorldHandler(Handler):
     asset_type = AssetType.COM_MAP
     header_size = 0x40
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        name = st.string(h, 0)
-        count = h.u32(8)
-        lights = None
-        if st.follows(h, 0xC, owned=True):
-            st.alloc(3)
-            table = st.load(PRIMARY_LIGHT_SIZE * count)
-            lights = [
-                {"def_name": st.string(light, 0xD8), "raw": light.bytes()}
-                for light in table.items(PRIMARY_LIGHT_SIZE, count)
-            ]
-        water = None
-        if st.follows(h, 0x24, owned=True):
-            st.alloc(3)
-            water = st.load(8 * h.u32(0x20)).bytes()
-        burnable = None
-        if st.follows(h, 0x3C, owned=True):
-            st.alloc(3)
-            n = h.u32(0x38)
-            cells = st.load(12 * n)
-            burnable = []
-            for cell in cells.items(12, n):
-                data = None
-                if st.follows(cell, 8, owned=True):
-                    st.alloc(0)
-                    data = st.load(32).bytes()
-                burnable.append({"raw": cell.bytes(), "data": data})
-        st.pop()
-        return {
-            "name": name,
-            "is_in_use": h.u32(4),
-            "primary_light_count": count,
-            "primary_lights": lights,
-            "water_cells": water,
-            "burnable_cells": burnable,
-            "header": h.bytes(),
-        }
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        lights = items(
+            io, h, 0xC, 3, PRIMARY_LIGHT_SIZE, h.u32(8), node, "primary_lights", owned=True
+        )
+        for light, element in lights or ():
+            io.string(light, 0xD8, element, "def_name")
+        array(io, h, 0x24, 3, 8 * h.u32(0x20), node, "water_cells", owned=True)
+        for cell, element in (
+            items(io, h, 0x3C, 3, 12, h.u32(0x38), node, "burnable_cells", owned=True) or ()
+        ):
+            array(io, cell, 8, 0, 32, element, "data", owned=True)
+        io.pop()

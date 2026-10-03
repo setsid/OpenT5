@@ -5,52 +5,57 @@ Load order: name, names [nz] (align 2, 2 x boneCount[11]), notify [nz] (align
 randomDataShort, randomDataByte, randomDataInt (all [nz]), indices [nz]
 (byte indices when numframes <= 255). Loaders: Ptr 0x244db8, struct 0x244728,
 delta part 0x23bfb0, translation frames 0x235dd0, quaternion frames 0x23a588.
+
+Node: "header", "name", one key per array (bytes), "delta_part" (a node: "raw",
+"trans" and "quat" sub-nodes holding "head", "frame0" or "frames_head",
+"indices", "frames").
 """
 
 from __future__ import annotations
 
 from opent5.xfile.constants import AssetType, Block
-from opent5.xfile.handlers.base import Handler, register
+from opent5.xfile.handlers.base import Handler, array, register
 from opent5.xfile.stream import Chunk, XStream
 
 
-def read_delta_part(st: XStream, numframes: int) -> dict:
-    dp = st.load(8)
+def _part(io: XStream, parent: Chunk, off: int, node: dict, key: str) -> dict | None:
+    """An [nz] pointer to a sub-node; returns the node to fill, or None."""
+    if io.follows(parent, off, owned=True):
+        io.alloc(3)
+        if io.reading:
+            node[key] = {}
+        return node[key]
+    if io.reading:
+        node[key] = None
+    return None
+
+
+def delta_part_body(io: XStream, numframes: int, node: dict) -> None:
+    dp = io.load(8, node, "raw")
     index_size = 1 if numframes <= 255 else 2
-    trans = None
-    if st.follows(dp, 0, owned=True):
-        st.alloc(3)
-        head = st.load(4)
+    trans = _part(io, dp, 0, node, "trans")
+    if trans is not None:
+        head = io.load(4, trans, "head")
         size, small = head.u16(0), head.u8(2)
-        trans = {"size": size, "small_trans": small}
         if size == 0:
-            trans["frame0"] = st.load(12).bytes()
+            io.load(12, trans, "frame0")
         else:
-            frames = st.load(28)
-            trans["mins_size"] = frames.data[0:24].tobytes()
-            trans["indices"] = st.load((size + 1) * index_size).bytes()
-            if st.follows(frames, 24, owned=True):
-                if small:
-                    st.alloc(0)
-                    trans["frames"] = st.load(3 * (size + 1)).bytes()
-                else:
-                    st.alloc(3)
-                    trans["frames"] = st.load(6 * (size + 1)).bytes()
-    quat = None
-    if st.follows(dp, 4, owned=True):
-        st.alloc(3)
-        head = st.load(4)
+            frames = io.load(28, trans, "frames_head")
+            io.load((size + 1) * index_size, trans, "indices")
+            if small:
+                array(io, frames, 24, 0, 3 * (size + 1), trans, "frames", owned=True)
+            else:
+                array(io, frames, 24, 3, 6 * (size + 1), trans, "frames", owned=True)
+    quat = _part(io, dp, 4, node, "quat")
+    if quat is not None:
+        head = io.load(4, quat, "head")
         size = head.u16(0)
-        quat = {"size": size}
         if size == 0:
-            quat["frame0"] = st.load(4).bytes()
+            io.load(4, quat, "frame0")
         else:
-            frames = st.load(4)
-            quat["indices"] = st.load((size + 1) * index_size).bytes()
-            if st.follows(frames, 0, owned=True):
-                st.alloc(3)
-                quat["frames"] = st.load(4 * (size + 1)).bytes()
-    return {"trans": trans, "quat": quat}
+            frames = io.load(4, quat, "frames_head")
+            io.load((size + 1) * index_size, quat, "indices")
+            array(io, frames, 0, 3, 4 * (size + 1), quat, "frames", owned=True)
 
 
 def _data_arrays(h: Chunk):
@@ -66,43 +71,23 @@ def _data_arrays(h: Chunk):
     )
 
 
-def read_xanim(st: XStream, h: Chunk) -> dict:
-    st.push(Block.VIRTUAL)
-    out: dict = {"name": st.string(h, 0)}
+def xanim_body(io: XStream, h: Chunk, node: dict) -> None:
+    io.push(Block.VIRTUAL)
+    io.string(h, 0, node, "name")
     numframes = h.u16(14)
-    out["numframes"] = numframes
-    out["bone_count"] = h.data[0x18:0x24].tolist()
-    out["notify_count"] = h.u8(36)
-    out["index_count"] = h.u32(44)
-    out["names"] = None
-    if st.follows(h, 64, owned=True):
-        st.alloc(1)
-        names = st.load(2 * h.u8(35))
-        out["names"] = [names.u16(2 * i) for i in range(h.u8(35))]
-    out["notify"] = None
-    if st.follows(h, 96, owned=True):
-        st.alloc(3)
-        out["notify"] = st.load(8 * h.u8(36)).bytes()
-    out["delta_part"] = None
-    if st.follows(h, 100, owned=True):
-        st.alloc(3)
-        out["delta_part"] = read_delta_part(st, numframes)
+    array(io, h, 64, 1, 2 * h.u8(35), node, "names", owned=True)
+    array(io, h, 96, 3, 8 * h.u8(36), node, "notify", owned=True)
+    delta = _part(io, h, 100, node, "delta_part")
+    if delta is not None:
+        delta_part_body(io, numframes, delta)
     for key, off, count, mask, size in _data_arrays(h):
-        out[key] = None
-        if st.follows(h, off, owned=True):
-            st.alloc(mask)
-            out[key] = st.load(size * count).bytes()
-    out["indices"] = None
-    if st.follows(h, 92, owned=True):
-        if numframes <= 255:
-            st.alloc(0)
-            out["indices"] = st.load(h.u32(44)).bytes()
-        else:
-            st.alloc(1)
-            out["indices"] = st.load(2 * h.u32(44)).bytes()
-    out["header"] = h.bytes()
-    st.pop()
-    return out
+        array(io, h, off, mask, size * count, node, key, owned=True)
+    if numframes <= 255:
+        array(io, h, 92, 0, h.u32(44), node, "indices", owned=True)
+    else:
+        array(io, h, 92, 1, 2 * h.u32(44), node, "indices", owned=True)
+    io.note(node, "numframes", numframes)
+    io.pop()
 
 
 @register
@@ -110,5 +95,5 @@ class XAnimHandler(Handler):
     asset_type = AssetType.XANIM
     header_size = 104
 
-    def read(self, st: XStream, header: Chunk) -> dict:
-        return read_xanim(st, header)
+    def body(self, io: XStream, header: Chunk, node: dict) -> None:
+        xanim_body(io, header, node)

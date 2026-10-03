@@ -5,33 +5,22 @@ import struct
 
 import pytest
 
-from opent5.xfile import REGISTRY, AssetError, AssetType, Writer, parse
+from opent5.xfile import REGISTRY, AssetError, AssetType, XWriter, parse, write, write_asset
 from opent5.xfile.constants import PTR_INLINE, encode_offset_pointer
 from opent5.xfile.handlers.localize import LocalizeEntry
 from opent5.xfile.handlers.rawfile import RawFile
-from opent5.xfile.handlers.stringtable import StringTable, StringTableCell, string_hash
+from opent5.xfile.handlers.stringtable import StringTable, string_hash
 
 
 def u32s(*values):
     return b"".join(struct.pack(">I", v & 0xFFFFFFFF) for v in values)
 
 
-RAWFILE = RawFile("a.txt", PTR_INLINE, 3, PTR_INLINE, b"abc\0")
+RAWFILE = RawFile.build("a.txt", b"abc")
 # The name points at "a.txt", which the rawfile put at VIRTUAL + 40.
-LOCALIZE = LocalizeEntry("Hi", PTR_INLINE, "a.txt", encode_offset_pointer(4, 40))
-TABLE = StringTable(
-    name="t.csv",
-    name_ptr=PTR_INLINE,
-    column_count=2,
-    row_count=1,
-    values_ptr=PTR_INLINE,
-    cell_index_ptr=PTR_INLINE,
-    cells=[
-        StringTableCell("x", PTR_INLINE, string_hash("x")),
-        StringTableCell("y", PTR_INLINE, string_hash("y")),
-    ],
-    cell_index=[0, 1],
-)
+LOCALIZE = LocalizeEntry.build("Hi", "a.txt")
+LOCALIZE["header"] = u32s(PTR_INLINE, encode_offset_pointer(4, 40))
+TABLE = StringTable.build("t.csv", [["x", "y"]])
 ASSETS = (
     (AssetType.RAWFILE, RAWFILE),
     (AssetType.LOCALIZE, LOCALIZE),
@@ -50,7 +39,7 @@ TEMP_SIZE = 20 + 16
 def asset_bytes():
     out = []
     for asset_type, data in ASSETS:
-        writer = Writer()
+        writer = XWriter()
         REGISTRY[asset_type].write(data, writer)
         out.append(writer.getvalue())
     return out
@@ -88,18 +77,49 @@ class TestSyntheticZone:
     def test_structured_data(self):
         xfile = parse(build_zone())
         raw, loc, table = (a.data for a in xfile.assets)
-        assert raw == RAWFILE
+        assert isinstance(raw, RawFile) and raw.length == 3
         assert raw.contents() == b"abc"
         assert loc.value == "Hi" and loc.name == "a.txt"
         assert table.cell(0, 1) == "y"
-        assert table.cells[0].hash == string_hash("x")
+        assert table.hashes()[0] == string_hash("x")
+        assert sorted(table.index()) == [0, 1]
 
-    def test_round_trip(self):
+    def test_round_trip_per_asset(self):
         data = build_zone()
         for asset in parse(data).assets:
-            writer = Writer()
-            REGISTRY[asset.type].write(asset.data, writer)
-            assert writer.getvalue() == data[asset.file_start : asset.file_end]
+            assert write_asset(asset) == data[asset.file_start : asset.file_end]
+
+    def test_round_trip_whole_zone(self):
+        data = build_zone()
+        xfile = parse(data)
+        written = write(xfile)
+        assert written.content == data
+        assert written.header == xfile.header
+        assert (written.log.table() == xfile.log.table()).all()
+
+    def test_an_edit_resizes_the_zone_and_its_header(self):
+        xfile = parse(build_zone())
+        raw = xfile.assets[0].data
+        raw["buffer"] = b"abcdefgh\0"
+        raw["header"] = raw["header"][:4] + struct.pack(">i", 8) + raw["header"][8:]
+        written = write(xfile)
+        assert len(written.content) == len(build_zone()) + 5
+        assert written.header.size == len(written.content) - 36
+        # The buffer still starts 16-aligned; everything after it moved in VIRTUAL.
+        reparsed = parse(written.content)
+        assert reparsed.problems() == []
+        assert reparsed.assets[0].data.contents() == b"abcdefgh"
+
+    def test_pointer_override_by_ordinal(self):
+        data = build_zone()
+        xfile = parse(data)
+        pointers = xfile.log.of_kind(7)
+        # Ordinal of the localize name pointer: the field at its header + 4.
+        loc = xfile.assets[1]
+        ordinal = next(i for i, p in enumerate(pointers) if p[1] == loc.file_start + 4)
+        written = write(xfile, pointer_values={ordinal: encode_offset_pointer(4, 8)})
+        assert written.content[loc.file_start + 4 : loc.file_start + 8] == u32s(0x80000009)
+        assert parse(written.content).assets[1].data.name == "hello"
 
     def test_wrong_block_size_is_a_problem(self):
         problems = parse(build_zone(virtual=VIRTUAL_SIZE + 4)).problems()
@@ -136,10 +156,14 @@ class TestRegistry:
         no_loader = {21, 27, 28, 32, 33, 34, 35, 36, 37}
         assert set(REGISTRY) == set(range(46)) - no_loader
 
-    def test_only_tier_one_types_write(self):
-        writable = {t for t, h in REGISTRY.items() if h.writable}
-        assert writable == {AssetType.RAWFILE, AssetType.STRINGTABLE, AssetType.LOCALIZE}
+    def test_writing_a_node_without_its_data_names_the_key(self):
+        node = RawFile.build("a.txt", b"abc")
+        del node["buffer"]
+        with pytest.raises(Exception, match="buffer"):
+            REGISTRY[AssetType.RAWFILE].write(node, XWriter())
 
-    def test_read_only_handlers_say_so(self):
-        with pytest.raises(NotImplementedError, match="material.*read-only"):
-            REGISTRY[AssetType.MATERIAL].write({}, Writer())
+    def test_writing_a_short_array_names_the_sizes(self):
+        node = RawFile.build("a.txt", b"abc")
+        node["buffer"] = b"ab"
+        with pytest.raises(Exception, match="expected 4 bytes.*found 2"):
+            REGISTRY[AssetType.RAWFILE].write(node, XWriter())

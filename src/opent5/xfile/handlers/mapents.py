@@ -17,13 +17,8 @@ class MapEntsHandler(Handler):
     asset_type = AssetType.MAP_ENTS
     header_size = 0xC
 
-    def read(self, st: XStream, h: Chunk) -> dict:
-        st.push(Block.VIRTUAL)
-        name = st.string(h, 0)
-        text = array(st, h, 4, 0, h.u32(8))
-        st.pop()
-        return {
-            "name": name,
-            "num_entity_chars": h.u32(8),
-            "entity_string": None if text is None else text.bytes(),
-        }
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        array(io, h, 4, 0, h.u32(8), node, "entity_string")
+        io.pop()
