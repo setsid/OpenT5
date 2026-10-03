@@ -13,7 +13,9 @@ from opent5.export.jsonable import Jsonifier, NameTable, safe_name
 from opent5.export.obj import ObjGroup, ObjMesh, mtl_text, obj_text, read_obj
 from opent5.export.preview import render
 from opent5.export.zone import axes_to_angles, orthonormal, r_hash
-from opent5.xfile.structs import XStreamNTUV, XVertexPacked, cbrush_t
+from opent5.xfile.structs import XStreamNTUV, XSurface, XVertexPacked, cbrush_t
+
+POS_SHIFT = XSurface.field("posScaleExp").offset
 
 # -- CMP normals, halves, packed positions -------------------------------------------------
 
@@ -29,8 +31,8 @@ def test_cmp_axes():
 
 def test_packed_positions():
     surf = bytearray(0x5C)
-    struct.pack_into(">3f", surf, vx.XSURF_POS_OFFSET, 1.0, 2.0, 32.0)
-    surf[vx.XSURF_POS_SHIFT : vx.XSURF_POS_SHIFT + 3] = bytes([6, 6, 9])
+    struct.pack_into(">3f", surf, XSurface.field("posOffset").offset, 1.0, 2.0, 32.0)
+    surf[POS_SHIFT : POS_SHIFT + 3] = bytes([6, 6, 9])
     q = np.array([[16384, -16384, 32767], [0, 0, 0]])
     p = vx.packed_positions(q, bytes(surf))
     assert np.allclose(p[0], [1 + 32, 2 - 32, 32 + 512 * 32767 / 32768], atol=1e-3)
@@ -40,7 +42,7 @@ def test_packed_positions():
 def test_xsurface_mesh_format5():
     # Typed arrays in the parser's own formats for flags 5 (XVertexPacked, XStreamNTUV).
     surf = bytearray(0x5C)
-    surf[vx.XSURF_POS_SHIFT : vx.XSURF_POS_SHIFT + 3] = bytes([6, 6, 6])
+    surf[POS_SHIFT : POS_SHIFT + 3] = bytes([6, 6, 6])
     verts0 = np.frombuffer(
         np.array([[0, 0, 0, 32767], [512, 0, 0, 32767], [0, 512, 0, 32767]], ">i2").tobytes(),
         XVertexPacked.dtype(),
