@@ -14,7 +14,7 @@ pointer, "bits" = the 8-byte GfxStateBits when inline).
 
 from __future__ import annotations
 
-from opent5.xfile.constants import PTR_INLINE, PTR_INSERT, AssetType, Block
+from opent5.xfile.constants import OFFSET_BLOCK_SHIFT, PTR_INLINE, PTR_INSERT, AssetType, Block
 from opent5.xfile.handlers.base import Handler, array, asset_ref, items, register
 from opent5.xfile.stream import Chunk, XStream
 
@@ -60,6 +60,13 @@ def material_body(io: XStream, h: Chunk, node: dict) -> None:
                 io.insert()
             io.load(8, element, "bits")
         io.pop()
+        if io.reading:
+            # Later materials alias this element: it points at the state bits loaded here.
+            field_key = (e.block << OFFSET_BLOCK_SHIFT) | e.mem
+            if raw in (PTR_INLINE, PTR_INSERT):
+                io.refs.slot(field_key, element, io.asset_index)
+            elif raw:
+                io.refs.chain[field_key] = (raw - 1) & 0xFFFFFFFF
     io.pop()
 
 

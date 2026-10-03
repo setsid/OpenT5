@@ -137,6 +137,7 @@ def test_model_meshes_resolve(nuked, tmp_path):
     assert pos.max(0) == pytest.approx([225.57, 61.35, 132.6], abs=2)
 
 
+@pytest.mark.slow
 def test_export_without_images(nuked, tmp_path):
     manifest = ZoneExporter(
         nuked["content"],

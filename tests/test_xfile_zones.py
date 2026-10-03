@@ -39,7 +39,14 @@ def candidates(name: str) -> list[Path]:
     return [p for p in out if p.is_file()]
 
 
-@pytest.fixture(scope="module", params=ZONES)
+#: Zones whose oracle checks run in the fast suite; the rest are marked slow.
+FAST_ZONES = ("patch", "patch_mp")
+
+
+@pytest.fixture(
+    scope="module",
+    params=[z if z in FAST_ZONES else pytest.param(z, marks=pytest.mark.slow) for z in ZONES],
+)
 def sample(request):
     """(name, content, parsed) for a sample zone whose length matches the fixture.
     Module scope with a parameter: pytest runs every test on one zone before

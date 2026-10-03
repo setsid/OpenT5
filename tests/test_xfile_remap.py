@@ -145,7 +145,12 @@ def open_zone(name: str):
     ("fixture", "length", "sha1"),
     [
         ("remap_code_post_gfx_mp.json", 15, "43ac232529ae3f337e73a16987c163f1faa1e88d"),
-        ("remap_code_post_gfx_mp_b2.json", 140, "7e00990c394ee225716b90ef41419245d1332155"),
+        pytest.param(
+            "remap_code_post_gfx_mp_b2.json",
+            140,
+            "7e00990c394ee225716b90ef41419245d1332155",
+            marks=pytest.mark.slow,
+        ),
     ],
 )
 def test_reproduces_the_oracle_test_zones(fixture, length, sha1):
@@ -193,13 +198,14 @@ def resized(content: bytes, at: int, length: int, delta: int) -> Edit:
     return Edit(at, length, old + b"#" * delta)
 
 
+_SLOW = pytest.mark.slow
 CASES = [
-    ("code_post_gfx_mp", AssetType.LOCALIZE, False),
-    ("code_post_gfx_mp", AssetType.RAWFILE, False),
-    ("code_post_gfx_mp", AssetType.STRINGTABLE, True),
+    pytest.param("code_post_gfx_mp", AssetType.LOCALIZE, False, marks=_SLOW),
+    pytest.param("code_post_gfx_mp", AssetType.RAWFILE, False, marks=_SLOW),
+    pytest.param("code_post_gfx_mp", AssetType.STRINGTABLE, True, marks=_SLOW),
     ("patch_mp", AssetType.LOCALIZE, False),
-    ("patch_mp", AssetType.RAWFILE, False),
-    ("patch_mp", AssetType.STRINGTABLE, True),
+    pytest.param("patch_mp", AssetType.RAWFILE, False, marks=_SLOW),
+    pytest.param("patch_mp", AssetType.STRINGTABLE, True, marks=_SLOW),
 ]
 
 
@@ -219,7 +225,9 @@ def test_random_string_resizes_reparse_exactly(zone_name, asset_type, cells):
 
 
 @pytest.mark.zones
-@pytest.mark.parametrize("zone_name", ["code_post_gfx_mp", "patch_mp"])
+@pytest.mark.parametrize(
+    "zone_name", [pytest.param("code_post_gfx_mp", marks=pytest.mark.slow), "patch_mp"]
+)
 def test_several_edits_at_once(zone_name):
     _, content, x = open_zone(zone_name)
     rng = random.Random(zone_name)

@@ -27,6 +27,7 @@ from opent5.xfile.constants import (
     decode_offset_pointer,
     type_name,
 )
+from opent5.xfile.events import NONE
 from opent5.xfile.stream import AssetLink, Chunk, XStream
 
 
@@ -72,15 +73,16 @@ class Handler:
             slot = io.insert() if raw == PTR_INSERT else None
             header = io.load(self.header_size, node, "header")
             self.body(io, header, node)
-            if slot is not None:
-                io.slots[(Block.VIRTUAL << OFFSET_BLOCK_SHIFT) | slot] = node
+            if slot is not None and io.reading:
+                io.refs.slot((Block.VIRTUAL << OFFSET_BLOCK_SHIFT) | slot, node, io.asset_index)
             io.trail.pop()
             result = node
         elif raw != PTR_NULL:
             if io.reading:
                 block, offset = decode_offset_pointer(raw)
-                target = io.slots.get((raw - 1) & 0xFFFFFFFF)
-                result = AssetLink(self.asset_type, raw, block, offset, target)
+                found = io.refs.asset_at((raw - 1) & 0xFFFFFFFF)
+                target, owner = found if found is not None else (None, -1)
+                result = AssetLink(self.asset_type, raw, block, offset, target, owner)
             else:
                 result = node
         io.pop()
@@ -127,6 +129,13 @@ def asset_ref(io: XStream, chunk: Chunk, off: int, asset_type: int, node: Any, k
     result = load_asset(io, asset_type, raw, child)
     if io.reading:
         node[key] = result
+        if chunk.block not in (Block.TEMP, NONE):
+            # Later alias pointers may name this field: it holds the asset's address.
+            field_key = (chunk.block << OFFSET_BLOCK_SHIFT) | (chunk.mem + off)
+            if isinstance(result, AssetLink):
+                io.refs.chain[field_key] = (raw - 1) & 0xFFFFFFFF
+            elif result is not None:
+                io.refs.slot(field_key, result, io.asset_index)
     return result
 
 

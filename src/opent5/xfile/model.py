@@ -30,12 +30,14 @@ from opent5.xfile.constants import (
     ASSET_LIST_SIZE,
     BLOCK_COUNT,
     HEADER_SIZE,
+    OFFSET_BLOCK_SHIFT,
     PTR_NULL,
     Block,
     type_name,
 )
 from opent5.xfile.events import NONE, EventKind, EventLog
 from opent5.xfile.handlers.base import REGISTRY
+from opent5.xfile.refs import Refs, Target
 from opent5.xfile.stream import Chunk, DeferredData, XFileError, XStream, XWriter
 
 #: blockSize[0] (TEMP) is the TEMP high-water mark plus 16 in every zone walked
@@ -138,6 +140,21 @@ class XFile:
     asset_list: bytes = b""
     script_string_ptrs: bytes | None = field(repr=False, default=None)
     asset_entries: bytes | None = field(repr=False, default=None)
+    #: Pointer resolution records (opent5.xfile.refs).
+    refs: Refs | None = field(repr=False, default=None)
+
+    def resolve(self, value: int) -> Target | None:
+        """What a raw pointer value names: the asset behind an alias, or the node,
+        key, element and byte offset of the data an offset pointer points at."""
+        if self.refs is None:
+            raise XFileError("this XFile was not parsed with reference records")
+        return self.refs.resolve(value)
+
+    def view(self, node: dict):
+        """A field view of `node` that can also resolve its pointer fields."""
+        from opent5.xfile.schema import NodeView
+
+        return NodeView(node, xfile=self)
 
     def problems(self) -> list[str]:
         """Every way the walk disagrees with the header; empty when the parse is exact."""
@@ -208,6 +225,7 @@ def parse(content: bytes | bytearray | memoryview, log: bool = True) -> XFile:
         asset_list=list_bytes,
         script_string_ptrs=parts.get("script_string_ptrs"),
         asset_entries=parts.get("asset_entries"),
+        refs=st.refs,
     )
 
 
@@ -343,6 +361,9 @@ def _entry(io: XStream, entries: Chunk, index: int, data: Any) -> Asset:
         # Load_XAsset passes the header pointer already read with the array.
         raw = io.ref(entries, 8 * index + 4)
         data = handler.load_ptr(io, raw, data)
+        if io.reading and isinstance(data, dict):
+            field_key = (entries.block << OFFSET_BLOCK_SHIFT) | (entries.mem + 8 * index + 4)
+            io.refs.slot(field_key, data, index)
     except AssetError:
         raise
     except (XFileError, IndexError, ValueError, struct.error) as exc:

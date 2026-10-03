@@ -342,6 +342,7 @@ class TestTheRetailZones:
         assert sorted({c.stream for c in fastfile.chunks}) == list(range(STREAM_COUNT))
         assert len(fastfile.content) > 13_000_000
 
+    @pytest.mark.slow
     @pytest.mark.skipif(not BIGGEST.is_file(), reason="patch_ui_mp.ff is not here")
     def test_the_largest_zone_survives_a_repack(self):
         fastfile = read_fastfile(BIGGEST.read_bytes())

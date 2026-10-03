@@ -356,10 +356,11 @@ class NodeView:
     """A node with its schema: ``fields`` (its main struct), ``struct(key)``,
     ``array(key)``, child views, and ``to_dict``."""
 
-    def __init__(self, node: dict, kinds: dict | None = None):
+    def __init__(self, node: dict, kinds: dict | None = None, xfile: Any = None):
         from opent5.xfile.structs import KINDS  # late: structs imports this module
 
         self.node = node
+        self.xfile = xfile
         self.kinds = kinds if kinds is not None else KINDS
         self.kind = node.get("_t") if isinstance(node, dict) else None
         self.schema: dict = self.kinds.get(self.kind, {}) if self.kind else {}
@@ -406,17 +407,37 @@ class NodeView:
     def child(self, key: Any) -> Any:
         value = self.node[key]
         if isinstance(value, dict):
-            return NodeView(value, self.kinds)
+            return NodeView(value, self.kinds, self.xfile)
         if isinstance(value, list):
-            return [NodeView(v, self.kinds) if isinstance(v, dict) else v for v in value]
+            return [
+                NodeView(v, self.kinds, self.xfile) if isinstance(v, dict) else v for v in value
+            ]
         return value
+
+    def target(self, name: str, key: Any = None, index: int | None = None) -> Any:
+        """Resolve pointer field `name` of the node's own struct (or of the struct at
+        `key`, element `index`): a Target for an offset or alias pointer, a list of
+        them for a pointer array, None for null and inline (-1 / -2) pointers, whose
+        data sits in this node's own keys. Needs a view made by ``xfile.view``."""
+        if self.xfile is None:
+            raise FieldError("target() needs a view made with xfile.view(node)")
+        view = self.fields if key is None else self.struct(key, index)
+        if view is None:
+            raise FieldError(f"{self.kind} has no struct to read {name!r} from")
+        f = view.struct.field(name)
+        if f.role != "ptr":
+            raise FieldError(f"{view.struct.name}.{name} is not a pointer field")
+        value = view[name]
+        if isinstance(value, list):
+            return [self.xfile.resolve(v) for v in value]
+        return self.xfile.resolve(value)
 
     def to_dict(self, max_items: int | None = None) -> Any:
         return to_dict(self.node, self.kinds, max_items)
 
 
-def view(node: dict) -> NodeView:
-    return NodeView(node)
+def view(node: dict, xfile: Any = None) -> NodeView:
+    return NodeView(node, xfile=xfile)
 
 
 def to_dict(node: Any, kinds: dict | None = None, max_items: int | None = None) -> Any:

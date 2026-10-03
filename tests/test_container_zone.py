@@ -168,7 +168,9 @@ def edit(rng, content, boundaries):
 
 
 class TestEditedZonesReadBackAsEdited:
-    @pytest.mark.parametrize("seed", range(8))
+    @pytest.mark.parametrize(
+        "seed", [0, *(pytest.param(s, marks=pytest.mark.slow) for s in range(1, 8))]
+    )
     def test_random_edits(self, small, seed):
         original, data = small
         rng = random.Random(1000 + seed)

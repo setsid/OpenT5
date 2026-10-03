@@ -55,6 +55,7 @@ from opent5.xfile.constants import (
     Block,
 )
 from opent5.xfile.events import NONE, EventKind, EventLog, PtrKind
+from opent5.xfile.refs import Refs
 
 _U16 = struct.Struct(">H").unpack_from
 _S16 = struct.Struct(">h").unpack_from
@@ -167,8 +168,11 @@ class AssetLink:
     raw: int
     block: int
     offset: int
-    #: The asset loaded inline (-2) that filled the slot, when known.
+    #: The asset the alias names (resolved through alias slots, the pointer fields
+    #: that loaded assets inline, and chains of alias fields), when known.
     target: Any = field(default=None, repr=False)
+    #: Index of the top-level asset whose load put the target there (-1: unknown).
+    asset_index: int = -1
 
     @property
     def name(self) -> str | None:
@@ -200,8 +204,8 @@ class XStream:
         self._pending = -1
         #: Strings by memory key ((block << 29) | offset), to resolve offset pointers.
         self.strings: dict[int, str] = {}
-        #: Alias slots by memory key, to resolve asset references.
-        self.slots: dict[int, Any] = {}
+        #: Allocations, alias slots and alias chains, to resolve pointers (refs.py).
+        self.refs = Refs()
         #: Index of the asset being loaded (-1 before the first).
         self.asset_index = -1
         #: Names of the structs being loaded, outermost first, for error messages.
@@ -279,6 +283,7 @@ class XStream:
         chunk = self._read(size)
         if node is not None:
             node[key] = chunk.bytes()
+        self.refs.record(chunk.block, chunk.mem, size, node, key, 0, self.asset_index)
         return chunk
 
     def items(
@@ -296,6 +301,7 @@ class XStream:
                 {"_t": kind, "raw": data[size * i : size * (i + 1)].tobytes()} for i in range(count)
             ]
         node[key] = elements
+        self.refs.record(chunk.block, chunk.mem, size * count, node, key, size, self.asset_index)
         return list(zip(chunk.items(size, count), elements, strict=True))
 
     def note(self, node: Any, key: Any, value: Any) -> None:
@@ -369,8 +375,10 @@ class XStream:
             self._mask = NONE
             if node is not None:
                 node[key] = item
+            self.refs.record(block, mem, size, node, key, 0, self.asset_index)
             return item
         if size:
+            self.refs.record(block, mem, size, None, None, 0, self.asset_index)
             self.pos[block] = mem + size
             if self._ev is not None:
                 self._ev((READ, NONE, size, block, mem, self._mask))
@@ -458,7 +466,9 @@ class XStream:
         if raw == PTR_INLINE:
             self._pointer(chunk, off, raw, PtrKind.INLINE)
             self.alloc(0)
+            block, mem = self.cur, self.pos[self.cur]
             text = self.xstring()
+            self.refs.record(block, mem, len(text) + 1, node, key, 0, self.asset_index)
         elif raw == PTR_NULL:
             self._pointer(chunk, off, raw, PtrKind.NULL)
             text = None
