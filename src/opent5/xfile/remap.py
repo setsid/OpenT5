@@ -43,6 +43,7 @@ import bisect
 import struct
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -56,7 +57,7 @@ from opent5.xfile.constants import (
 )
 from opent5.xfile.events import NONE, EventKind, PtrKind
 from opent5.xfile.model import XFile, parse
-from opent5.xfile.stream import XFileError
+from opent5.xfile.stream import XFileError, XStream, XWriter
 
 READ, STRING, DEFER, TAIL = EventKind.READ, EventKind.STRING, EventKind.DEFER, EventKind.TAIL
 PUSH, POP, ALLOC, POINTER = EventKind.PUSH, EventKind.POP, EventKind.ALLOC, EventKind.POINTER
@@ -449,3 +450,407 @@ def compare(before: XFile, after: XFile, before_targets: list | None = None) -> 
             if len(problems) > 20:
                 break
     return problems
+
+
+# -- Rewriting from edited nodes: counts and element arrays may change -----------------------
+#
+# The splice remap above changes the length of reads the loader already makes. An edit that
+# changes counts (a stringtable row added or removed), turns a shared string into an inline
+# one, or otherwise changes which reads happen, cannot be a byte splice: the type's write side
+# has to emit the asset again. ``Rewrite`` does that for the whole zone and then remaps the
+# offset pointers the same way the splice remap does, with one difference in how it matches
+# old allocations to new ones: by what was loaded rather than by position in the event log.
+#
+# 1. Trace. The zone is parsed with a stream that records, for every event that takes block
+#    memory, the identity of what was loaded: ("L", node, key) for a Load_Stream into
+#    node[key] (an array of structs also records its element nodes, in order), ("S", node,
+#    key) for an inline string, ("P", asset node) for a DB_InsertPointer alias slot, ("R",
+#    asset, n) for the n-th RUNTIME reservation of an asset, and ("pre", event) for the
+#    script strings and the asset array (which no edit changes). Nodes are named by their
+#    Python identity; the trace keeps a reference to each, so an identity is never reused.
+# 2. Edit. The caller changes the parsed nodes in place: bytes, strings, element lists
+#    (removing an element dict, inserting a new one). Anything kept keeps its identity.
+# 3. Write. The edited zone is written by the same handlers, with the same tracing, so every
+#    allocation in the new stream has an identity too, and the header is derived from the
+#    written stream (size, every blockSize; TEMP as high-water mark + 16).
+# 4. Map. Every OFFSET / ALIAS_REF pointer the writer emitted still holds its old value. Its
+#    old target is found in the old layout (the allocation containing it), named by identity,
+#    and looked up in the new layout, keeping the offset inside the allocation; inside an array
+#    of structs the element is followed by identity, so a pointer to element 7 of 9 follows
+#    that element when an earlier one is removed. A pointer whose target was removed raises
+#    ``RemapError`` naming the field. Pointers into TEMP do not occur in any zone walked
+#    (every converted pointer targets VIRTUAL or PHYSICAL) and are refused.
+#
+# For an edit that only resizes reads this gives exactly the splice remap's result
+# (tests/test_xfile_remap.py checks both on the same edits); for an unedited zone it gives
+# the original content.
+
+
+class _Trace:
+    """What a traced parse or write loaded, keyed by event index."""
+
+    def __init__(self) -> None:
+        #: allocation event (READ / STRING / DEFER / INSERT) -> identity
+        self.ident: dict[int, tuple] = {}
+        #: event of a Load_Stream of an array of structs -> element ids, in order
+        self.elements: dict[int, list[int]] = {}
+        #: the same, the element nodes themselves (the list as it was loaded)
+        self.lists: dict[int, list] = {}
+        #: READ / DEFER event -> (node, key) that holds its bytes
+        self.holders: dict[int, tuple[Any, Any]] = {}
+        #: file offset of an offset-pointer string field -> (node, key) holding its text
+        self.string_fields: dict[int, tuple[Any, Any]] = {}
+        #: id(asset node) -> (file start, file end) of everything its pointer loaded
+        self.spans: dict[int, tuple[int, int]] = {}
+        self.keep: list = []
+
+
+class _Tracing:
+    """Mixin over XStream / XWriter: records ``_Trace`` while walking."""
+
+    def _setup_trace(self) -> None:
+        self.trace = _Trace()
+        self._insert_event = -1
+        self._headers: list[tuple[int, Any, int]] = []
+        self._runtime_asset = -2
+        self._runtime_count = 0
+        self._loose = 0
+
+    def _last_alloc(self, n0: int) -> int:
+        words = self.log.words
+        for i in range(len(words) // 6 - 1, n0 - 1, -1):
+            if words[i * 6] in (READ, STRING, DEFER, INSERT):
+                return i
+        return -1
+
+    def _mark(self, n0: int, ident: tuple, holder: tuple | None = None) -> int:
+        i = self._last_alloc(n0)
+        if i < 0 or i in self.trace.ident:
+            return -1
+        self.trace.ident[i] = ident if self.asset_index >= 0 else ("pre", i)
+        if holder is not None:
+            self.trace.holders[i] = holder
+        return i
+
+    def load(self, size: int, node: Any = None, key: Any = None):
+        n0 = len(self.log)
+        chunk = super().load(size, node, key)
+        if node is not None:
+            self._mark(n0, ("L", id(node), key), (node, key))
+            self.trace.keep.append(node)
+            if key == "header" and isinstance(node, dict):
+                if self._insert_event >= 0:
+                    self.trace.ident[self._insert_event] = ("P", id(node))
+                    self._insert_event = -1
+                self._headers.append((len(self.stack), node, chunk.at))
+        else:
+            self._loose += 1
+            self._mark(n0, ("N", self.asset_index, self._loose))
+        return chunk
+
+    def items(self, size: int, count: int, node: Any, key: Any, kind: str | None = None):
+        n0 = len(self.log)
+        pairs = super().items(size, count, node, key, kind)
+        i = self._mark(n0, ("L", id(node), key), (node, key))
+        self.trace.keep.append(node)
+        if i >= 0:
+            elements = node[key]
+            self.trace.elements[i] = [id(e) for e in elements]
+            self.trace.lists[i] = list(elements)
+        return pairs
+
+    def reserve(self, size: int, node: Any = None, key: Any = None):
+        n0 = len(self.log)
+        item = super().reserve(size, node, key)
+        if node is not None:
+            self._mark(n0, ("L", id(node), key), (node, key))
+            self.trace.keep.append(node)
+        else:
+            if self._runtime_asset != self.asset_index:
+                self._runtime_asset, self._runtime_count = self.asset_index, 0
+            self._runtime_count += 1
+            self._mark(n0, ("R", self.asset_index, self._runtime_count))
+        return item
+
+    def string(self, chunk, off: int, node: Any = None, key: Any = None):
+        n0 = len(self.log)
+        text = super().string(chunk, off, node, key)
+        if self._last_alloc(n0) >= 0:
+            self._mark(n0, ("S", id(node), key))
+            self.trace.keep.append(node)
+        elif node is not None and chunk.at != NONE:
+            self.trace.string_fields[chunk.at + off] = (node, key)
+            self.trace.keep.append(node)
+        return text
+
+    def insert(self) -> int:
+        slot = super().insert()
+        self._insert_event = len(self.log) - 1
+        return slot
+
+    def pop(self) -> None:
+        super().pop()
+        while self._headers and len(self.stack) < self._headers[-1][0]:
+            _, node, start = self._headers.pop()
+            self.trace.spans[id(node)] = (start, self.fp)
+
+
+class _TracingStream(_Tracing, XStream):
+    def __init__(self, data: bytes):
+        XStream.__init__(self, data, log=True)
+        self._setup_trace()
+
+
+class _TracingWriter(_Tracing, XWriter):
+    def __init__(self):
+        XWriter.__init__(self, log=True)
+        self._setup_trace()
+
+
+def traced_parse(content: bytes | bytearray | memoryview) -> tuple[XFile, _Trace]:
+    """``parse(content)`` (with its event log), plus the trace ``Rewrite`` needs."""
+    from opent5.xfile.constants import ASSET_LIST_OFFSET, ASSET_LIST_SIZE
+    from opent5.xfile.model import XFileHeader, _walk
+
+    data = bytes(content)
+    header = XFileHeader.parse(data)
+    if len(data) < ASSET_LIST_OFFSET + ASSET_LIST_SIZE:
+        raise XFileError(
+            f"XAssetList at {ASSET_LIST_OFFSET:#x}: expected {ASSET_LIST_SIZE} bytes, "
+            f"stream is {len(data)}"
+        )
+    st = _TracingStream(data)
+    list_bytes = data[ASSET_LIST_OFFSET : ASSET_LIST_OFFSET + ASSET_LIST_SIZE]
+    st.fp = ASSET_LIST_OFFSET + ASSET_LIST_SIZE
+    parts: dict = {}
+    walked = _walk(st, list_bytes, ASSET_LIST_OFFSET, parts, None)
+    xfile = XFile(
+        header=header,
+        script_strings=parts.get("script_strings") or [],
+        assets=walked.assets,
+        script_strings_offset=walked.strings_at,
+        asset_array_offset=walked.array_at,
+        tail_offset=walked.tail,
+        end_offset=st.fp,
+        length=len(data),
+        deferred=st.deferred,
+        final_cursors=st.cursors(),
+        temp_high_water=st.temp_high,
+        log=st.log,
+        asset_list=list_bytes,
+        script_string_ptrs=parts.get("script_string_ptrs"),
+        asset_entries=parts.get("asset_entries"),
+        refs=st.refs,
+    )
+    return xfile, st.trace
+
+
+def traced_write(xfile: XFile):
+    """``write(xfile)`` with the header derived from the stream, plus its trace."""
+    from opent5.xfile.model import TEMP_SLACK, Written, XFileHeader, _walk
+
+    writer = _TracingWriter()
+    writer.raw(xfile.header.pack())
+    list_at = writer.raw(xfile.asset_list)
+    parts = {
+        "script_string_ptrs": xfile.script_string_ptrs,
+        "script_strings": xfile.script_strings,
+        "asset_entries": xfile.asset_entries,
+    }
+    walked = _walk(writer, xfile.asset_list, list_at, parts, xfile)
+    content = writer.out
+    sizes = list(writer.pos)
+    sizes[TEMP] = writer.temp_high + TEMP_SLACK
+    header = XFileHeader(len(content) - HEADER_SIZE, xfile.header.external_size, tuple(sizes))
+    content[0:HEADER_SIZE] = header.pack()
+    written = Written(
+        content=bytes(content),
+        header=header,
+        assets=walked.assets,
+        tail_offset=walked.tail,
+        final_cursors=writer.cursors(),
+        temp_high_water=writer.temp_high,
+        log=writer.log,
+    )
+    return written, writer.trace
+
+
+def describe_identity(ident: tuple | None) -> str:
+    if ident is None:
+        return "an untraced allocation"
+    tag = ident[0]
+    if tag == "S":
+        return f"the string {ident[2]!r} of node {ident[1]:#x}"
+    if tag == "L":
+        return f"the data {ident[2]!r} of node {ident[1]:#x}"
+    if tag == "P":
+        return f"the alias slot of asset node {ident[1]:#x}"
+    if tag == "R":
+        return f"RUNTIME reservation {ident[2]} of asset {ident[1]}"
+    return f"{ident!r}"
+
+
+class Rewrite:
+    """A zone parsed for editing: change ``xfile``'s nodes in place, then ``build``.
+
+        rw = Rewrite(content)
+        table = rw.xfile.assets[52].data
+        del table["cells"][0:2]               # e.g. drop a row of a two-column table
+        ...                                   # header counts, cellIndex
+        result = rw.build(check=True)         # RemapResult; result.content is the new zone
+
+    ``build`` may be called again after further edits; the reference is always the content
+    the Rewrite was made from."""
+
+    def __init__(self, content: bytes | bytearray | memoryview):
+        self.content = bytes(content)
+        self.xfile, self.trace = traced_parse(self.content)
+        self._layout: _Layout | None = None
+        self._by_ident: dict[tuple, int] | None = None
+        self._reads: tuple[list[int], list[int]] | None = None
+
+    # -- the original layout ---------------------------------------------------------------
+
+    def layout(self) -> _Layout:
+        if self._layout is None:
+            self._layout, _, _ = _replay(self.xfile.log.table(), None)
+        return self._layout
+
+    def event_of(self, ident: tuple) -> int | None:
+        """The original allocation event of an identity, e.g. ("S", id(node), "value")."""
+        if self._by_ident is None:
+            self._by_ident = {v: k for k, v in self.trace.ident.items()}
+        return self._by_ident.get(ident)
+
+    def owner(self, event: int) -> int:
+        """Index of the top-level asset whose load logged ``event`` (-1 before the first)."""
+        return _owner([a.event_start for a in self.xfile.assets], event)
+
+    def sharers(self, node: Any, key: Any, string: bool = True) -> list[int]:
+        """POINTER events (OFFSET / ALIAS_REF) of the original zone that point into what was
+        loaded as node[key] (an inline string when ``string``, else a Load_Stream)."""
+        event = self.event_of(("S" if string else "L", id(node), key))
+        if event is None:
+            return []
+        rows = self.xfile.log.table()
+        _, _, size, block, mem, _ = (int(v) for v in rows[event])
+        movable = _movable_pointers(rows)
+        if not movable:
+            return []
+        p = rows[movable]
+        hit = (p[:, 4] == block) & (p[:, 5] >= mem) & (p[:, 5] < mem + max(size, 1))
+        return [movable[i] for i in np.nonzero(hit)[0].tolist()]
+
+    def field_holder(self, file_offset: int) -> tuple[Any, Any, int]:
+        """The node, key and byte offset holding the original file bytes at
+        ``file_offset`` (a struct field): for an array of structs, the element node and
+        "raw". Raises RemapError when no traced read holds it."""
+        if self._reads is None:
+            rows = self.xfile.log.table()
+            reads = np.nonzero((rows[:, 0] == READ) & (rows[:, 1] != NONE) & (rows[:, 2] != 0))[0]
+            self._reads = (rows[reads, 1].tolist(), reads.tolist())
+        starts, events = self._reads
+        k = bisect.bisect_right(starts, file_offset) - 1
+        if k >= 0:
+            event = events[k]
+            rows = self.xfile.log.table()
+            fp, size = int(rows[event, 1]), int(rows[event, 2])
+            holder = self.trace.holders.get(event)
+            if file_offset < fp + size and holder is not None:
+                node, key = holder
+                inner = file_offset - fp
+                elements = self.trace.lists.get(event)
+                if elements:
+                    k2, sub = divmod(inner, size // len(elements))
+                    return elements[k2], "raw", sub
+                return node, key, inner
+        raise RemapError(f"field at {file_offset:#x}: expected a traced read to hold it, none does")
+
+    # -- writing ---------------------------------------------------------------------------
+
+    def build(self, check: bool = False) -> RemapResult:
+        """Write the (edited) nodes and remap every offset pointer; see the section notes."""
+        written, new_trace = traced_write(self.xfile)
+        new_rows = written.log.table()
+        old = self.layout()
+        new, _, _ = _replay(new_rows, None)  # also checks the writer's own positions
+        by_ident: dict[tuple, Allocation] = {}
+        duplicate: set[tuple] = set()
+        for allocs in new.by_block.values():
+            for a in allocs:
+                ident = new_trace.ident.get(a.event)
+                if ident is None:
+                    continue
+                if ident in by_ident:
+                    duplicate.add(ident)
+                by_ident[ident] = a
+        positions: dict[int, dict[int, int]] = {}
+        out = bytearray(written.content)
+        pointers: list[tuple[int, int, int]] = []
+        for j in _movable_pointers(new_rows):
+            _, at, raw, _, block, offset = new_rows[j].tolist()
+            if block == TEMP:
+                raise RemapError(
+                    f"pointer field at {at:#x} (value {raw:#010x}): expected a target outside "
+                    "TEMP, found one in TEMP"
+                )
+            a_old = old.find(block, offset, NONE)
+            ident = self.trace.ident.get(a_old.event)
+            a_new = by_ident.get(ident) if ident is not None else None
+            if a_new is None or ident in duplicate:
+                why = "which the edit removed" if a_new is None else "which was written twice"
+                raise RemapError(
+                    f"pointer field at {at:#x} (value {raw:#010x}) names block {block} "
+                    f"+{offset:#x}, inside {describe_identity(ident)}, {why}"
+                )
+            inner = offset - a_old.old_start
+            old_ids = self.trace.elements.get(a_old.event)
+            if old_ids:
+                esz = a_old.old_size // len(old_ids)
+                k, sub = divmod(inner, esz)
+                new_ids = new_trace.elements.get(a_new.event, [])
+                if k >= len(old_ids):
+                    nk = len(new_ids)
+                else:
+                    where = positions.get(a_new.event)
+                    if where is None:
+                        where = positions[a_new.event] = {e: n for n, e in enumerate(new_ids)}
+                    nk = where.get(old_ids[k])
+                    if nk is None:
+                        raise RemapError(
+                            f"pointer field at {at:#x} (value {raw:#010x}) names element {k} "
+                            f"of {describe_identity(ident)}, which the edit removed"
+                        )
+                inner = nk * esz + sub
+            if inner > a_new.old_size:
+                raise RemapError(
+                    f"pointer field at {at:#x}: target {inner} bytes into "
+                    f"{describe_identity(ident)}, which is now {a_new.old_size} bytes"
+                )
+            value = ((block << OFFSET_BLOCK_SHIFT) | ((a_new.old_start + inner) & OFFSET_MASK)) + 1
+            if value != raw:
+                if at == NONE:
+                    raise RemapError(f"pointer event {j}: field has no file bytes (RUNTIME)")
+                struct.pack_into(">I", out, at, value)
+                pointers.append((at, raw, value))
+        moved: dict[int, list[Allocation]] = {b: [] for b in range(BLOCK_COUNT)}
+        for b, allocs in old.by_block.items():
+            for a in allocs:
+                n = by_ident.get(self.trace.ident.get(a.event, ("?",)))
+                if n is not None:
+                    moved[b].append(
+                        Allocation(b, a.old_start, a.old_size, n.old_start, n.old_size, a.event)
+                    )
+        result = RemapResult(
+            content=bytes(out),
+            pointers=pointers,
+            fields=[],
+            header_before=struct.unpack_from(">9I", self.content, 0),
+            header_after=struct.unpack_from(">9I", out, 0),
+            allocations=moved,
+        )
+        if check:
+            problems = list(parse(result.content, log=False).problems())
+            if problems:
+                raise RemapError("rewrite check failed: " + "; ".join(problems[:5]))
+        return result
