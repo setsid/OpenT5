@@ -70,6 +70,15 @@ leaves, water, cobble). The PC compile and PS3 conversion are building now that
 the tools path is confirmed; test files will be under opent5-hwtest/minecraft/.
 No Mojang assets or names are used; only the blocky style is shared.
 
+### GUI textured viewer and tree thumbnails (commit 593c7d5)
+
+The model and world viewer now draws with the assets' own textures and lighting
+on an offscreen OpenGL path (Nuketown renders with its materials, props placed
+and textured), with a Shaded/Wireframe toggle; the asset tree shows small image
+thumbnails and per-type icons. Looked at the shaded Nuketown and the thumbnails:
+both correct. GUI self-test 109/0. Panels for the patch and search features are
+being wired now.
+
 ## Still inferred / needs a device run
 
 - A: whether the primary-light grid is bright enough (dim vs wrong).
