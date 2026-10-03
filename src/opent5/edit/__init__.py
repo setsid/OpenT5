@@ -9,6 +9,7 @@ report = doc.save("out/mp_nuked.ff")       # verified; report.problems is empty
 from opent5.edit.document import Document, check_target, game_folders
 from opent5.edit.geometry import Mesh
 from opent5.edit.types import (
+    SHARE_MODES,
     SIGNATURE_NOTE,
     AssetKey,
     AssetRef,
@@ -17,9 +18,11 @@ from opent5.edit.types import (
     ImageData,
     SaveReport,
     SearchHit,
+    SharedField,
 )
 
 __all__ = [
+    "SHARE_MODES",
     "SIGNATURE_NOTE",
     "AssetKey",
     "AssetRef",
@@ -30,6 +33,7 @@ __all__ = [
     "Mesh",
     "SaveReport",
     "SearchHit",
+    "SharedField",
     "check_target",
     "game_folders",
 ]

@@ -24,7 +24,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--selftest", metavar="REPORT", help=argparse.SUPPRESS)
     parser.add_argument("--screenshots", metavar="DIR", help=argparse.SUPPRESS)
     parser.add_argument("--only", nargs="*", help=argparse.SUPPRESS)
+    # Update check self-test against a local fake release server (opent5.update.selftest).
+    parser.add_argument("--update-selftest", metavar="REPORT", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.update_selftest:
+        from opent5.update import selftest as update_selftest
+
+        return update_selftest.run(args.update_selftest)
 
     from PySide6.QtWidgets import QApplication
 
@@ -53,6 +59,8 @@ def main(argv: list[str] | None = None) -> int:
         window._apply_theme(args.theme)
     window.resize(1440, 900)
     window.show()
+    if not args.screenshot:
+        window.updates.start()  # background update check (opent5.gui.updates)
     if args.zones:
         window.open_paths(args.zones)
     if args.screenshot:

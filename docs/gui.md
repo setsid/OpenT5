@@ -16,7 +16,13 @@ any file inside the zone folders configured in `.env`.
 
 ## Layout
 
-- **Zone tabs.** Each open zone is a tab, marked with `*` while it has unsaved edits.
+- **Zone tabs.** Each open zone is a tab. While it has unsaved edits its text starts with
+  `* ` and it carries a dot in the accent colour, and the window title reads
+  `* zone - OpenT5`.
+- **Unsaved strip.** Across the top of a zone with edits: "Unsaved changes: N assets
+  edited (M edits). Save As to write a new file.", with **Save As...** and **Discard**.
+  Discard undoes every edit after asking; Redo brings them back while the zone is open. The
+  strip has a 3px accent bar on its left edge and the panel background, in both themes.
 - **Asset tree** (left). The assets are grouped by type, with a count per type. It lists the
   zone's own asset list and also the assets loaded inside other assets (images inside
   materials, models, the clipMap's entity string), marked `inline`. Above the tree is a
@@ -31,28 +37,42 @@ any file inside the zone folders configured in `.env`.
 - **Start page.** It lists recent files and every zone in the configured folders (disc,
   update, dlc). The folders are read on a worker thread.
 
-Opening a zone runs on a worker thread, with its progress in the status bar. On mp_nuked
-(35 MB file, 69 MB inflated) it takes about 3 s, and the window never stops responding for
-more than about 60 ms.
+Opening a zone runs on a worker thread. Its tab appears at once and shows a centred panel
+with the file name, the stage, a bar and the percentage; the status bar shows the same. The
+bar is driven by the work itself: chunks decrypted and inflated (0 to 25%), assets parsed
+(25 to 85%), then the shared-string and inline-asset indexes. Closing the tab while it loads
+drops the result. On mp_nuked (35 MB file, 69 MB inflated) opening takes about 3 s, and the
+window never stops responding for more than about 60 ms.
+
+Saving shows a progress strip across the top of the zone page (and the status bar): assets
+written, pointers remapped, chunks compressed and encrypted, the file written, then the
+verification's chunks, parse and asset comparison, each stage filling its share of the bar
+by its own counts.
 
 ## Views
 
 | View | For | What it does |
 |---|---|---|
-| Text | rawfile (GSC, CSC, cfg, txt, script), clipMap / map_ents entity string | Line numbers and a current-line band. Highlighting for GSC-like code (keywords, built-ins, `path::func` references, strings, comments, numbers, `#include`) and for cfg (commands, strings, comments). The monospace font is the first installed of Cascadia Mono, Consolas, JetBrains Mono and DejaVu Sans Mono. Find (Ctrl+F) and replace (Ctrl+H) can use regular expressions and match case, and every match is marked. Edits go to the backend after a 400 ms pause, and at once before undo, save or switching assets. CRLF files keep CRLF. |
-| Table | stringtable | Editable grid. Columns can be resized. Insert row (Ctrl+Shift+Enter) and Remove row (Ctrl+Shift+Delete) use `add_row` / `remove_row`. Edited cells are drawn in the accent colour. |
-| Localize | localize | Every entry of the zone as Key / Value, with a filter. Values can be edited. The selected entry is scrolled into view. |
+| Text | rawfile (GSC, CSC, cfg, txt, script), clipMap / map_ents entity string | GSC and CSC scripts are stored without indentation; with View > Formatted GSC (on by default, remembered) they are shown indented by `opent5.edit.gscformat` and saved back in the stored form: an unedited script saves byte for byte, an edited line is stored without its indentation (docs/edit-api.md, GSC formatting). The status bar says "formatted". Line numbers and a current-line band. Highlighting for GSC-like code (keywords, built-ins, `path::func` references, strings, comments, numbers, `#include`) and for cfg (commands, strings, comments). The monospace font is the first installed of Cascadia Mono, Consolas, JetBrains Mono and DejaVu Sans Mono. Find (Ctrl+F) and replace (Ctrl+H) can use regular expressions and match case, and every match is marked. Edits go to the backend after a 400 ms pause, and at once before undo, save or switching assets. CRLF files keep CRLF. |
+| Table | stringtable | Editable grid. Columns can be resized. Insert row (Ctrl+Shift+Enter) and Remove row (Ctrl+Shift+Delete) use `add_row` / `remove_row`. Edited cells are drawn in the accent colour. A cell whose string is shared carries a link marker; its tooltip and the line under the grid say what it is shared with. |
+| Localize | localize | Every entry of the zone as Key / Value / Shared with, with a filter over keys and values. Values can be edited. A value the zone stores once for several keys carries a link marker, the third column names the other keys, and the line under the table repeats it for the selected entry. The selected entry is scrolled into view. |
 | Image | image (top-level and inline) | Fit, 1:1 and wheel zoom around the cursor; drag to pan. Channel buttons for RGB, R, G, B and A, and alpha blend over a checkerboard. The info panel shows format, size, mips, cube, semantic, where the pixels live (inline, deferred, pak slot N entry M, or not in this zone, with the reason) and notes. Export PNG. Import PNG/DDS runs `replace_image`; for images the API cannot replace (pixels streamed from a .pak, formats it cannot encode yet) the panel shows the API's reason instead of the button. |
 | Geometry | gfx_map (world), col_map (brushes and collision triangles), xmodel (LOD0, top-level and inline) | Wireframe rasterised with numpy (no OpenGL, so it works offscreen and on any GPU), with depth cue, ground grid and an axis gizmo. Left drag orbits, right or middle drag pans, the wheel zooms, F frames everything, Home resets the camera. While dragging it draws a 40k-edge subset. On Nuketown it draws about 240k edges in roughly 100 ms per full-quality frame and 30 to 45 ms while dragging. Collision has a mode box: brushes, triangles or both. |
-| Fields | every asset | The schema fields (`fields()`, the schema's `to_dict`) as a tree that builds branches as you expand them. Integers are shown in decimal and hex. There is a filter over the loaded branches. Read-only for now. |
+| Fields | every asset | The schema fields (`fields()`, the schema's `to_dict`) as a tree that builds branches as you expand them. Integers are shown in decimal and hex. There is a filter over the loaded branches. Scalar fields of the asset's struct and its sub-structs are editable (double-click or F2) through `set_field`: integers in decimal or 0x hex, range checked for the field's type; floats; vectors and small arrays as space-separated values; enums by name or number. Pointers and counts carry a lock; their tooltip says why they stay read-only (`field_info`). Refused input is shown under the tree with the reason; nothing changes. |
 | Hex | every asset with a byte span (inline ones too, through the edit API) | Offset (zone offset, or relative), 16 bytes in two groups and ASCII. Only the visible rows are painted, so a 15 MB GfxWorld span opens instantly. Click, drag or shift-click to select; Ctrl+G goes to an offset; Ctrl+C copies the selection as hex. The status bar inspects the byte at the cursor (u8, u16, u32, f32, big-endian). |
 
 ## Editing, undo, changes, saving
 
 - Every edit goes through the backend as one operation. Ctrl+Z and Ctrl+Shift+Z (or Ctrl+Y)
   undo and redo through the backend in every view, and jump to the asset they touched.
+- **Shared strings.** Editing a value that other keys or cells share always asks first, in a
+  small dialog: **Edit all sharing keys** (A) changes the stored string, so every key that
+  reads it changes; **Split this key** (S) gives this key its own copy. It starts on the last
+  choice (Enter takes it, Esc cancels and changes nothing). The Changes panel says which
+  happened (`share=all ... (also MENU_PLAYER_MATCH_CAPS)` or `share=split ...`).
 - **Changes** (Ctrl+Shift+D) lists each edit with its asset, type and a summary (`text +3
-  -1`, the cell, or the API's detail, for example when a shared string was split). The
+  -1`, the cell, a field path, or the API's detail, for example how a shared string was
+  edited). The
   right side shows the selected change as a unified diff with added and removed lines
   shaded. Double-click a change to open its asset.
 - **Save As** (Ctrl+Shift+S) writes a new file through `Document.save(path, verify=True)` on
@@ -123,6 +143,10 @@ into `out/screenshots/`, which git ignores. It takes about 35 s:
 | `12_changes_diff_dark`, `12_changes_diff_light` | Changes panel after three edits |
 | `13_save_report_dark` | report of a real, verified Save As (written to a temporary folder and deleted) |
 | `14_about_dark`, `14_about_light`, `15_shortcuts_dark` | About (with the GPL notice), shortcuts |
+| `16_shared_localize_dark`, `16_share_choice_dark`, `16_share_choice_light`, `16_shared_changes_dark` | code_post_gfx_mp: `MPUI_PLAYER_MATCH_CAPS` with its shared marker and note, the edit choice, and the Changes panel after an "all" and a "split" edit |
+| `17_loading_dark` | code_post_gfx_mp captured while it loads (loading panel and status bar) |
+| `18_unsaved_dark`, `18_unsaved_light`, `19_saving_dark` | unsaved strip, tab and title; a Save As in progress |
+| `20_fields_edit_dark`, `20_fields_edit_light` | a material's fields after one edit, with the locked counts and pointers |
 
 ## Tests
 
@@ -130,12 +154,19 @@ into `out/screenshots/`, which git ignores. It takes about 35 s:
 filter and the edit markers, search, the changes and undo mapping, the editor's find and
 replace, CRLF round trips, the highlighter, the palette's fuzzy ranking and the diff lines.
 It runs against a fake backend, plus one `zones` test on patch_mp.
+`tests/test_gui_edit.py` covers the shared-string markers and the choice (all, split,
+cancel, the default), the unsaved title, tab and strip and Discard, the staged progress,
+the loading page, formatted GSC (shown indented, stored minified, off again) and field
+editing (input parsing by type, locked counts, refused input).
 `tests/test_gui_hex.py`, `tests/test_gui_image.py` and `tests/test_gui_mesh.py` cover the
 custom views. They are plain pytest with an offscreen QApplication (pytest-qt is not used)
 and take about 3 s in total.
 
 ## Open items
 
-- Field editing (`set_field`) is not offered in the Fields view yet; it is read-only.
+- Fields of nested nodes (a material inside a model, for example) are shown but edited only
+  by opening that asset itself.
+- After an "all" edit the localize table marks the other keys as edited only while it stays
+  open; the Changes panel always lists the edit.
 - The menu views show no menu source: T5 menus are compiled, so there is none to show.
 - Geometry is wireframe only. It does not draw the world's static models.

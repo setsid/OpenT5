@@ -134,7 +134,7 @@ Full export: `{"ok", "zone", "outdir", "mode": "full export", "files", "failures
 
 ## replace
 
-    opent5 replace ZONE ASSET FILE [ASSET FILE ...] -o OUT [--no-verify] [--json]
+    opent5 replace ZONE ASSET FILE [ASSET FILE ...] -o OUT [--no-verify] [--share split|all] [--json]
 
 Replaces assets with the content of files and saves a new zone. Every length is allowed:
 the zone is re-laid out and every offset pointer remapped (docs/edit-api.md, Saving).
@@ -146,6 +146,18 @@ the zone is re-laid out and every offset pointer remapped (docs/edit-api.md, Sav
 | localize | the new value (one final newline is dropped) |
 | image | PNG of the same width and height, or a DDS of the same format, size and at least the same mip count; only for images whose pixels are in the zone (inline or deferred). Streamed images (`.pak`) are refused: writing `.pak` files is not implemented |
 | map_ents, col_map | the new entity string |
+
+Shared strings. The zone linker stores identical strings once, so several localize keys (or
+stringtable cells, or other string fields) can read the same stored text; for example
+`MENU_PLAYER_MATCH_CAPS` and `MPUI_PLAYER_MATCH_CAPS` share "PLAYER MATCH" in
+code_post_gfx_mp. `--share split` (the default) changes only the named asset: the other
+fields keep the old text as their own copy. `--share all` changes the stored string, so
+every field that shares it changes too (fields that read only the end of it, or that are an
+asset's name, keep the old text). Each change's detail says which happened (`share=split` or
+`share=all`). It applies to localize values and stringtable cells.
+
+    $ opent5 replace code_post_gfx_mp MPUI_PLAYER_MATCH_CAPS new.txt --share all -o out/cpg.ff
+      change: asset 4162 localize share=all: the stored string changed for 2 field(s) (also MENU_PLAYER_MATCH_CAPS)
 
 After saving, the file is verified (unless `--no-verify`): reopened, parsed exactly, every
 asset not edited identical to the source (or identical apart from remapped pointers that

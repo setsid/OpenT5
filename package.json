@@ -12,7 +12,10 @@
     "format": ".venv/bin/ruff format src tests tools",
     "build": ".venv/bin/python -m compileall -q src && .venv/bin/python -m opent5 --version",
     "opent5": ".venv/bin/python -m opent5",
-    "gui": ".venv/bin/python -m opent5.gui"
+    "gui": ".venv/bin/python -m opent5.gui",
+    "keygen": ".venv/bin/python tools/keygen.py",
+    "release": ".venv/bin/python tools/release.py",
+    "version": ".venv/bin/python tools/release.py version"
   },
   "author": "setsid"
 }

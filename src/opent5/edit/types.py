@@ -85,6 +85,37 @@ class Change:
         return self.index
 
 
+@dataclass(frozen=True)
+class SharedField:
+    """A field that holds the same stored string as the one asked about
+    (``Document.shared_with``)."""
+
+    #: The asset holding the field: an asset-list index or an inline key.
+    index: AssetKey
+    type_name: str
+    #: The asset's name (for a localize entry, its key).
+    name: str | None
+    #: Which field: "value" (localize), "row 2, column 1" (stringtable), or
+    #: "StructType.key" for any other string field.
+    field: str
+    #: True for the field that stores the string; the others point at it.
+    owner: bool = False
+    #: True when the field points into the middle of the string (it reads a suffix):
+    #: share="all" cannot change it with the rest, so it is split instead.
+    suffix: bool = False
+
+    @property
+    def label(self) -> str:
+        what = self.name or f"<{self.type_name} {self.index!r}>"
+        return what if self.field in ("value", "") else f"{what} ({self.field})"
+
+
+#: How an edit treats a string that other fields share: "split" gives the edited field its
+#: own copy (the others keep the old text); "all" edits the stored string so every field
+#: sharing it changes.
+SHARE_MODES = ("split", "all")
+
+
 @dataclass
 class SaveReport:
     path: Path

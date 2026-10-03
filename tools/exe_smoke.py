@@ -11,6 +11,11 @@ report. This tool waits for the report and fails when any view could not be crea
 required view or asset type was never exercised. From WSL the exe is started through
 cmd.exe; on Windows it is started directly.
 
+With --update it also runs the update self-test against the exe (update_smoke below):
+a fake release server on 127.0.0.1 offers a newer, test-signed release and a tampered
+copy of it; the exe must download and verify the first and reject the second, and must
+not swap itself. Zones may then be omitted to run only that part.
+
 Exit code 0 when the report is clean, 1 otherwise.
 """
 
@@ -35,11 +40,21 @@ def windows_to_local(path: str) -> Path:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("exe", help="the built OpenT5.exe (Windows path)")
-    ap.add_argument("zones", nargs="+", help="zones to open (Windows paths)")
+    ap.add_argument("zones", nargs="*", help="zones to open (Windows paths)")
     ap.add_argument("--report", default=r"C:\o5\selftest.json", help="Windows path")
     ap.add_argument("--timeout", type=float, default=900)
+    ap.add_argument("--update", action="store_true", help="also run the update self-test")
+    ap.add_argument("--update-report", default=r"C:\o5\update-selftest.json", help="Windows path")
     args = ap.parse_args(argv)
+    if not args.zones and not args.update:
+        ap.error("give zones, --update, or both")
+    code = update_smoke(args.exe, args.update_report) if args.update else 0
+    if not args.zones:
+        return code
+    return max(code, views_smoke(args))
 
+
+def views_smoke(args) -> int:
     report = windows_to_local(args.report)
     report.unlink(missing_ok=True)
     command = (
@@ -81,6 +96,75 @@ def main(argv: list[str] | None = None) -> int:
     if data["missing_types"] or data["missing_views"]:
         print(f"  not exercised: {data['missing_types'] + data['missing_views']}")
     return 0 if data["ok"] else 1
+
+
+def _wait_for(report: Path, deadline: float) -> None:
+    last = -1
+    while time.perf_counter() < deadline:
+        if report.is_file() and report.stat().st_size == last and last > 0:
+            return
+        last = report.stat().st_size if report.is_file() else -1
+        time.sleep(1)
+
+
+def update_smoke(exe: str, report_arg: str, timeout: float = 300) -> int:
+    """The exe finds, downloads and verifies a test-signed release, rejects a tampered one,
+    and does not swap itself. The fake release server listens on 127.0.0.1 only."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from opent5 import update
+    from opent5.update.minisign import SecretKey
+    from update_fake_server import FakeServer, release
+
+    key = SecretKey.generate()  # throwaway: never the release key
+    payload = os.urandom(300_000)
+    exe_local = windows_to_local(exe)
+    before = exe_local.stat()
+    report = windows_to_local(report_arg)
+    report.unlink(missing_ok=True)
+    started = time.perf_counter()
+    with FakeServer() as server:
+        for prefix, tamper in (("good", ""), ("tampered", "exe")):
+            r = release(key, "99.0.0", payload, server.prefix_url(prefix), tamper=tamper,
+                        notes="Update smoke test release.")  # fmt: skip
+            server.add_releases(prefix, [r])
+        env = {
+            "QT_QPA_PLATFORM": "offscreen",
+            update.TEST_URL_ENV: server.base,
+            update.TEST_KEY_ENV: key.public.line(),
+        }
+        if os.name == "nt":
+            subprocess.run(
+                [exe, "--update-selftest", report_arg], env=dict(os.environ, **env), timeout=timeout
+            )
+        else:
+            sets = "".join(f"set {k}={v}&& " for k, v in env.items())
+            subprocess.run(
+                ["cmd.exe", "/c", f"{sets}{exe} --update-selftest {report_arg}"], cwd="/mnt/c"
+            )
+            _wait_for(report, started + timeout)
+        paths = [p for p, _ in server.requests]
+    after = exe_local.stat()
+    if not report.is_file():
+        print(f"exe_smoke --update: no report at {report_arg}", file=sys.stderr)
+        return 1
+    data = json.loads(report.read_text())
+    unchanged = (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns)
+    old_new = [p.name for p in exe_local.parent.glob(exe_local.name + ".*")]
+    hit_both = any(p.startswith("/good/") for p in paths) and any(
+        p.startswith("/tampered/") for p in paths
+    )
+    ok = bool(data.get("ok")) and unchanged and not old_new and hit_both and data.get("frozen")
+    print(
+        f"{exe} --update-selftest: good={data.get('good', {}).get('status')}, "
+        f"tampered={data.get('tampered', {}).get('status')}, frozen={data.get('frozen')}, "
+        f"exe unchanged={unchanged and not old_new}, {len(paths)} requests to 127.0.0.1, "
+        f"{time.perf_counter() - started:.0f} s: {'OK' if ok else 'FAILED'}"
+    )
+    for e in data.get("errors", []):
+        print(f"  ERROR {e}")
+    if not ok:
+        print(json.dumps(data, indent=2))
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

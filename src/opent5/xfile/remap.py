@@ -607,8 +607,9 @@ class _TracingWriter(_Tracing, XWriter):
         self._setup_trace()
 
 
-def traced_parse(content: bytes | bytearray | memoryview) -> tuple[XFile, _Trace]:
-    """``parse(content)`` (with its event log), plus the trace ``Rewrite`` needs."""
+def traced_parse(content: bytes | bytearray | memoryview, progress=None) -> tuple[XFile, _Trace]:
+    """``parse(content)`` (with its event log), plus the trace ``Rewrite`` needs.
+    ``progress(stage, done, total)`` is optional (asset counts)."""
     from opent5.xfile.constants import ASSET_LIST_OFFSET, ASSET_LIST_SIZE
     from opent5.xfile.model import XFileHeader, _walk
 
@@ -620,6 +621,7 @@ def traced_parse(content: bytes | bytearray | memoryview) -> tuple[XFile, _Trace
             f"stream is {len(data)}"
         )
     st = _TracingStream(data)
+    st.progress = progress
     list_bytes = data[ASSET_LIST_OFFSET : ASSET_LIST_OFFSET + ASSET_LIST_SIZE]
     st.fp = ASSET_LIST_OFFSET + ASSET_LIST_SIZE
     parts: dict = {}
@@ -645,11 +647,12 @@ def traced_parse(content: bytes | bytearray | memoryview) -> tuple[XFile, _Trace
     return xfile, st.trace
 
 
-def traced_write(xfile: XFile):
+def traced_write(xfile: XFile, progress=None):
     """``write(xfile)`` with the header derived from the stream, plus its trace."""
     from opent5.xfile.model import TEMP_SLACK, Written, XFileHeader, _walk
 
     writer = _TracingWriter()
+    writer.progress = progress
     writer.raw(xfile.header.pack())
     list_at = writer.raw(xfile.asset_list)
     parts = {
@@ -702,9 +705,9 @@ class Rewrite:
     ``build`` may be called again after further edits; the reference is always the content
     the Rewrite was made from."""
 
-    def __init__(self, content: bytes | bytearray | memoryview):
+    def __init__(self, content: bytes | bytearray | memoryview, progress=None):
         self.content = bytes(content)
-        self.xfile, self.trace = traced_parse(self.content)
+        self.xfile, self.trace = traced_parse(self.content, progress)
         self._layout: _Layout | None = None
         self._by_ident: dict[tuple, int] | None = None
         self._reads: tuple[list[int], list[int]] | None = None
@@ -768,9 +771,10 @@ class Rewrite:
 
     # -- writing ---------------------------------------------------------------------------
 
-    def build(self, check: bool = False) -> RemapResult:
-        """Write the (edited) nodes and remap every offset pointer; see the section notes."""
-        written, new_trace = traced_write(self.xfile)
+    def build(self, check: bool = False, progress=None) -> RemapResult:
+        """Write the (edited) nodes and remap every offset pointer; see the section notes.
+        ``progress(stage, done, total)`` is optional (assets written, pointers remapped)."""
+        written, new_trace = traced_write(self.xfile, progress)
         new_rows = written.log.table()
         old = self.layout()
         new, _, _ = _replay(new_rows, None)  # also checks the writer's own positions
@@ -787,7 +791,10 @@ class Rewrite:
         positions: dict[int, dict[int, int]] = {}
         out = bytearray(written.content)
         pointers: list[tuple[int, int, int]] = []
-        for j in _movable_pointers(new_rows):
+        movable = _movable_pointers(new_rows)
+        for n, j in enumerate(movable):
+            if progress is not None and n % 4096 == 0:
+                progress("Remapping pointers", n, len(movable))
             _, at, raw, _, block, offset = new_rows[j].tolist()
             if block == TEMP:
                 raise RemapError(

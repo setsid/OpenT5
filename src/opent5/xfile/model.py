@@ -193,9 +193,10 @@ class XFile:
         return out
 
 
-def parse(content: bytes | bytearray | memoryview, log: bool = True) -> XFile:
+def parse(content: bytes | bytearray | memoryview, log: bool = True, progress=None) -> XFile:
     """Walk a whole decompressed zone. Raises AssetError (an XFileError) naming
-    the asset, handler and offset at the first asset that does not parse."""
+    the asset, handler and offset at the first asset that does not parse.
+    ``progress(stage, done, total)`` is optional (asset counts)."""
     data = bytes(content)
     header = XFileHeader.parse(data)
     if len(data) < ASSET_LIST_OFFSET + ASSET_LIST_SIZE:
@@ -204,6 +205,7 @@ def parse(content: bytes | bytearray | memoryview, log: bool = True) -> XFile:
             f"stream is {len(data)}"
         )
     st = XStream(data, log=log)
+    st.progress = progress
     # The XAssetList is read raw: it occupies no block memory.
     list_bytes = data[ASSET_LIST_OFFSET : ASSET_LIST_OFFSET + ASSET_LIST_SIZE]
     st.fp = ASSET_LIST_OFFSET + ASSET_LIST_SIZE
@@ -261,7 +263,12 @@ def _walk(io: XStream, list_bytes: bytes, list_at: int, parts: dict, source: XFi
     if io.follows(asset_list, 12, owned=True):
         io.alloc(3)
         entries = io.load(8 * asset_count, parts, "asset_entries")
+        report = getattr(io, "progress", None)
         for index in range(asset_count):
+            if report is not None and index % 16 == 0:
+                report(
+                    "Writing assets" if source is not None else "Parsing assets", index, asset_count
+                )
             data = None if source is None else source.assets[index].data
             assets.append(_entry(io, entries, index, data))
     io.pop()

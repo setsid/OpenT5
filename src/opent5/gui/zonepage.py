@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 
 from opent5.gui import theme
 from opent5.gui.backend import Ref, ZoneDoc
+from opent5.gui.strips import ProgressStrip, UnsavedStrip
 from opent5.gui.tree import AssetTree, human_size
 from opent5.gui.views.base import AssetView, empty_state
 
@@ -99,6 +100,8 @@ class ZonePage(QWidget):
     edited = Signal()
     status = Signal(str)
     selected = Signal(object)  # Ref | None
+    save_as_requested = Signal()
+    discard_requested = Signal()
 
     def __init__(self, doc: ZoneDoc, parent=None):
         super().__init__(parent)
@@ -168,9 +171,26 @@ class ZonePage(QWidget):
         self.splitter.addWidget(right)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([320, 1000])
+        self.unsaved = UnsavedStrip()
+        self.unsaved.save_as.connect(self.save_as_requested)
+        self.unsaved.discard.connect(self.discard_requested)
+        self.saving = ProgressStrip()
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self.splitter)
+        lay.setSpacing(0)
+        lay.addWidget(self.saving)
+        lay.addWidget(self.unsaved)
+        lay.addWidget(self.splitter, 1)
+        self.update_unsaved()
+
+    def update_unsaved(self) -> None:
+        """The strip at the top: shown while the zone has edits not yet saved."""
+        doc = self.doc
+        if not doc.dirty:
+            self.unsaved.set_count(0, 0)
+            return
+        self.unsaved.set_count(len(doc.edited_keys()), len(doc.changes()))
+        self.unsaved.save_btn.setEnabled(doc.can_save)
 
     # views
     def view(self, kind: str) -> AssetView:
@@ -258,10 +278,12 @@ class ZonePage(QWidget):
             view.refresh()
         self.tree.model.set_edited(self.doc.edited_keys())
         self._update_header()
+        self.update_unsaved()
 
     def _edited(self) -> None:
         self.tree.model.set_edited(self.doc.edited_keys())
         self._update_header()
+        self.update_unsaved()
         self.edited.emit()
 
     def open_ref(self, ref: Ref, kind: str | None = None) -> None:
