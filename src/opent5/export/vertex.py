@@ -11,23 +11,20 @@ section 3. Two things the schema leaves opaque are decoded here:
   ``tris.firstVertex`` the group's first vertex; the stride is the run length
   divided by the group's vertex count.
 - Packed model positions (XVertexPacked*): position = offset + s16 * 2**e /
-  32768, with the offset the three floats at XSurface +0x48 and e the bytes at
-  +0x55..+0x57, which the schema keeps in unnamed bytes.
+  32768, with the offset XSurface ``posOffset`` (+0x48) and e ``posScaleExp``
+  (+0x55..+0x57).
 """
 
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass
 
 import numpy as np
 
 from opent5.xfile.schema import unpack_cmp_array
+from opent5.xfile.structs import XSurface
 
 WORLD_LAYER_BASE = 28
-#: XSurface byte offsets used for packed positions (not named in the schema).
-XSURF_POS_OFFSET = 0x48
-XSURF_POS_SHIFT = 0x55
 
 
 def unpack_cmp(words: np.ndarray) -> np.ndarray:
@@ -165,8 +162,8 @@ def world_mesh(positions: np.ndarray, layer: bytes, indices: np.ndarray, surface
 
 def packed_positions(pos: np.ndarray, surf_raw: bytes) -> np.ndarray:
     """s16 (x, y, z) quantised positions (the schema's ``pos``) -> float32 (count, 3)."""
-    offset = np.array(struct.unpack_from(">3f", surf_raw, XSURF_POS_OFFSET))
-    shifts = np.array(list(surf_raw[XSURF_POS_SHIFT : XSURF_POS_SHIFT + 3]), np.float64)
+    offset = np.array(XSurface.field("posOffset").decode(surf_raw), np.float64)
+    shifts = np.array(XSurface.field("posScaleExp").decode(surf_raw), np.float64)
     return (offset + pos.astype(np.float64) * (2.0**shifts) / 32768.0).astype(np.float32)
 
 

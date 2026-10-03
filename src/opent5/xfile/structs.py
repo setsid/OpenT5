@@ -772,6 +772,8 @@ XSurface = S(
     F(0x28, "vertexStreamHandle", "u32"),
     P(0x2C, "vertList"),
     F(0x30, "indexBufferHandle", "u32"),
+    F(0x48, "posOffset", "vec3"),
+    F(0x55, "posScaleExp", "u8[3]"),
     source="structs-map.md 9 (PS3 0x5c); +0x34 partBits as PC (INFERRED); +0x48 position "
     "offset and +0x55 scale exponents of packed positions: docs/extract.md 3.2",
 )
