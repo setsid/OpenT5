@@ -179,17 +179,11 @@ length, and optionally the content.
 
 ## DLC
 
-DLC map zones are being copied into OPENT5_DLC_ZONES
-(`.../hdd/dlc1..dlc5/{english,french}`) while this is written. The
-inventory picks up whatever is there when it is run; a zone that fails
-because its file is still arriving (its size changes while it is read, it
-was modified in the last minute, or it ends with a short chunk) is reported
-as "incomplete transfer?" rather than as a format failure.
-At the last run (121 zones, 393 s) the DLC present was dlc1 english and
-french (8 each), dlc2 english and french (10 each) and 3 zones of dlc3
-english; the rest of dlc3, dlc4 and dlc5 were still being copied and are
-PENDING: re-run tools/inventory.py once the copy finishes. None of the 39
-DLC zones read failed.
+The DLC map zones come from the console HDD, in OPENT5_DLC_ZONES
+(`.../hdd/dlc1..dlc5/{english,french}`, plus the HDD's own update folders),
+searched recursively. All 112 open and round-trip; none failed. The
+`dlcN.edat.off` files beside them are licence files, not zones, and are not
+read.
 
 The `_load.ff` zones (704 and 1,056 bytes) are real zones too: two chunks,
 the prefix and one small body.
