@@ -55,3 +55,10 @@ depend on the live disc (the user is testing against it).
 **A/B fix honesty.** The primary-light fix makes the grid reference the room
 light but cod2rad bakes it darker than Nuketown (p50 174 vs 1151). Recorded as
 "dim, needs device run to confirm" rather than claimed fixed.
+
+**Exe smoke cadence.** Rebuilding the 48 MB exe after every commit (about 10 min
+each) would dominate the night. The GUI self-test (which loads every view, the
+same regression the exe view-smoke catches) runs after each GUI-affecting change,
+and the full exe smoke (views + update) runs once at release prep after all
+feature work lands. If that final smoke fails, the offending change is fixed
+before the report is called done.
