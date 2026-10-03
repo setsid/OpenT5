@@ -19,15 +19,6 @@ By setsid.
 
 ---
 
-A Black Ops zone (`.ff`) isn't an archive. It's a signed, encrypted, compressed
-snapshot of the game's memory, full of pointers into itself. OpenT5 reads that
-snapshot down to the last byte, lets you change what's inside, and writes it back
-in the form the game expects.
-
-I wanted a tool that treats the PS3 build properly: no hex-patching blind, no
-"same length only" edits, and nothing claimed that hasn't been checked against the
-game's own loader.
-
 ## What it does
 
 - **Opens every zone** on the disc, the title update and all five DLC packs
@@ -44,7 +35,7 @@ game's own loader.
 - **Converts maps** built with the PC Mod Tools into a PS3 map zone. A sealed
   test room built this way already loads and plays in RPCS3.
 
-There's a desktop app and a command line, and both use the same editing core.
+A desktop app and a command line, both on the same editing core.
 
 ## Getting it
 
@@ -69,7 +60,7 @@ npm run gui               # desktop app
 .venv/bin/opent5 --help   # command line
 ```
 
-You'll need Python 3.10 or newer and Node (only for the `npm run` shortcuts).
+Requires Python 3.10+ (and Node for the `npm run` shortcuts).
 
 ## Using it
 
@@ -86,15 +77,14 @@ Every command takes `--json`. A bare zone name like `mp_nuked` is looked up in
 the folders named in `.env`. More in [docs/cli.md](docs/cli.md) and
 [docs/gui.md](docs/gui.md).
 
-## Read this before you edit anything
+## Signatures
 
-Every retail zone carries an RSA-2048 signature, and nobody outside the
-publisher can make a new one. OpenT5 keeps the original signature bytes, so an
-**edited zone loads only on a client with the signature check patched out**.
-The app tells you this every time you save.
+Retail zones are RSA-signed and the signature can't be regenerated. Edited zones
+keep the original signature bytes, so they **load only on a client with the
+signature check patched out**.
 
-OpenT5 never writes over your game files. Saving always produces a new file,
-and it reopens and checks every asset before it says the save worked.
+Saving always writes a new file and verifies every asset; game files are never
+overwritten.
 
 ## What it works with
 
@@ -107,13 +97,11 @@ and it reopens and checks every asset before it says the save worked.
 Other regions and the Xbox 360 build are untested. Zones from other games
 (World at War, Black Ops II) use different layouts and won't open.
 
-## How it was worked out
+## Research
 
-Nothing public described the PS3 structures past the container, so they were
-worked out from the zones and the game's own executable. Every claim in
-[`docs/research/`](docs/research/README.md) carries its evidence: an offset and
-the bytes, or an address in the executable. The parser is checked against the
-game's real loader, run in a small PowerPC interpreter
+Format notes are in [`docs/research/`](docs/research/README.md), each with its
+evidence (zone offsets and bytes, or executable addresses). The parser is checked
+against the game's own loader running in a PowerPC interpreter
 ([`tools/loader_emu`](tools/loader_emu)).
 
 ## Development
