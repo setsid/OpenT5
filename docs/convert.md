@@ -6,6 +6,8 @@ signature-patched PS3 client can load. First target: a sealed box (`mp_opent5box
 inside `mp_nuked.ff`. The user-facing test procedure is docs/demo-box.md.
 
     opent5 convert PC_MAP.ff --base mp_nuked -o OUTDIR [--lighting flat|sunlit|keep] [--json]
+                   [--name mp_NAME [--copy-pak] [--register [--patch-mp FILE] [--title T]
+                   [--description D] [--ui-slot warmuseum|snowmine|salvage|firebase]]]
 
 `PC_MAP.ff` is the PC zone (`zone/English/<map>.ff` of the PC tools, `IWffu100`). `--base` is
 a PS3 map zone (a bare name is looked up in the .env folders) whose world is replaced; the
@@ -289,9 +291,47 @@ event log and `.ff` identical in all 178 (151 s).
 - Lightmaps, reflection probes and the light grid colours are not converted (3.5).
 - Static models (GfxStaticModelDrawInst and XModel conversion), layered materials with
   ambiguous extras, path nodes, PS3-rebuilt streaming trees: not done.
-- One map at a time under a stock name; a new map name needs the menu tables and
-  configstrings.
+- Own map names: section 8. Offering a named map in the menus needs a stock zone change.
 - The PC tools need the LinkerMod `cod2map.dll` / `linker_pc.dll` (box-map.md 1.2).
+
+## 8. Map names (`--name`)
+
+`--name mp_opent5box` writes `OUTDIR/mp_opent5box.ff`, a map of its own: the zone header
+name, the world (`maps/mp/mp_opent5box.d3dbsp` for com_map, gfx_map, game_map_mp, col_map_mp
+and map_ents; gfx base name `mp_opent5box`, which also names the last rawfile), the 11 map
+scripts, the sun and exposure files and the 12 configstring tables are renamed, and the script
+paths inside the scripts follow (`maps\mp\mp_opent5box_fx::main()`). Every other `mp_nuked`
+in the zone names an asset that keeps its name. Why each one, with ELF addresses:
+docs/research/map-registration.md 3. `mapname.py` holds the rules and the renaming;
+`register.py` the map table row.
+
+Name rules (`mapname.validate`): `mp_` then lower case letters, digits and `_`; at most 23
+characters (the UI map table's 24-byte field); not ending in `_load` or `_patch`; not a stock
+or cut map name. Without `--name` the output is unchanged (box into mp_nuked: sha1
+`d5a37f69...`, as in docs/demo-box.md).
+
+With an own name the update's Nuketown script no longer applies, so the compatibility
+entities of 3.6 are not added (`--name`: `compat` off by default).
+
+`--copy-pak` writes `<name>.pak`, a byte copy of the base's pak: the game opens
+`<zone>.pak` beside `<zone>.ff` (docs/research/pak.md 5). Images of the map's own (a future
+compass image) belong inside the map's zone, never in a shared pak.
+
+The game loads an unknown map name from the disc maps' folder without a missing-map error,
+but the menus list only the rows of `mp/mapstable.csv` in patch_mp.ff, and no route that
+avoids a stock change was found (map-registration.md 4). `--register` (opt in) writes an
+edited copy of the update's patch_mp.ff with the map's row; the default writes only the
+map's own files.
+
+Box as `mp_opent5box` (`out/demo/f_box_named/`, docs/demo-box-named.md):
+
+| Check | Result |
+|---|---|
+| Content | reparses exactly, written back identically, 53 166 pointers, 0 unresolved |
+| `opent5 verify --against mp_nuked` | ok; 32 assets changed: the 9 of 1.1, 12 configstring tables, 10 more renamed rawfiles, rawfile 528 |
+| Emulated loader | consumed exactly; 53 166 conversions, same fields and values as the product parser; blocks end at the header sizes |
+| GUI self-test (with code_post_gfx_mp) | 99 checks, 0 failed |
+| Determinism | two runs, same sha1 (`56cf51e4...`) |
 
 ## Sources
 

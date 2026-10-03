@@ -7,7 +7,7 @@
     opent5 unpack ZONE DIR / opent5 pack DIR -o OUT
     opent5 verify ZONE [--against SOURCE]
     opent5 rebuild ZONE -o OUT
-    opent5 convert PC_MAP.ff --base mp_nuked -o OUTDIR
+    opent5 convert PC_MAP.ff --base mp_nuked [--name mp_NAME] -o OUTDIR
 
 Exit codes: 0 done, 1 failed (the message says why), 2 usage. Nothing is ever written into
 the game folders named in .env, or over the zone being read. docs/cli.md has every command
@@ -594,16 +594,20 @@ def text_rebuild(d: dict) -> str:
 
 
 def cmd_convert(args) -> dict:
+    import shutil
+
     from opent5.convert.mapzone import convert_map
     from opent5.xfile import XFileError
 
     pc_path = Path(args.pc)
     base = Path(zone_by_name(args.base))
     folder = out_dir(args.output)
-    target = out_file(folder / f"{base.stem}.ff", base, pc_path)
+    name = args.name or None
+    stem = name or base.stem
+    target = out_file(folder / f"{stem}.ff", base, pc_path)
     started = time.perf_counter()
     try:
-        result = convert_map(pc_path.read_bytes(), base, lighting=args.lighting)
+        result = convert_map(pc_path.read_bytes(), base, lighting=args.lighting, name=name)
     except XFileError as exc:
         raise Failure(str(exc)) from None
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -613,32 +617,77 @@ def cmd_convert(args) -> dict:
         "source": str(pc_path),
         "base": str(base),
         "base_sha1": sha1_of(base),
+        "map": result.zone_name,
         "output": str(target),
         "sha1": report["zone"]["sha1"],
         "bytes": report["zone"]["fastfile_bytes"],
         "checks": report["checks"],
         "gametypes_ready": [g for g, v in report["gametypes"].items() if v == "ready"],
-        "seconds": round(time.perf_counter() - started, 2),
-        "report": str(folder / "convert.json"),
     }
+    renamed = result.zone_name != base.stem
+    if renamed and args.copy_pak:
+        pak = base.with_suffix(".pak")
+        if not pak.is_file():
+            raise Failure(f"{pak}: expected the base map's image pack beside it, found none")
+        pak_target = out_file(folder / f"{result.zone_name}.pak", pak)
+        shutil.copyfile(pak, pak_target)
+        data["pak"] = {"source": str(pak), "output": str(pak_target), "sha1": sha1_of(pak_target)}
+    if renamed and args.register:
+        data["registration"] = _register(args, folder, result.zone_name, base.stem)
+    data["seconds"] = round(time.perf_counter() - started, 2)
+    data["report"] = str(folder / "convert.json")
     (folder / "convert.json").write_text(json.dumps({**data, **report}, indent=1, default=str))
     return data
 
 
+def _register(args, folder: Path, name: str, base: str) -> dict:
+    """patch_mp.ff with the map's table row and name, from the update's copy (read only)."""
+    from opent5 import env
+    from opent5.convert.register import register_map
+    from opent5.xfile import XFileError
+
+    source = Path(args.patch_mp) if args.patch_mp else None
+    if source is None:
+        folder_of = env.path_of("OPENT5_PATCH_ZONES")
+        source = folder_of / "patch_mp.ff" if folder_of else None
+    if source is None or not source.is_file():
+        raise Failure(
+            "registration: expected the update's patch_mp.ff (--patch-mp, or "
+            "OPENT5_PATCH_ZONES in .env), found none"
+        )
+    target = out_file(folder / "patch_mp.ff", source)
+    try:
+        return register_map(source, target, name, base, args.title, args.description, args.ui_slot)
+    except XFileError as exc:
+        raise Failure(str(exc)) from None
+
+
 def text_convert(d: dict) -> str:
     c = d["checks"]
-    return "\n".join(
-        [
-            f"converted {d['source']} onto a copy of {d['base']} (the base is only read)",
-            f"  reparse  {'exact' if c['reparse_exact'] else 'NOT EXACT'}; written back "
-            f"{'identically' if c['write_identical'] else 'DIFFERENTLY'}; "
-            f"{c['unresolved']} of {c['offset_and_alias_pointers']} pointers unresolved",
-            f"  ready    {', '.join(d['gametypes_ready'])}",
-            f"  output   {d['sha1']}  {d['output']}",
-            f"  report   {d['report']}",
-            "  the console signature no longer matches: signature-patched client only",
-        ]
-    )
+    lines = [
+        f"converted {d['source']} onto a copy of {d['base']} (the base is only read)",
+        f"  map      {d['map']}",
+        f"  reparse  {'exact' if c['reparse_exact'] else 'NOT EXACT'}; written back "
+        f"{'identically' if c['write_identical'] else 'DIFFERENTLY'}; "
+        f"{c['unresolved']} of {c['offset_and_alias_pointers']} pointers unresolved",
+        f"  ready    {', '.join(d['gametypes_ready'])}",
+        f"  output   {d['sha1']}  {d['output']}",
+    ]
+    if "pak" in d:
+        lines.append(f"  pak      {d['pak']['sha1']}  {d['pak']['output']}")
+    r = d.get("registration")
+    if r:
+        lines.append(f"  patch_mp {r['sha1']}  {r['output']}")
+        lines.append(
+            f"           map table row {r['row']} (index {r['entry']['index']}, "
+            f"maxnum_map {r['maxnum_map']}); name {r['texts'][r['keys']['name']]!r} "
+            f"under {r['keys']['name']}"
+        )
+    lines += [
+        f"  report   {d['report']}",
+        "  the console signature no longer matches: signature-patched client only",
+    ]
+    return "\n".join(lines)
 
 
 def text_generic(d: dict) -> str:
@@ -734,7 +783,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("pc", help="the PC map .ff (zone/English/<map>.ff of the PC Mod Tools)")
     p.add_argument("--base", required=True, help="the PS3 map zone whose world is replaced")
-    p.add_argument("-o", "--output", required=True, help="output folder (gets <base>.ff)")
+    p.add_argument(
+        "-o", "--output", required=True, help="output folder (gets <base>.ff, or <name>.ff)"
+    )
     p.add_argument(
         "--lighting",
         choices=("flat", "sunlit", "keep"),
@@ -742,6 +793,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="flat (default): light each surface evenly from the brightest even patch of the "
         "base map's lightmap on the same material; sunlit: the same among sunlit patches; "
         "keep: the PC lightmap coordinates",
+    )
+    p.add_argument(
+        "--name",
+        help="the map's own name (mp_ prefix, lower case, at most 23 characters): writes "
+        "<name>.ff; without it the map replaces the base under the base's name",
+    )
+    p.add_argument("--title", help="the name the menus show (default: from --name)")
+    p.add_argument("--description", help="the map description the menus show")
+    p.add_argument(
+        "--ui-slot",
+        choices=("warmuseum", "snowmine", "salvage", "firebase"),
+        default="warmuseum",
+        help="which unused localized map name of patch_mp carries the title",
+    )
+    p.add_argument("--patch-mp", help="with --register: the patch_mp.ff to start from (read only)")
+    p.add_argument(
+        "--register",
+        action="store_true",
+        help="with --name: also write an edited copy of patch_mp.ff that offers the map in "
+        "the menus. This changes a stock zone (docs/research/map-registration.md): opt in only",
+    )
+    p.add_argument(
+        "--copy-pak",
+        action="store_true",
+        help="with --name: also write <name>.pak, a copy of the base map's image pack",
     )
     return parser
 
