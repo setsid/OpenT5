@@ -1,5 +1,9 @@
 # R1: XFile layout, blocks, pointer markers and asset types (T5 PS3, BLES01031)
 
+> **Erratum (from the 178-zone walk, `walk-all.md`).** The header's TEMP block size is the TEMP
+> high-water mark **plus 16** in all 178 zones, not equal to it. The reason is INFERRED (likely
+> the 16-byte XAssetList counted in TEMP).
+
 Status: complete for the stream framing (header, script strings, asset list, markers, blocks,
 enum, loader addresses). Per-asset struct contents belong to R2 (structs.md); section 5 gives
 R2 the entry points.

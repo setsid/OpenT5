@@ -22,6 +22,19 @@ included). "LS n" = `Load_Stream(1, p, n)`, i.e. n bytes are copied from the str
 given in bytes (the loader passes `align - 1` to `DB_AllocStreamPos`). ELF addresses are VAs in
 `t5mp.elf`. "-1" and "-2" are the inline markers 0xffffffff and 0xfffffffe.
 
+
+> **Errata (from the 178-zone walk, `walk-all.md` section 3).** Where this document and
+> `walk-all.md` disagree, `walk-all.md` and `src/opent5/xfile/handlers/` win; each correction
+> there carries its ELF address and zone bytes.
+> - GfxWorld sceneDynBrush (RUNTIME, +0x340) is 4 x dynEntClientCount[1] (+0x3d8), not
+>   INFERRED 8 x (load site 0x251830 .. 0x25186c).
+> - GfxWorld worldLodChains/Infos/Surfaces (+0x3fc .. +0x410), outdoorBounds (+0x43c/+0x440),
+>   heroLights/heroLightTree (+0x444 .. +0x450), waterBuffers (+0x418/+0x420), cullGroups
+>   (+0x3b8) and each reflection probe's volume array (probe +0x10, count +0x14) are loaded, with
+>   the sizes given in `walk-all.md`; this document listed them as unknown or zero.
+> - The clipMap brush side pointer is at cbrush_t +0x20 (and the brush pointer of a PhysGeomInfo
+>   at +0x58 of its parent), not +0x0 as table rows above say.
+
 ## Contents
 
 1. Method and proof
