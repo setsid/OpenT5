@@ -148,12 +148,61 @@ every one is checked ready offline.
 ## 6. Open items
 
 - C and D of docs/research/box-rpcs3-issues.md (Search and Destroy objectives not drawn,
-  Domination hanging on load) are engine-level and unconfirmed. The leading hypothesis is
-  the PS3 per-map configstring tables (`configstrings_ps3_mp_nuked_<gametype>.csv`)
-  mismatching the shaders the box registers (EXE_CONFIGSTRINGMISMATCH). This demo carries
-  the twelve stock tables unchanged (cell for cell), so it will show the same faults if that
-  is the cause. A device TTY log is needed before a converter change.
+  Domination hanging on load) are engine-level and unconfirmed; the configstring-mismatch
+  hypothesis was withdrawn (docs/research/box-objectives-cd.md 2: it is an ERR_DROP with a
+  visible error, not a hang, and SD ran). Two discriminating test maps isolate the cause;
+  see section 7.
 - Props are XModels of the base zone only (docs/convert.md 12.5).
 - The compass image shows the room only, not the props.
 - Ceiling colour: the light is white and the ambient bluish, so the cream ceiling reads grey
   (box-rpcs3-issues.md 2.4); a PC map property, not changed here.
+
+## 7. fixC and fixD: the discriminating test maps (docs/research/box-objectives-cd.md)
+
+`tools/testmap.py` grew two options that build variants of the modes box
+(docs/demo-box-modes.md), both keeping the name mp_nuked and the twelve stock configstring
+tables and scripts (no patch_mp edit):
+
+- `--sd-radius` (fixC): the SD and bombzone objective triggers are emitted as radius
+  triggers (`trigger_radius` for the walk-in bomb pickup, `trigger_radius_use` for the
+  hold-to-use bomb sites and defuse triggers) instead of brush `trigger_multiple` /
+  `trigger_use_touch`. A radius trigger is a point entity with `radius` and `height` keys and
+  no `"model" "*N"`, so it spawns without a clipMap submodel. If Search and Destroy then
+  shows the bomb, the A and B sites and the A/B icons, the cause of C is that brush-model
+  triggers do not spawn on PS3, and the converter fix is in the brush-model / cmodel path
+  (`convert/world.py`). If it still fails, the cause is client draw / registration (C2).
+- `--path-nodes` (fixD): a 5 x 5 grid of `node_pathnode` entities over the floor (inside the
+  walls, `path_node_entities`). cod2map auto-links nodes in range and writes them to the
+  GameWorldMp PathData; the converter already carries that data (game_map_mp, proven on PC
+  mp_nuked's 316 path nodes). The converted box otherwise has `nodeCount` 0 (docs/convert.md
+  3.6). If Domination then finishes loading, the cause of D is that the spawn-influence
+  system needs the map connectivity the box lacked, and the fix is to emit path nodes for a
+  converted map.
+
+Offline-validated (no device): the fixC entity string keeps all twelve gametypes ready
+(`entities.check`), with the five SD / bombzone brush triggers now radius triggers (no
+`"*N"`), so cod2map writes five fewer brush models (box cmodels 15 -> 10). The fixD path node
+grid is written as `node_pathnode` entities that cod2map compiles to PathData.
+
+NOT BUILT this run: the PC Mod Tools could not be run because a stuck `launcher-x64.exe`
+(LinkerMod loader, Windows session 0) held the toolchain and returned exit 5 / "Access is
+denied" to every cod2map launch, and it could not be terminated from WSL (Access denied).
+Once the toolchain is free, build and convert with (keeping OPENT5_ZONES on the retail base):
+
+    tools/testmap.py build mp_opent5box_fixc --sd-radius   --game <G> --work <W> -o fixc.ff
+    opent5 convert fixc.ff --base mp_nuked --modes all -o out/demo/k_box_fixC
+    tools/testmap.py build mp_opent5box_fixd --path-nodes   --game <G> --work <W> -o fixd.ff
+    opent5 convert fixd.ff --base mp_nuked --modes all -o out/demo/k_box_fixD
+
+then validate each (reparse exact, `tools/convert_map.py oracle` exact, `opent5 verify`).
+
+Device test:
+- fixC: start Search and Destroy. Bomb + sites + A/B icons appear -> brush-model trigger
+  spawning is the root cause of C (fix in the cmodel path). Still nothing, and the log shows
+  "No sd_bomb_pickup_trig trigger found in map." / "No sd_bomb script_model found in map."
+  -> getEnt still fails (unexpected for radius; reopen). Nothing and no such line -> client
+  draw/registration (C2).
+- fixD: start Domination. It finishes loading -> path connectivity was the cause of D (emit
+  path nodes for converted maps). Still hangs at "Awaiting challenge" -> the stall is the
+  DOM flag influencers themselves; also run Team Deathmatch on the plain modes box to split
+  a generic `updateAllSpawnPoints` stall from the DOM-specific influencer path.

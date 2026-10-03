@@ -133,6 +133,14 @@ def point(classname: str, origin, yaw: float | None = None, **keys) -> Entity:
     return Entity(e)
 
 
+def radius_trigger(classname: str, centre, radius: float, height: float, **keys) -> Entity:
+    """A radius trigger: a point entity with ``radius`` and ``height`` keys and no brush
+    (convert.md 9.1: no ``model "*N"`` is written, so it spawns without a clipMap submodel).
+    ``classname`` with ``use`` is hold-to-use (_gameobjects.gsc createUseObject 681)."""
+    x, y, z = centre
+    return point(classname, (x, y, z), 0, radius=f"{radius:g}", height=f"{height:g}", **keys)
+
+
 def room_brushes(
     half: int, height: int, wall: int = 16, material: str = WALL, light_grid: bool = False
 ) -> list[list[str]]:
@@ -223,22 +231,33 @@ def spawn_entities(half: int) -> list[Entity]:
     return out
 
 
-def objective_entities(half: int) -> list[Entity]:
+def objective_entities(half: int, sd_radius: bool = False) -> list[Entity]:
     """Every gametype's objectives (docs/demo-box-modes.md has the plan; the requirements
     with evidence are in opent5.convert.entities). Positions overlap only between modes
-    that never run together: _gameobjects::main deletes what a mode does not allow."""
+    that never run together: _gameobjects::main deletes what a mode does not allow.
+    ``sd_radius``: emit the SD / bombzone objective triggers as radius triggers (no brush
+    ``"*N"`` model) instead of brush triggers, to tell a brush-model spawn fault from a
+    client draw fault (docs/research/box-objectives-cd.md 5, fixC)."""
     s = half / 512
     out: list[Entity] = []
 
     def at(x, y, z=0):
         return (x * s, y * s, z)
 
+    # fixC: the radius classname per brush trigger class (a "use" trigger stays hold-to-use).
+    radius_class = {"trigger_use_touch": "trigger_radius_use", "trigger_multiple": "trigger_radius"}
+
+    def obj_trigger(classname, centre, size, height, **keys):
+        if sd_radius:
+            return radius_trigger(radius_class[classname], centre, size / 2, height, **keys)
+        return trigger(classname, centre, size, height, **keys)
+
     # sd and dem: two bomb sites on the defenders' (east) side. Trigger, visual, defuse
     # trigger chained by target, all tagged "bombzone" (allowed by sd and dem).
     for label, y in (("a", -320), ("b", 320)):
         c = at(288, y)
         out.append(
-            trigger(
+            obj_trigger(
                 "trigger_use_touch",
                 c,
                 96,
@@ -262,7 +281,7 @@ def objective_entities(half: int) -> list[Entity]:
             )
         )
         out.append(
-            trigger(
+            obj_trigger(
                 "trigger_use_touch",
                 c,
                 96,
@@ -274,7 +293,7 @@ def objective_entities(half: int) -> list[Entity]:
     # sd: the bomb on the attackers' side.
     c = at(-288, 0)
     out.append(
-        trigger(
+        obj_trigger(
             "trigger_multiple",
             c,
             48,
@@ -444,6 +463,25 @@ def objective_entities(half: int) -> list[Entity]:
     return out
 
 
+def path_node_entities(half: int, cells: int = 5) -> list[Entity]:
+    """A coarse ``node_pathnode`` grid over the floor (``cells`` x ``cells``): the AI /
+    MP spawn-influence connectivity a converted map lacks (game_map_mp nodeCount 0,
+    docs/convert.md 3.6; docs/research/box-objectives-cd.md 4, fixD). cod2map auto-links
+    nodes in range (no DONT_LINK spawnflag) and writes them to the GameWorldMp PathData,
+    which the converter carries (game_map_mp, proven on PC mp_nuked's 316 nodes). Placed a
+    little above the floor; cod2map drops each to the ground."""
+    s = half / 512
+    span = half - 48  # inside the walls
+    step = 2 * span / (cells - 1)
+    out = []
+    for r in range(cells):
+        for c in range(cells):
+            x = (-span + c * step) * s
+            y = (-span + r * step) * s
+            out.append(Entity({"classname": "node_pathnode", "origin": _v(x, y, 16)}))
+    return out
+
+
 def map_text(
     half: int = 512,
     height: int = 256,
@@ -451,6 +489,8 @@ def map_text(
     wall: str = WALL,
     light_grid: bool = False,
     props: bool = False,
+    sd_radius: bool = False,
+    path_nodes: bool = False,
 ) -> str:
     """The whole ``.map`` (CRLF line ends are added by ``write_map``)."""
     lines = ["iwmap 4", '"000_Global" flags  active', '"The Map" flags ', "// entity 0", "{"]
@@ -480,9 +520,11 @@ def map_text(
         *spawn_entities(half),
     ]
     if objectives:
-        entities += objective_entities(half)
+        entities += objective_entities(half, sd_radius=sd_radius)
     if props:
         entities += prop_entities(half)
+    if path_nodes:
+        entities += path_node_entities(half)
     for i, e in enumerate(entities, 1):
         lines.append(f"// entity {i}")
         lines.append("{")
@@ -494,17 +536,19 @@ def map_text(
     return "\n".join(lines) + "\n"
 
 
-def entity_dicts(half: int = 512, height: int = 256, objectives: bool = True, **_) -> list[dict]:
+def entity_dicts(
+    half: int = 512, height: int = 256, objectives: bool = True, sd_radius: bool = False, **_
+) -> list[dict]:
     """The point and brush entities as written to the ``.map`` (no worldspawn, no light, no
-    props: cod2map turns ``misc_model`` into static models)."""
+    props: cod2map turns ``misc_model`` into static models; path nodes become PathData)."""
     out = [dict(e.keys) for e in spawn_entities(half)]
     if objectives:
-        out += [dict(e.keys) for e in objective_entities(half)]
+        out += [dict(e.keys) for e in objective_entities(half, sd_radius=sd_radius)]
     return out
 
 
 def compiled_entities(
-    half: int = 512, height: int = 256, objectives: bool = True, **_
+    half: int = 512, height: int = 256, objectives: bool = True, sd_radius: bool = False, **_
 ) -> tuple[list[dict], list[tuple]]:
     """The entity string and brush model bounds cod2map makes of ``map_text`` (read from
     the compiled box, tests/test_convert_entities.py): the worldspawn, then the entities in
@@ -518,7 +562,8 @@ def compiled_entities(
     r, t = half + 16 + 1, 16 + 1
     cmodels: list[tuple] = [((-r, -r, -t), (r, r, height + t))]
     out = [world]
-    entities = spawn_entities(half) + (objective_entities(half) if objectives else [])
+    objs = objective_entities(half, sd_radius=sd_radius) if objectives else []
+    entities = spawn_entities(half) + objs
     for e in entities:
         keys = dict(e.keys)
         if e.brushes:
@@ -657,6 +702,16 @@ def main(argv=None) -> int:
             action="store_true",
             help=f"the full test map: objectives, light grid, {FULL_WALL} walls, props",
         )
+        c.add_argument(
+            "--sd-radius",
+            action="store_true",
+            help="SD / bombzone objective triggers as radius triggers (fixC, box-objectives-cd.md)",
+        )
+        c.add_argument(
+            "--path-nodes",
+            action="store_true",
+            help="a node_pathnode grid over the floor (fixD, box-objectives-cd.md)",
+        )
     args = p.parse_args(argv)
     kw = {
         "half": args.half,
@@ -665,6 +720,8 @@ def main(argv=None) -> int:
         "wall": FULL_WALL if args.full else args.wall,
         "light_grid": args.full or args.light_grid,
         "props": args.full or args.props,
+        "sd_radius": args.sd_radius,
+        "path_nodes": args.path_nodes,
     }
     if args.cmd == "write":
         write_map(Path(args.out), **kw)
