@@ -13,6 +13,7 @@ PATCH = (env.path_of("OPENT5_PATCH_ZONES") or env.ROOT / "missing") / "patch_mp.
 
 
 @pytest.mark.zones
+@pytest.mark.slow
 @pytest.mark.skipif(not PATCH.is_file(), reason="patch_mp.ff is not configured")
 def test_a_view_module_missing_from_the_build_fails_the_selftest(tmp_path, monkeypatch):
     from opent5.gui import selftest, zonepage

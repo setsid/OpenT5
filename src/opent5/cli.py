@@ -292,7 +292,7 @@ def _extract_one(doc, r, out: Path) -> list[str]:
     return [str(path)]
 
 
-def _apply_replacement(doc, ref, file: Path) -> str:
+def _apply_replacement(doc, ref, file: Path, share: str = "split") -> str:
     from opent5.xfile.constants import AssetType as T
 
     data = file.read_bytes()
@@ -322,13 +322,13 @@ def _apply_replacement(doc, ref, file: Path) -> str:
                 continue
             for c, cell in enumerate(row):
                 if have[n][c] != cell:
-                    doc.set_cell(ref.index, n, c, cell)
+                    doc.set_cell(ref.index, n, c, cell, share=share)
         return f"table, {len(rows)} rows"
     text = data.decode("latin-1")
     if ref.type == T.LOCALIZE:
         if text.endswith("\n"):
             text = text[:-1]
-        doc.set_localize(ref.index, text)
+        doc.set_localize(ref.index, text, share=share)
         return "localize value"
     doc.set_text(ref.index, text)
     return "text"
@@ -349,7 +349,7 @@ def cmd_replace(args) -> dict:
             if not path.is_file():
                 raise Failure(f"{file}: expected a file to read, found none")
             ref = resolve_asset(doc, spec)
-            how = _apply_replacement(doc, ref, path)
+            how = _apply_replacement(doc, ref, path, args.share)
             done.append({"asset": ref_json(ref), "file": str(path), "as": how})
         report = doc.save(target, verify=not args.no_verify)
     except EditError as exc:
@@ -651,6 +651,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-o", "--output", required=True, help="the new .ff (never the source)")
     p.add_argument("--no-verify", action="store_true", help="skip verification after saving")
+    p.add_argument(
+        "--share",
+        choices=("split", "all"),
+        default="split",
+        help="localize values and stringtable cells whose string other fields share: split "
+        "(default, only the named asset changes) or all (every field sharing it changes)",
+    )
 
     p = sub.add_parser("unpack", parents=[common], help="decrypt and inflate a fastfile")
     p.add_argument("zone")

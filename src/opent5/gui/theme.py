@@ -306,6 +306,21 @@ QProgressBar::chunk {{ background: {t.text_dim}; }}
 #AssetHeader {{ background: {t.panel}; border-bottom: 1px solid {t.border}; }}
 #AssetTitle {{ color: {t.text}; }}
 #AssetMeta {{ color: {t.text_dim}; }}
+#Credit {{ color: {t.text_dim}; }}
+#UnsavedStrip {{ background: {t.panel}; border-bottom: 1px solid {t.border};
+    border-left: 3px solid {t.modified}; }}
+#UnsavedText {{ color: {t.text}; }}
+#StripButton {{ padding: 2px 10px; min-width: 56px; }}
+#ProgressStrip {{ background: {t.panel}; border-bottom: 1px solid {t.border}; }}
+#LoadingPanel {{ background: {t.panel}; border: 1px solid {t.border_strong}; }}
+#ProgressTitle {{ color: {t.text}; }}
+#ProgressPct {{ color: {t.text}; }}
+#BigProgress {{ max-height: 8px; min-height: 8px; border: 1px solid {t.border}; }}
+#BigProgress::chunk {{ background: {t.accent}; }}
+#FieldError {{ color: {t.error}; background: {t.panel}; border-top: 1px solid {t.border};
+    padding: 3px 8px; }}
+#ShareNote {{ color: {t.text}; background: {t.panel}; border-top: 1px solid {t.border};
+    padding: 3px 8px; }}
 #FindBar {{ background: {t.panel}; border-top: 1px solid {t.border}; }}
 #FindBar QLineEdit {{ padding: 1px 4px; }}
 #Palette {{ background: {t.panel}; border: 1px solid {t.border_strong}; }}

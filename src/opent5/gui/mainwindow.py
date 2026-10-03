@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import traceback
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QSettings, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -33,6 +34,7 @@ from opent5.gui.backend import EditError, SaveReport, ZoneDoc
 from opent5.gui.dialogs import AboutDialog, SaveReportDialog, ShortcutsDialog
 from opent5.gui.palette import Item, Palette
 from opent5.gui.panels import ChangesPanel, SearchPanel
+from opent5.gui.strips import LoadingPage
 from opent5.gui.tree import human_size
 from opent5.gui.zonepage import VIEWS, ZonePage
 
@@ -55,12 +57,21 @@ class Task(QRunnable):
 
     def run(self) -> None:
         try:
-            result = self.fn(lambda m, f: self.signals.progress.emit(m, f))
+            result = self.fn(self._progress)
         except Exception as exc:  # shown to the user, with the reason
             detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-            self.signals.failed.emit(detail)
+            self._emit(self.signals.failed, detail)
             return
-        self.signals.done.emit(result)
+        self._emit(self.signals.done, result)
+
+    def _progress(self, message: str, fraction: float) -> None:
+        self._emit(self.signals.progress, message, fraction)
+
+    @staticmethod
+    def _emit(signal, *args) -> None:
+        # the window may have gone while the worker ran (closed during a load)
+        with contextlib.suppress(RuntimeError):
+            signal.emit(*args)
 
 
 class StartPage(QWidget):
@@ -74,6 +85,8 @@ class StartPage(QWidget):
         f = title.font()
         f.setPointSize(f.pointSize() + 6)
         title.setFont(f)
+        credit = QLabel(f"{opent5.APP_NAME} by {opent5.APP_AUTHOR}")
+        credit.setObjectName("Credit")
         hint = QLabel(
             "Open a zone with Ctrl+O, drop a .ff file on this window, or pick one below. "
             "Zones are only read; edits are saved to a new file."
@@ -96,6 +109,7 @@ class StartPage(QWidget):
         lay.setContentsMargins(32, 28, 32, 24)
         lay.setSpacing(8)
         lay.addWidget(title)
+        lay.addWidget(credit)
         lay.addWidget(hint)
         lay.addSpacing(10)
         lay.addLayout(cols, 1)
@@ -181,6 +195,8 @@ class MainWindow(QMainWindow):
         self.registry: list[tuple[str, QAction]] = []  # (menu group, action)
         #: Ask before closing a zone with unsaved edits (off for scripted runs).
         self.ask_before_discard = True
+        #: Save reports are modal dialogs (off for scripted runs, which close them).
+        self.modal_reports = True
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -226,6 +242,11 @@ class MainWindow(QMainWindow):
         self._apply_theme(self.settings.value("theme", "dark"))
         self._refresh_recent()
         self._update_state()
+
+        # -- update checks (owned by opent5.gui.updates; __main__ calls .start()) ----------
+        from opent5.gui import updates
+
+        self.updates = updates.attach(self)
 
     # -- actions --------------------------------------------------------------------------
 
@@ -283,6 +304,13 @@ class MainWindow(QMainWindow):
                 lambda _c=False, k=kind: self.set_view(k),
                 f"Alt+{i}",
             )
+        self.a_format = A("View", "Formatted GSC", self._toggle_format, checkable=True)
+        self.a_format.setToolTip(
+            "Show .gsc / .csc scripts indented; they are saved in the stored (unindented) form"
+        )
+        fmt = self.settings.value("format_gsc", True)
+        self.a_format.setChecked(fmt not in (False, "false", "0", 0))
+        self._set_format(self.a_format.isChecked())
         self.theme_group = QActionGroup(self)
         self.a_dark = A("View", "Dark Theme", lambda: self._apply_theme("dark"), checkable=True)
         self.a_light = A("View", "Light Theme", lambda: self._apply_theme("light"), checkable=True)
@@ -307,6 +335,7 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&View")
         tm = m.addMenu("Theme")
         tm.addActions([self.a_dark, self.a_light])
+        m.addAction(self.a_format)
         m.addSeparator()
         m.addActions(list(self.view_actions.values()))
         m.addSeparator()
@@ -384,6 +413,8 @@ class MainWindow(QMainWindow):
             b = bar.tabButton(i, QTabBar.ButtonPosition.RightSide)
             if b is not None:
                 b.setIcon(icons.icon("close"))
+        if hasattr(self, "st_state"):
+            self._update_state()
 
     # -- opening --------------------------------------------------------------------------
 
@@ -419,36 +450,74 @@ class MainWindow(QMainWindow):
     def _open_async(self, path: Path) -> None:
         task = Task(lambda progress: ZoneDoc.open(path, progress))
         self._tasks.append(task)
+        loading = LoadingPage(path)
+        i = self.tabs.addTab(loading, f"{path.stem} (opening)")
+        self.tabs.setTabToolTip(i, str(path))
+        self.tabs.setCurrentIndex(i)
+        self.start.hide()
+        self.tabs.show()
         self.progress.setValue(0)
         self.progress.show()
         self.message(f"Opening {path.name}...")
-        task.signals.progress.connect(
-            lambda m, f: (self.progress.setValue(int(f * 100)), self.message(f"{path.name}: {m}"))
-        )
-        task.signals.done.connect(lambda doc: self._opened(task, doc))
-        task.signals.failed.connect(lambda err: self._open_failed(task, path, err))
+        task.signals.progress.connect(lambda m, f: self._open_progress(loading, m, f))
+        task.signals.done.connect(lambda doc: self._opened(task, loading, doc))
+        task.signals.failed.connect(lambda err: self._open_failed(task, loading, path, err))
         self.pool.start(task)
+        self._update_state()
 
-    def _opened(self, task: Task, doc: ZoneDoc) -> None:
+    def _open_progress(self, loading: LoadingPage, stage: str, fraction: float) -> None:
+        if loading.cancelled:
+            return
+        loading.set_progress(stage, fraction)
+        self.progress.setValue(int(fraction * 100))
+        self.message(f"{loading.path.name}: {stage} ({int(fraction * 100)}%)")
+
+    def _opened(self, task: Task, loading: LoadingPage, doc: ZoneDoc) -> None:
         self._tasks.remove(task)
         if not self._tasks:
             self.progress.hide()
-        self._add_doc(doc)
+        if loading.cancelled:
+            doc.close()
+            return
+        at = self.tabs.indexOf(loading)
+        current = self.tabs.currentWidget() is loading
+        self.tabs.removeTab(at)
+        loading.deleteLater()
+        self._add_doc(doc, at if at >= 0 else None, select=current)
         self.message(f"Opened {doc.zone_name}: {len(doc.refs)} assets in {doc.load_seconds:.1f} s")
 
-    def _open_failed(self, task: Task, path: Path, err: str) -> None:
+    def _open_failed(self, task: Task, loading: LoadingPage, path: Path, err: str) -> None:
         self._tasks.remove(task)
         if not self._tasks:
             self.progress.hide()
+        if not loading.cancelled:
+            self._drop_tab(self.tabs.indexOf(loading))
         self.message(f"Could not open {path.name}")
         QMessageBox.warning(self, "Could not open zone", f"{path}\n\n{err}")
 
-    def _add_doc(self, doc: ZoneDoc) -> ZonePage:
+    def _drop_tab(self, index: int) -> None:
+        w = self.tabs.widget(index)
+        if w is None:
+            return
+        self.tabs.removeTab(index)
+        w.deleteLater()
+        if not self.tabs.count():
+            self.tabs.hide()
+            self.start.show()
+            self._refresh_recent()
+        self._update_state()
+
+    def _add_doc(self, doc: ZoneDoc, at: int | None = None, select: bool = True) -> ZonePage:
         page = ZonePage(doc)
         page.edited.connect(lambda p=page: self._edited(p))
         page.status.connect(self.st_sel.setText)
         page.selected.connect(lambda _r: self._update_state())
-        i = self.tabs.addTab(page, doc.zone_name)
+        page.save_as_requested.connect(lambda p=page: self._save_as_page(p))
+        page.discard_requested.connect(lambda p=page: self.discard(p))
+        if at is None:
+            i = self.tabs.addTab(page, doc.zone_name)
+        else:
+            i = self.tabs.insertTab(at, page, doc.zone_name)
         close = QToolButton(self.tabs.tabBar())
         page.close_button = close  # keep the wrapper alive with the page
         close.setObjectName("TabClose")
@@ -459,7 +528,8 @@ class MainWindow(QMainWindow):
         close.clicked.connect(lambda _c=False, p=page: self.close_tab(self.tabs.indexOf(p)))
         self.tabs.tabBar().setTabButton(i, QTabBar.ButtonPosition.RightSide, close)
         self.tabs.setTabToolTip(i, str(doc.path))
-        self.tabs.setCurrentIndex(i)
+        if select:
+            self.tabs.setCurrentIndex(i)
         self._remember(doc.path)
         self.start.hide()
         self.tabs.show()
@@ -469,7 +539,9 @@ class MainWindow(QMainWindow):
     def _page_for(self, path: Path) -> ZonePage | None:
         for i in range(self.tabs.count()):
             page = self.tabs.widget(i)
-            if page.doc.path.resolve() == path.resolve():
+            if isinstance(page, LoadingPage) and page.path.resolve() == path.resolve():
+                return page
+            if isinstance(page, ZonePage) and page.doc.path.resolve() == path.resolve():
                 return page
         return None
 
@@ -517,6 +589,10 @@ class MainWindow(QMainWindow):
 
     def close_tab(self, index: int) -> None:
         page = self.tabs.widget(index)
+        if isinstance(page, LoadingPage):
+            page.cancelled = True  # the worker finishes; its result is dropped
+            self._drop_tab(index)
+            return
         if not isinstance(page, ZonePage):
             return
         page.commit()
@@ -548,6 +624,8 @@ class MainWindow(QMainWindow):
         dirty = []
         for i in range(self.tabs.count()):
             page = self.tabs.widget(i)
+            if not isinstance(page, ZonePage):
+                continue
             page.commit()
             if page.doc.dirty:
                 dirty.append(page)
@@ -570,9 +648,20 @@ class MainWindow(QMainWindow):
     def _update_state(self) -> None:
         page = self.page()
         doc = page.doc if page else None
+        bar = self.tabs.tabBar()
         for i in range(self.tabs.count()):
             p = self.tabs.widget(i)
-            self.tabs.setTabText(i, p.doc.zone_name + (" *" if p.doc.dirty else ""))
+            if not isinstance(p, ZonePage):
+                continue
+            dirty = p.doc.dirty
+            self.tabs.setTabText(i, ("* " if dirty else "") + p.doc.zone_name)
+            bar.setTabTextColor(i, QColor(theme.current().modified) if dirty else QColor())
+            # the stylesheet sets tab text colours, so the accent dot carries the colour
+            bar.setTabIcon(
+                i,
+                QIcon(icons.draw_pixmap("dot", theme.current().modified, 10)) if dirty else QIcon(),
+            )
+            self.tabs.setTabToolTip(i, str(p.doc.path) + ("\nUnsaved changes" if dirty else ""))
         has = doc is not None
         for a in (
             self.a_close,
@@ -600,7 +689,7 @@ class MainWindow(QMainWindow):
             return
         for w in (self.st_zone, self.st_assets, self.st_state, self.st_backend, self.st_sel):
             w.show()
-        self.setWindowTitle(f"{doc.zone_name}{' *' if doc.dirty else ''} - {opent5.APP_NAME}")
+        self.setWindowTitle(f"{'* ' if doc.dirty else ''}{doc.zone_name} - {opent5.APP_NAME}")
         self.st_zone.setText(doc.zone_name)
         self.st_assets.setText(f"{len(doc.refs)} assets, {len(doc.inline_refs)} inline")
         n = len(doc.changes()) if doc.dirty else 0
@@ -655,6 +744,9 @@ class MainWindow(QMainWindow):
         page = self.page()
         if page is None:
             return
+        self._save_as_page(page)
+
+    def _save_as_page(self, page: ZonePage) -> None:
         page.commit()
         doc = page.doc
         if not doc.can_save:
@@ -681,25 +773,36 @@ class MainWindow(QMainWindow):
             report = doc.save(path, verify=True)
             self._saved(page, report)
             return report
-        task = Task(lambda progress: doc.save(path, verify=True))
+        task = Task(lambda progress: doc.save(path, verify=True, progress=progress))
         self._tasks.append(task)
-        self.progress.setRange(0, 0)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
         self.progress.show()
+        page.saving.start(f"Saving {path.name}")
+        page.unsaved.setEnabled(False)
         self.message(f"Saving and verifying {path.name}...")
 
-        def done(report):
+        def step(stage: str, fraction: float) -> None:
+            page.saving.set_progress(stage, fraction)
+            self.progress.setValue(int(fraction * 100))
+            self.message(f"Saving {path.name}: {stage} ({int(fraction * 100)}%)")
+
+        def finish() -> None:
             self._tasks.remove(task)
-            self.progress.setRange(0, 100)
             self.progress.hide()
+            page.saving.hide()
+            page.unsaved.setEnabled(True)
+
+        def done(report):
+            finish()
             self._saved(page, report)
 
         def failed(err):
-            self._tasks.remove(task)
-            self.progress.setRange(0, 100)
-            self.progress.hide()
+            finish()
             self.message("Save failed")
             QMessageBox.warning(self, "Save failed", err)
 
+        task.signals.progress.connect(step)
         task.signals.done.connect(done)
         task.signals.failed.connect(failed)
         self.pool.start(task)
@@ -710,8 +813,62 @@ class MainWindow(QMainWindow):
             f"Saved {report.path.name}: {report.assets_changed} changed, "
             f"{report.assets_checked} checked"
         )
+        page.update_unsaved()
         self._update_state()
-        SaveReportDialog(report, self).exec()
+        dialog = SaveReportDialog(report, self)
+        if self.modal_reports:
+            dialog.exec()
+        else:
+            dialog.show()
+
+    def discard(self, page: ZonePage | None = None) -> None:
+        """Undo every edit of a zone (after asking); Redo brings them back."""
+        page = page or self.page()
+        if page is None:
+            return
+        page.commit()
+        if not page.doc.can_undo:
+            return
+        if self.ask_before_discard:
+            n = len(page.doc.changes())
+            answer = QMessageBox.question(
+                self,
+                "Discard changes",
+                f"Undo all {n} edit{'s' if n != 1 else ''} in {page.doc.zone_name}? "
+                "Redo (Ctrl+Shift+Z) brings them back while the zone is open.",
+                QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Discard:
+                return
+        n = page.doc.discard_all()
+        page.refresh()
+        if page is self.page():
+            self.changes.reload()
+        self._update_state()
+        self.message(f"Discarded {n} edit{'s' if n != 1 else ''}", 4000)
+
+    # -- view options -----------------------------------------------------------------------
+
+    def _set_format(self, on: bool) -> None:
+        from opent5.gui.views import code
+
+        code.FORMAT_SCRIPTS = on
+
+    def _toggle_format(self) -> None:
+        on = self.a_format.isChecked()
+        for i in range(self.tabs.count()):
+            p = self.tabs.widget(i)
+            if isinstance(p, ZonePage):
+                p.commit()
+        self._set_format(on)
+        self.settings.setValue("format_gsc", on)
+        for i in range(self.tabs.count()):
+            p = self.tabs.widget(i)
+            view = p.views.get("text") if isinstance(p, ZonePage) else None
+            if view is not None and view.ref is not None:
+                view.load(view.doc, view.ref)
+        self.message("Scripts shown formatted" if on else "Scripts shown as stored", 3000)
 
     # -- navigation -----------------------------------------------------------------------
 
@@ -764,8 +921,8 @@ class MainWindow(QMainWindow):
         kind = {"text": "text", "cell": "table", "value": "localize"}.get(hit.where)
         page.open_ref(hit.ref, kind)
         view = page.current_view()
-        if hit.where == "text" and hasattr(view, "editor"):
-            view.editor.go_to_line(hit.line or 1, max(0, hit.column or 0))
+        if hit.where == "text" and hasattr(view, "go_to"):
+            view.go_to(hit.line or 1, max(0, hit.column or 0))
             view.editor.setFocus()
         elif hit.where == "cell" and hasattr(view, "select_cell"):
             view.select_cell(hit.row or 0, hit.column or 0)

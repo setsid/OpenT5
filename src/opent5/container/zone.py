@@ -100,10 +100,11 @@ class Zone:
         self._source = source
 
     @classmethod
-    def open(cls, source: str | Path | bytes, key: bytes = SALSA20_KEY) -> Zone:
+    def open(cls, source: str | Path | bytes, key: bytes = SALSA20_KEY, progress=None) -> Zone:
+        """``progress(stage, done, total)`` is optional (chunk counts while decrypting)."""
         data = source if isinstance(source, bytes | bytearray) else Path(source).read_bytes()
         data = bytes(data)
-        return cls(read_fastfile(data, key), data, key)
+        return cls(read_fastfile(data, key, progress), data, key)
 
     @property
     def name(self) -> str:
@@ -174,7 +175,9 @@ class Zone:
                 pieces.append((middle[step : step + XCHUNK_WRITE_SIZE], None))
         return pieces + tail
 
-    def build(self, derive_size: bool = True, recompress: bool = False) -> SaveResult:
+    def build(
+        self, derive_size: bool = True, recompress: bool = False, progress=None
+    ) -> SaveResult:
         """The file `save` would write.
 
         derive_size makes the content's own length field agree with its
@@ -191,7 +194,9 @@ class Zone:
         plan = self.plan(content)
         deflated: list[bytes] = []
         kept = 0
-        for body, stream in plan:
+        for n, (body, stream) in enumerate(plan):
+            if progress is not None and n % 8 == 0:
+                progress("Compressing", n, len(plan))
             if stream is not None and not recompress:
                 deflated.append(stream)
                 kept += 1
@@ -204,7 +209,7 @@ class Zone:
         # Same header and the same stored lengths: the same layout, so the
         # original length (and any padding that broke the rule) stands.
         total = self._total if unchanged_layout else 0
-        data = assemble(header, deflated, self.key, total, gaps)
+        data = assemble(header, deflated, self.key, total, gaps, progress)
         identical = self._source is not None and data == self._source
         return SaveResult(
             data=data,
@@ -256,14 +261,17 @@ class Verified:
 
 
 def verify(
-    source: str | Path | bytes, expected: bytes | None = None, key: bytes = SALSA20_KEY
+    source: str | Path | bytes,
+    expected: bytes | None = None,
+    key: bytes = SALSA20_KEY,
+    progress=None,
 ) -> Verified:
     """Reopen a fastfile and check everything the loader relies on: every
     chunk decrypts and inflates, one terminator per stream, the zone's own
     length field matches its content, and (if given) the content is
     `expected`. Raises FastFileError naming the offset and the values."""
     data = source if isinstance(source, bytes | bytearray) else Path(source).read_bytes()
-    fastfile = read_fastfile(bytes(data), key)
+    fastfile = read_fastfile(bytes(data), key, progress)
     if fastfile.terminators != STREAM_COUNT:
         raise FastFileError(
             f"wanted {STREAM_COUNT} terminators ending at {fastfile.end:#x}, "

@@ -29,6 +29,42 @@ from opent5.xfile.constants import type_name
 
 Progress = Callable[[str, float], None]
 
+#: Stages of opening and saving a zone, with the share of the whole bar each one takes
+#: (their own done / total counts move the bar inside that share).
+OPEN_STAGES = {
+    "Decrypting and inflating": (0.0, 0.25),
+    "Parsing assets": (0.25, 0.85),
+    "Indexing shared strings": (0.85, 0.95),
+    "Indexing inline assets": (0.95, 1.0),
+}
+SAVE_STAGES = {
+    "Writing assets": (0.0, 0.18),
+    "Remapping pointers": (0.18, 0.36),
+    "Compressing": (0.36, 0.52),
+    "Encrypting": (0.52, 0.58),
+    "Writing the file": (0.58, 0.6),
+    "Verifying: decrypting and inflating": (0.6, 0.7),
+    "Verifying: parsing": (0.7, 0.85),
+    "Verifying assets": (0.85, 1.0),
+}
+
+
+def staged(report: Progress | None, stages: dict[str, tuple[float, float]]):
+    """A ``progress(stage, done, total)`` callback for the edit layer that reports
+    ``(text, fraction of the whole)``: each stage fills its share of the bar by its own
+    counts (chunks, assets, pointers)."""
+    if report is None:
+        return None
+
+    def progress(stage: str, done: int, total: int) -> None:
+        lo, hi = stages.get(stage, (0.0, 0.0))
+        part = (done / total) if total else 0.0
+        pct = f" {done:,} of {total:,}" if total > 1 else ""
+        report(f"{stage}{pct}", lo + (hi - lo) * min(max(part, 0.0), 1.0))
+
+    return progress
+
+
 #: Kinds of view an asset offers, in the order the view bar shows them.
 VIEW_KINDS = ("text", "table", "localize", "image", "entities", "geometry", "fields", "hex")
 
@@ -467,11 +503,16 @@ class ZoneDoc:
         if prefer_edit and edit_available():
             from opent5.edit import Document
 
-            report("Reading, inflating and parsing", 0.1)
-            doc = cls(Document.open(path), "edit")
+            report("Reading the file", 0.0)
+            stage = staged(report, OPEN_STAGES)
+            impl = Document.open(path, progress=stage)
+            doc = cls(impl, "edit")
+            if hasattr(impl, "index_shared_strings"):
+                stage("Indexing shared strings", 0, 1)
+                impl.index_shared_strings()
         else:
             doc = cls(_Adapter(path, report), "adapter")
-        report("Indexing inline assets", 0.92)
+        report("Indexing inline assets", 0.95)
         doc._collect_inline()
         doc.load_seconds = time.perf_counter() - started
         report("Ready", 1.0)
@@ -615,8 +656,45 @@ class ZoneDoc:
     def set_text(self, ref: Ref, text: str) -> None:
         self.impl.set_text(ref.key, text)
 
-    def set_cell(self, ref: Ref, row: int, col: int, text: str) -> None:
-        self.impl.set_cell(ref.key, row, col, text)
+    def set_cell(self, ref: Ref, row: int, col: int, text: str, share: str = "split") -> None:
+        if share != "split":
+            self.impl.set_cell(ref.key, row, col, text, share=share)
+        else:
+            self.impl.set_cell(ref.key, row, col, text)
+
+    def shared_with(self, ref: Ref, row: int | None = None, col: int | None = None) -> list:
+        """The other fields reading the same stored string (opent5.edit's ``SharedField``s:
+        index, type_name, name, field, owner, suffix, label); empty when not shared or when
+        the backend cannot tell."""
+        fn = getattr(self.impl, "shared_with", None)
+        if fn is None:
+            return []
+        try:
+            return fn(ref.key, row, col) if row is not None else fn(ref.key)
+        except EditError:
+            return []
+
+    @property
+    def can_share(self) -> bool:
+        return hasattr(self.impl, "shared_with")
+
+    def field_info(self, ref: Ref, path: str) -> dict:
+        """What set_field would edit at ``path`` (see Document.field_info)."""
+        fn = getattr(self.impl, "field_info", None)
+        if fn is None:
+            raise EditError("field editing needs opent5.edit")
+        return fn(ref.key, path)
+
+    def set_field(self, ref: Ref, path: str, value) -> None:
+        self.impl.set_field(ref.key, path, value)
+
+    def discard_all(self) -> int:
+        """Undo every edit (they stay on the redo stack). Returns how many were undone."""
+        n = 0
+        while self.impl.can_undo:
+            self.impl.undo()
+            n += 1
+        return n
 
     @property
     def can_edit_rows(self) -> bool:
@@ -628,8 +706,11 @@ class ZoneDoc:
     def remove_row(self, ref: Ref, row: int) -> list[str]:
         return self.impl.remove_row(ref.key, row)
 
-    def set_localize(self, ref: Ref, value: str) -> None:
-        self.impl.set_localize(ref.key, value)
+    def set_localize(self, ref: Ref, value: str, share: str = "split") -> None:
+        if share != "split":
+            self.impl.set_localize(ref.key, value, share=share)
+        else:
+            self.impl.set_localize(ref.key, value)
 
     def replace_image(self, ref: Ref, data) -> None:
         if ref.inline and not self.native:
@@ -695,7 +776,9 @@ class ZoneDoc:
     def can_save(self) -> bool:
         return self.backend == "edit"
 
-    def save(self, new_path: str | Path, verify: bool = True) -> SaveReport:
+    def save(
+        self, new_path: str | Path, verify: bool = True, progress: Progress | None = None
+    ) -> SaveReport:
         new_path = Path(new_path)
         if new_path.resolve() == self.path.resolve():
             raise EditError(f"refusing to overwrite the source zone {self.path}")
@@ -705,7 +788,11 @@ class ZoneDoc:
             except ValueError:
                 continue
             raise EditError(f"refusing to write into the game folder {folder}")
-        r = self.impl.save(new_path, verify=verify)
+        if progress is not None:
+            r = self.impl.save(new_path, verify=verify, progress=staged(progress, SAVE_STAGES))
+            progress("Saved", 1.0)
+        else:
+            r = self.impl.save(new_path, verify=verify)
         self.saved_path = new_path
         identical = bool(getattr(r, "identical", False))
         note = getattr(r, "signature_note", None)

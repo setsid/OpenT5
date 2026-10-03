@@ -243,7 +243,27 @@ def _import(p):
     _poly(p, [(2.5, 9), (2.5, 13.5), (13.5, 13.5), (13.5, 9)])
 
 
+def _link(p):
+    # two interlocking rounded links: a value stored once and read by several fields
+    p.drawRoundedRect(QRectF(1.5, 5.5, 7.5, 5), 2.5, 2.5)
+    p.drawRoundedRect(QRectF(7, 5.5, 7.5, 5), 2.5, 2.5)
+
+
+def _dot(p):
+    # the unsaved marker on a zone tab
+    p.setBrush(p.pen().color())
+    p.drawEllipse(QRectF(4.5, 4.5, 7, 7))
+
+
+def _lock(p):
+    p.drawRect(QRectF(3.5, 7.5, 9, 6.5))
+    _poly(p, [(5.5, 7.5), (5.5, 5), (8, 2.5), (10.5, 5), (10.5, 7.5)])
+
+
 DRAW = {
+    "link": _link,
+    "lock": _lock,
+    "dot": _dot,
     "open": _open,
     "save": _save,
     "undo": _undo,

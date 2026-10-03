@@ -92,7 +92,7 @@ class Comparison:
         return [i for i, s, _ in self.rows if s == status]
 
 
-def compare_assets(src: _Side, dst: _Side, touched: set[int] | None) -> Comparison:
+def compare_assets(src: _Side, dst: _Side, touched: set[int] | None, progress=None) -> Comparison:
     """Classify every asset of ``dst`` against ``src``: identical bytes (and deferred
     bytes); identical apart from offset pointers that name the same things ("remapped");
     or different. Assets in ``touched`` are "edited" and not compared. With touched None,
@@ -111,6 +111,8 @@ def compare_assets(src: _Side, dst: _Side, touched: set[int] | None) -> Comparis
     out = Comparison()
     old_assets, new_assets = src.xfile.assets, dst.xfile.assets
     for i, (a, b) in enumerate(zip(old_assets, new_assets, strict=True)):
+        if progress is not None and i % 32 == 0:
+            progress("Verifying assets", i, len(old_assets))
         if (a.type, a.name) != (b.type, b.name):
             out.rows.append(
                 (i, "differs", f"expected {a.type_name} {a.name!r}, found {b.type_name} {b.name!r}")
@@ -213,16 +215,27 @@ def _read(doc, xfile, key: AssetKey, kind: str) -> Any:
     raise ValueError(kind)
 
 
-def verify_saved(doc, path: Path, content: bytes) -> tuple[list[str], dict]:
-    """Checks 1 to 4 on a written file; ``content`` is what was built."""
+def _stage(progress, name: str):
+    if progress is None:
+        return None
+    return lambda _stage, done, total: progress(name, done, total)
+
+
+def verify_saved(doc, path: Path, content: bytes, progress=None) -> tuple[list[str], dict]:
+    """Checks 1 to 4 on a written file; ``content`` is what was built. ``progress(stage,
+    done, total)`` is optional."""
     try:
-        verify_container(Path(path).read_bytes(), expected=content)
+        verify_container(
+            Path(path).read_bytes(),
+            expected=content,
+            progress=_stage(progress, "Verifying: decrypting and inflating"),
+        )
     except FastFileError as exc:
         return [f"container: {exc}"], {}
-    return verify_content(doc, content)
+    return verify_content(doc, content, progress)
 
 
-def verify_content(doc, content: bytes) -> tuple[list[str], dict]:
+def verify_content(doc, content: bytes, progress=None) -> tuple[list[str], dict]:
     """Checks 2 to 4 on built content (no file)."""
     problems: list[str] = []
     details: dict[str, Any] = {}
@@ -232,7 +245,7 @@ def verify_content(doc, content: bytes) -> tuple[list[str], dict]:
         return len(problems) >= MAX_PROBLEMS
 
     try:
-        new = parse(content)
+        new = parse(content, progress=_stage(progress, "Verifying: parsing"))
     except XFileError as exc:
         problem(f"parse: {exc}")
         return problems, details
@@ -247,7 +260,7 @@ def verify_content(doc, content: bytes) -> tuple[list[str], dict]:
     side = doc.side_effect_assets()
     src = _Side(old, doc.content, doc._rw.layout())
     dst = _Side(new, content)
-    result = compare_assets(src, dst, touched)
+    result = compare_assets(src, dst, touched, progress)
     for i, status, reason in result.rows:
         if status == "differs" and problem(f"asset {i} ({old.assets[i].name}): {reason}"):
             break

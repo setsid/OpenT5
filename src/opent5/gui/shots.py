@@ -264,6 +264,13 @@ class Shooter:
             ui.open_ref(loc, "localize")
             self.shot("05_localize_ui_light" if False else "05_localize_ui_dark")
 
+        if self.wanted("16_shared") or self.wanted("17_loading"):
+            self.shared_strings()
+        if patch is not None and (self.wanted("18_unsaved") or self.wanted("19_saving")):
+            self.unsaved(patch)
+        if patch is not None and self.wanted("20_fields_edit"):
+            self.fields_edit(patch)
+
         if self.wanted("13_save_report"):
             self.save_report()
         if self.wanted("14_about"):
@@ -283,6 +290,132 @@ class Shooter:
             d.show()
             self.shot("15_shortcuts_dark", d)
             d.close()
+
+    def shared_strings(self) -> None:
+        """code_post_gfx_mp opened the way a user does (worker thread, loading page captured
+        mid-load), then the localize view on a key that shares its string, and the choice
+        an edit of it asks for."""
+        from opent5.gui.strips import ShareChoiceDialog
+        from opent5.gui.zonepage import ZonePage
+
+        path = zone("code_post_gfx_mp")
+        if path is None:
+            print("  skip: code_post_gfx_mp.ff not configured")
+            return
+        win = self.win
+        win.open_paths([path])
+        captured = False
+        end = time.perf_counter() + 60
+        while time.perf_counter() < end:
+            settle(self.app, 0.02)
+            w = win.tabs.currentWidget()
+            if isinstance(w, ZonePage):
+                break
+            bar = getattr(getattr(w, "progress", None), "bar", None)
+            if not captured and bar is not None and bar.value() >= 350:
+                if self.wanted("17_loading"):
+                    self.shot("17_loading_dark")
+                captured = True
+        page = win.tabs.currentWidget()
+        if not isinstance(page, ZonePage) or not self.wanted("16_shared"):
+            return
+        ref = page.find_ref("MPUI_PLAYER_MATCH_CAPS", "localize")
+        page.open_ref(ref, "localize")
+        view = page.current_view()
+        view.filter.setText("PLAYER_MATCH")
+        row = view.model.row_of(ref)
+        view.view.setCurrentIndex(view.proxy.mapFromSource(view.model.index(row, 1)))
+        self.shot("16_shared_localize_dark")
+        ShareChoiceDialog.last = "all"
+        d = ShareChoiceDialog(
+            'MPUI_PLAYER_MATCH_CAPS ("PLAYER MATCH")', ["MENU_PLAYER_MATCH_CAPS"], win
+        )
+        d.show()
+        self.shot("16_share_choice_dark", d)
+        self.theme("light")
+        self.shot("16_share_choice_light", d)
+        d.close()
+        self.theme("dark")
+        # what the Changes panel says after each choice
+        doc = page.doc
+        doc.set_localize(ref, "PLAYER MATCH (ALL)", share="all")
+        other = page.find_ref("MPUI_PLAYER_MATCH", "localize")
+        if other is not None and doc.shared_with(other):
+            doc.set_localize(other, "Player match (split)", share="split")
+        page._edited()
+        page.refresh()
+        view.model.refresh_values()
+        win._edited(page)
+        win.show_changes()
+        self.shot("16_shared_changes_dark")
+        win.bottom.hide()
+        doc.discard_all()
+        page.refresh()
+        view.filter.clear()
+        win._update_state()
+
+    def unsaved(self, patch) -> None:
+        """The unsaved strip, tab and title in both themes, and a save in progress."""
+        win = self.win
+        win.tabs.setCurrentWidget(patch)
+        ref = patch.find_ref("default_mp.cfg", "rawfile")
+        patch.doc.set_text(ref, patch.doc.text(ref) + "set ui_custom 1\n")
+        tab = patch.find_ref("mp/mapstable.csv", "stringtable")
+        patch.doc.set_cell(tab, 1, 1, "Nuketown (edited)")
+        patch.open_ref(ref, "text")
+        patch._edited()
+        patch.refresh()
+        win._update_state()
+        for t in ("dark", "light"):
+            if self.wanted(f"18_unsaved_{t}"):
+                self.theme(t)
+                self.shot(f"18_unsaved_{t}")
+        self.theme("dark")
+        if self.wanted("19_saving") and patch.doc.can_save:
+            target = Path(self.tmp) / "patch_mp_saving.ff"
+            win.modal_reports = False
+            win._save_to(patch, target)
+            end = time.perf_counter() + 60
+            shot = False
+            while win._tasks and time.perf_counter() < end:
+                settle(self.app, 0.01)
+                if not shot and patch.saving.bar.value() >= 300:
+                    self.shot("19_saving_dark")
+                    shot = True
+            # the report dialog is modal in a real save; here it was opened by _saved
+            for w in self.app.topLevelWidgets():
+                if w.isVisible() and w.windowTitle() == "Save report":
+                    w.close()
+            target.unlink(missing_ok=True)
+        patch.doc.discard_all()
+        patch.refresh()
+        win._update_state()
+
+    def fields_edit(self, patch) -> None:
+        """Editable fields: a material (its counts are locked) after one field edit."""
+        win = self.win
+        win.tabs.setCurrentWidget(patch)
+        mat = next(r for r in patch.doc.refs if r.type_name == "material")
+        patch.open_ref(mat, "fields")
+        view = patch.current_view()
+        m = view.model
+        header = view.proxy.index(0, 0)
+        for r in range(view.proxy.rowCount(header)):
+            idx = view.proxy.index(r, 0, header)
+            if idx.data() == "info.sortKey":
+                value = view.proxy.index(r, 1, header)
+                view.proxy.setData(value, "5")
+                view.tree.setCurrentIndex(value)
+                break
+        m.dataChanged.emit(m.index(0, 0), m.index(0, 0))
+        win._update_state()
+        self.shot("20_fields_edit_dark")
+        self.theme("light")
+        self.shot("20_fields_edit_light")
+        self.theme("dark")
+        patch.doc.discard_all()
+        patch.refresh()
+        win._update_state()
 
     def save_report(self) -> None:
         """A real Save As through the backend when opent5.edit is present; the file goes to a

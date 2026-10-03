@@ -4,6 +4,11 @@ Both are QTableViews over small models that read the document and send each
 edited cell straight to the backend (``set_cell`` / ``set_localize``). Edited
 cells are drawn in the ``modified`` colour. Rows can be added and removed when
 the backend offers it (opent5.edit's ``add_row`` / ``remove_row``).
+
+Shared strings: a value the zone stores once for several keys or cells carries a link
+marker, the localize table lists what it is shared with, and the line under each table
+names the sharers of the current value. Editing a shared value always asks first: edit all
+sharing keys, or split this key (``strips.ShareChoiceDialog``).
 """
 
 from __future__ import annotations
@@ -11,7 +16,7 @@ from __future__ import annotations
 import re
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
-from PySide6.QtGui import QAction, QColor, QKeySequence
+from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -24,13 +29,42 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from opent5.gui import theme
+from opent5.gui import icons, strips, theme
 from opent5.gui.backend import EditError, Ref, ZoneDoc
 from opent5.gui.views.base import AssetView
 
 ROLE = Qt.ItemDataRole
 NO_INDEX = QModelIndex()
 CELL_DETAIL = re.compile(r"row (\d+), col(?:umn)? (\d+)")
+
+
+def link_icon() -> QIcon:
+    """The shared-string marker, in the accent colour of the current theme."""
+    t = theme.current()
+    return QIcon(icons.draw_pixmap("link", t.accent, 14))
+
+
+def shared_text(sharers: list) -> str:
+    return "shared with: " + ", ".join(s.label for s in sharers) if sharers else ""
+
+
+class _SharedCache:
+    """Sharers per key, computed when a row is first drawn (the index itself is built
+    when the zone opens)."""
+
+    def __init__(self):
+        self.doc = None
+        self.values: dict = {}
+
+    def get(self, doc, key, fn):
+        if doc is not self.doc:
+            self.doc, self.values = doc, {}
+        if key not in self.values:
+            self.values[key] = fn() if doc is not None and doc.can_share else []
+        return self.values[key]
+
+    def clear(self) -> None:
+        self.values = {}
 
 
 class StringTableModel(QAbstractTableModel):
@@ -41,10 +75,20 @@ class StringTableModel(QAbstractTableModel):
         self.rows: list[list[str]] = []
         self.original: list[list[str]] = []
         self.error: str | None = None
+        self.shared = _SharedCache()
+        #: (what, other labels) -> "all" | "split" | None; replaced in tests
+        self.ask = strips.ask_share
+        self.last_share: str | None = None
+
+    def sharers(self, r: int, c: int) -> list:
+        return self.shared.get(
+            self.doc, (r, c), lambda: self.doc.shared_with(self.ref, r, c) if self.ref else []
+        )
 
     def load(self, doc: ZoneDoc, ref: Ref) -> None:
         self.beginResetModel()
         self.doc, self.ref = doc, ref
+        self.shared.clear()
         self.rows = doc.table(ref)
         edited = {}
         for c in doc.changes():
@@ -67,8 +111,13 @@ class StringTableModel(QAbstractTableModel):
         if not index.isValid():
             return None
         value = self.rows[index.row()][index.column()]
-        if role in (ROLE.DisplayRole, ROLE.EditRole, ROLE.ToolTipRole):
+        if role in (ROLE.DisplayRole, ROLE.EditRole):
             return value
+        if role == ROLE.ToolTipRole:
+            shared = shared_text(self.sharers(index.row(), index.column()))
+            return f"{value}\n{shared}" if shared else value
+        if role == ROLE.DecorationRole:
+            return link_icon() if self.sharers(index.row(), index.column()) else None
         if role == ROLE.ForegroundRole and value != self.original[index.row()][index.column()]:
             return QColor(theme.current().modified)
         return None
@@ -90,11 +139,27 @@ class StringTableModel(QAbstractTableModel):
         r, c = index.row(), index.column()
         if value == self.rows[r][c]:
             return False
+        share = "split"
+        sharers = self.sharers(r, c)
+        if sharers:
+            choice = self.ask(
+                f'Cell (row {r}, column {c}) "{self.rows[r][c]}"', [s.label for s in sharers]
+            )
+            if choice is None:
+                return False
+            share = choice
         try:
-            self.doc.set_cell(self.ref, r, c, str(value))
+            self.doc.set_cell(self.ref, r, c, str(value), share=share)
         except EditError as exc:
             self.error = str(exc)
             return False
+        self.last_share = share if sharers else None
+        if sharers:
+            # other cells (and the sharing state) may have changed
+            current = [list(row) for row in self.original]
+            self.load(self.doc, self.ref)
+            self.original = current
+            return True
         self.rows[r][c] = str(value)
         self.dataChanged.emit(index, index)
         return True
@@ -148,11 +213,14 @@ class TableView(AssetView):
         h.addWidget(self.remove_btn)
         h.addStretch(1)
         h.addWidget(self.shape)
+        self.note = share_note()
+        self.model.ask = lambda what, others: strips.ask_share(what, others, self)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addWidget(bar)
         lay.addWidget(self.view)
+        lay.addWidget(self.note)
         self.a_insert = QAction("Insert row", self, shortcut=QKeySequence("Ctrl+Shift+Return"))
         self.a_insert.triggered.connect(self.insert_row)
         self.a_remove = QAction("Remove row", self, shortcut=QKeySequence("Ctrl+Shift+Delete"))
@@ -220,6 +288,10 @@ class TableView(AssetView):
                 f"row {index.row()}, col {index.column()} of "
                 f"{self.model.rowCount()} x {self.model.columnCount()}"
             )
+            sharers = self.model.sharers(index.row(), index.column())
+            show_share_note(self.note, f"Row {index.row()}, column {index.column()}", sharers)
+        else:
+            self.note.hide()
 
     def select_cell(self, row: int, col: int) -> None:
         idx = self.model.index(row, col)
@@ -227,10 +299,48 @@ class TableView(AssetView):
         self.view.scrollTo(idx, QAbstractItemView.ScrollHint.PositionAtCenter)
 
 
-class LocalizeModel(QAbstractTableModel):
-    """Every localize entry of the zone: key, value; values editable."""
+def share_note() -> QLabel:
+    note = QLabel()
+    note.setObjectName("ShareNote")
+    note.setWordWrap(True)
+    note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    note.hide()
+    return note
 
-    HEADERS = ("Key", "Value")
+
+def show_share_note(note: QLabel, what: str, sharers: list) -> None:
+    if not sharers:
+        note.hide()
+        return
+    names = ", ".join(s.label for s in sharers)
+    note.setText(
+        f"{what} is stored once and shared with: {names}. Editing it asks whether to "
+        "change every sharing key or only this one."
+    )
+    note.show()
+
+
+class _KeyValueFilter(QSortFilterProxyModel):
+    """Filter on the key and value columns only (not the computed shared column)."""
+
+    needle = ""
+
+    def set_needle(self, text: str) -> None:
+        self.needle = text.lower()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, row, parent) -> bool:  # noqa: N802
+        if not self.needle:
+            return True
+        m = self.sourceModel()
+        return self.needle in m.keys[row].lower() or self.needle in m.values[row].lower()
+
+
+class LocalizeModel(QAbstractTableModel):
+    """Every localize entry of the zone: key, value, what it shares its stored string
+    with; values editable."""
+
+    HEADERS = ("Key", "Value", "Shared with")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -239,10 +349,18 @@ class LocalizeModel(QAbstractTableModel):
         self.values: list[str] = []
         self.keys: list[str] = []
         self.original: dict = {}
+        self.shared = _SharedCache()
+        self.ask = strips.ask_share
+        self.last_share: str | None = None
+
+    def sharers(self, r: int) -> list:
+        ref = self.refs[r]
+        return self.shared.get(self.doc, ref.key, lambda: self.doc.shared_with(ref))
 
     def load(self, doc: ZoneDoc) -> None:
         self.beginResetModel()
         self.doc = doc
+        self.shared.clear()
         self.refs = [r for r in doc.all_refs if r.type_name == "localize"]
         self.keys, self.values = [], []
         for r in self.refs:
@@ -250,6 +368,8 @@ class LocalizeModel(QAbstractTableModel):
             self.keys.append(key or r.name)
             self.values.append(value)
         self.original = {c.key: c.before for c in doc.changes() if c.kind == "localize"}
+        for key, before in self._shared_befores().items():
+            self.original.setdefault(key, before)
         self.endResetModel()
 
     def row_of(self, ref: Ref) -> int:
@@ -262,17 +382,27 @@ class LocalizeModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.refs)
 
     def columnCount(self, parent=NO_INDEX) -> int:  # noqa: N802
-        return 0 if parent.isValid() else 2
+        return 0 if parent.isValid() else 3
 
     def data(self, index, role=ROLE.DisplayRole):
         if not index.isValid():
             return None
         r, c = index.row(), index.column()
+        if c == 2:
+            if role in (ROLE.DisplayRole, ROLE.ToolTipRole):
+                return ", ".join(s.label for s in self.sharers(r))
+            if role == ROLE.ForegroundRole:
+                return QColor(theme.current().text_dim)
+            return None
         if role in (ROLE.DisplayRole, ROLE.EditRole):
             return self.keys[r] if c == 0 else self.values[r]
+        if role == ROLE.DecorationRole and c == 1:
+            return link_icon() if self.sharers(r) else None
         if role == ROLE.ToolTipRole and c == 1:
             before = self.original.get(self.refs[r].key)
-            return self.values[r] if before is None else f"was: {before}"
+            text = self.values[r] if before is None else f"was: {before}"
+            shared = shared_text(self.sharers(r))
+            return f"{text}\n{shared}" if shared else text
         if role == ROLE.ForegroundRole:
             if c == 0:
                 return QColor(theme.current().text_dim)
@@ -299,14 +429,50 @@ class LocalizeModel(QAbstractTableModel):
         r = index.row()
         if value == self.values[r]:
             return False
+        share = "split"
+        sharers = self.sharers(r)
+        if sharers:
+            choice = self.ask(f'{self.keys[r]} ("{self.values[r]}")', [s.label for s in sharers])
+            if choice is None:
+                return False
+            share = choice
         try:
-            self.doc.set_localize(self.refs[r], str(value))
-        except EditError:
+            self.doc.set_localize(self.refs[r], str(value), share=share)
+        except EditError as exc:
+            self.error = str(exc)
             return False
+        self.last_share = share if sharers else None
+        if sharers:
+            # other keys may now read the new text, and the sharing has changed
+            self.refresh_values()
+            return True
         self.values[r] = str(value)
         self.original = {c.key: c.before for c in self.doc.changes() if c.kind == "localize"}
         self.dataChanged.emit(index, index)
         return True
+
+    def refresh_values(self) -> None:
+        """Re-read every value and the sharing (after an edit that changed several)."""
+        self.values = [self.doc.localize(r)[1] for r in self.refs]
+        self.original = {c.key: c.before for c in self.doc.changes() if c.kind == "localize"}
+        for key, before in self._shared_befores().items():
+            self.original.setdefault(key, before)
+        self.shared.clear()
+        if self.refs:
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self.refs) - 1, 2))
+
+    def _shared_befores(self) -> dict:
+        """Keys changed through another key's share="all" edit: their text before."""
+        out = {}
+        by_label = {k: r.key for k, r in zip(self.keys, self.refs, strict=True)}
+        for c in self.doc.changes():
+            if c.kind == "localize" and "share=all" in (c.detail or ""):
+                tail = c.detail.split("(also ", 1)
+                if len(tail) == 2:
+                    for label in tail[1].rstrip(")").split(", "):
+                        if label in by_label:
+                            out.setdefault(by_label[label], c.before)
+        return out
 
 
 class LocalizeView(AssetView):
@@ -316,16 +482,17 @@ class LocalizeView(AssetView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.model = LocalizeModel(self)
-        self.proxy = QSortFilterProxyModel(self)
+        self.proxy = _KeyValueFilter(self)
         self.proxy.setSourceModel(self.model)
-        self.proxy.setFilterKeyColumn(-1)
         self.proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.view = _table(self.proxy)
         self.view.horizontalHeader().setStretchLastSection(True)
+        self.model.ask = lambda what, others: strips.ask_share(what, others, self)
+        self.note = share_note()
         self.view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.view.verticalHeader().hide()
         self.filter = QLineEdit(placeholderText="Filter keys and values")
-        self.filter.textChanged.connect(self.proxy.setFilterFixedString)
+        self.filter.textChanged.connect(self.proxy.set_needle)
         self.count = QLabel()
         bar = QWidget()
         bar.setObjectName("ViewBar")
@@ -339,8 +506,17 @@ class LocalizeView(AssetView):
         lay.setSpacing(0)
         lay.addWidget(bar)
         lay.addWidget(self.view)
+        lay.addWidget(self.note)
         self.model.dataChanged.connect(lambda *_: self.edited.emit())
+        self.view.selectionModel().currentChanged.connect(self._current)
         self._doc_loaded = None
+
+    def _current(self, index, _prev) -> None:
+        if not index.isValid():
+            self.note.hide()
+            return
+        r = self.proxy.mapToSource(index).row()
+        show_share_note(self.note, self.model.keys[r], self.model.sharers(r))
 
     def load(self, doc, ref) -> None:
         super().load(doc, ref)
@@ -348,6 +524,7 @@ class LocalizeView(AssetView):
             self.model.load(doc)
             self._doc_loaded = doc
             self.view.setColumnWidth(0, 300)
+            self.view.setColumnWidth(1, 520)
         self.count.setText(f"{self.model.rowCount()} entries")
         row = self.model.row_of(ref)
         if row >= 0:
@@ -361,6 +538,7 @@ class LocalizeView(AssetView):
 
     def refresh(self) -> None:
         current = self.view.currentIndex()
-        self.model.load(self.doc)
-        if current.isValid():
-            self.view.setCurrentIndex(current)
+        where = (current.row(), current.column()) if current.isValid() else None
+        self.model.load(self.doc)  # resets the model: the old index is stale now
+        if where is not None and where[0] < self.proxy.rowCount():
+            self.view.setCurrentIndex(self.proxy.index(*where))

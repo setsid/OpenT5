@@ -6,6 +6,12 @@ regular expression, case sensitive or not) with every match marked.
 ``TextView`` puts them together over a document: edits go to the backend after
 a short pause (or at once before undo, save or a switch), and undo and redo go
 through the backend, so the editor's own undo stack is off.
+
+GSC / CSC scripts are stored without indentation. With View > Formatted GSC (on by
+default, ``FORMAT_SCRIPTS``) the editor shows them indented by
+``opent5.edit.gscformat.format_script`` and stores what is typed through
+``unformat_script``, so an unedited script reads back exactly as stored and an edited line
+is stored the way the game's files are (docs/edit-api.md, GSC formatting).
 """
 
 from __future__ import annotations
@@ -33,12 +39,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from opent5.edit import gscformat
 from opent5.gui import icons, theme
 from opent5.gui.backend import EditError
 from opent5.gui.views.base import AssetView, empty_state
 from opent5.gui.views.highlight import Highlighter, mode_for
 
 COMMIT_DELAY_MS = 400
+#: Show .gsc / .csc indented (View > Formatted GSC).
+FORMAT_SCRIPTS = True
 
 
 class _Gutter(QWidget):
@@ -386,6 +395,8 @@ class TextView(AssetView):
         self._loading = False
         self._shown: str | None = None
         self._eol = "\n"
+        #: True while the shown script is the formatted form of the stored one.
+        self.formatted = False
         self._timer = QTimer(self, singleShot=True, interval=COMMIT_DELAY_MS)
         self._timer.timeout.connect(self.commit)
         self.editor.textChanged.connect(self._changed)
@@ -425,12 +436,17 @@ class TextView(AssetView):
         )
         self.editor.highlighter.set_mode(mode)
         self.editor.setReadOnly(ref.inline)
+        self.formatted = (
+            FORMAT_SCRIPTS and gscformat.is_script(ref.name) and gscformat.round_trips(body)
+        )
         self.set_body(body)
 
     def set_body(self, body: str) -> None:
         """Show ``body``. The editor keeps lines with \\n only, so the line ending of
         the asset is remembered and restored on commit; an untouched buffer never
-        reads as an edit."""
+        reads as an edit. A script is shown formatted when ``formatted`` is set."""
+        if self.formatted:
+            body = gscformat.format_script(body)
         self._eol = "\r\n" if "\r\n" in body else "\n"
         shown = body.replace("\r\n", "\n") if self._eol == "\r\n" else body
         if shown == self.editor.toPlainText():
@@ -468,6 +484,8 @@ class TextView(AssetView):
         if shown == getattr(self, "_shown", None):
             return False
         body = shown.replace("\n", self._eol) if self._eol != "\n" else shown
+        if self.formatted:
+            body = gscformat.unformat_script(body)
         try:
             if body == self.doc.text(self.ref):
                 self._shown = shown
@@ -486,7 +504,18 @@ class TextView(AssetView):
         text = f"Ln {c.blockNumber() + 1}, Col {c.positionInBlock() + 1}"
         if sel:
             text += f" ({sel} selected)"
+        if self.formatted:
+            text += "  formatted"
         self.status.emit(text)
+
+    def go_to(self, line: int, column: int = 0) -> None:
+        """Go to a line and a column of the stored text (search results count columns
+        there); in a formatted script the column moves by the indentation added."""
+        if self.formatted:
+            block = self.editor.document().findBlockByNumber(max(line - 1, 0))
+            shown = block.text()
+            column += len(shown) - len(shown.lstrip(" \t"))
+        self.editor.go_to_line(line, column)
 
     def find_text(self, text: str) -> None:
         self.findbar.open_find(False)

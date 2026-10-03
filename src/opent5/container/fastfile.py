@@ -387,9 +387,28 @@ def padded_length(end: int) -> int:
     return (want + FILE_ALIGNMENT - 1) // FILE_ALIGNMENT * FILE_ALIGNMENT
 
 
-def read_fastfile(data: bytes, key: bytes = SALSA20_KEY) -> FastFile:
+def count_chunks(data: bytes) -> int:
+    """How many chunks the size fields announce (no decryption): for progress displays."""
+    offset, count = CHUNKS_OFFSET, 0
+    while offset + CHUNK_SIZE_FIELD.size <= len(data):
+        offset += ring_gap(offset)
+        if offset + CHUNK_SIZE_FIELD.size > len(data):
+            break
+        (size,) = CHUNK_SIZE_FIELD.unpack_from(data, offset)
+        offset += CHUNK_SIZE_FIELD.size
+        if size == 0 or size > XCHUNK_SIZE:
+            break
+        offset += size
+        count += 1
+    return count
+
+
+def read_fastfile(data: bytes, key: bytes = SALSA20_KEY, progress=None) -> FastFile:
+    """Decrypt and inflate every chunk. ``progress(stage, done, total)``, when given, is
+    called as chunks are read (total from the size fields)."""
     check_header(data)
     header = bytes(data[:CHUNKS_OFFSET])
+    total = count_chunks(data) if progress is not None else 0
     table = NonceTable(zone_name_of(header))
     chunks: list[Chunk] = []
     offset = CHUNKS_OFFSET
@@ -431,6 +450,8 @@ def read_fastfile(data: bytes, key: bytes = SALSA20_KEY) -> FastFile:
         offset += size
 
         nonce = table.nonce(stream)
+        if progress is not None and len(chunks) % 8 == 0:
+            progress("Decrypting and inflating", len(chunks), total)
         plaintext = crypt(stored, key, nonce)
         table.advance(stream, plaintext)
         try:
@@ -491,6 +512,7 @@ def assemble(
     key: bytes = SALSA20_KEY,
     total_bytes: int = 0,
     gaps: dict[int, bytes] | None = None,
+    progress=None,
 ) -> bytes:
     """Frame, encrypt and chain already-deflated chunks into a fastfile.
 
@@ -525,6 +547,8 @@ def assemble(
                 f"is {XCHUNK_SIZE}"
             )
         nonce = table.nonce(stream)
+        if progress is not None and index % 8 == 0:
+            progress("Encrypting", index, len(deflated))
         field(len(plaintext))
         out += crypt(plaintext, key, nonce)
         table.advance(stream, plaintext)
