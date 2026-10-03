@@ -5,12 +5,13 @@
   "license": "GPL-3.0-or-later",
   "description": "Open, browse, edit and rebuild Black Ops (T5) PS3 fastfiles",
   "scripts": {
-    "setup": "python3 -m virtualenv .venv && .venv/bin/pip install -r requirements-dev.txt",
+    "setup": ".venv/bin/python -m pip install -r requirements-dev.txt -r requirements-gui.txt",
     "test": ".venv/bin/python -m pytest tests -m 'not slow'",
     "test:all": ".venv/bin/python -m pytest tests",
     "lint": ".venv/bin/ruff check src tests tools && .venv/bin/ruff format --check src tests tools",
     "format": ".venv/bin/ruff format src tests tools",
     "build": ".venv/bin/python -m compileall -q src && .venv/bin/python -m opent5 --version",
-    "opent5": ".venv/bin/python -m opent5"
+    "opent5": ".venv/bin/python -m opent5",
+    "gui": ".venv/bin/python -m opent5.gui"
   }
 }
