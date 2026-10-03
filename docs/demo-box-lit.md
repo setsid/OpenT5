@@ -99,3 +99,14 @@ Run: Team Deathmatch or Free-for-all, splitscreen or private match, as before.
 
 Please report which rows match, the output used, a screenshot inside the room with the
 minimap visible, and any RPCS3 log lines about fastfile, DB, script or RSX errors.
+
+## Result in RPCS3 (2026-10-03, local splitscreen)
+
+- Team Deathmatch: floor, walls and the ceiling hotspot lit correctly from the box's own
+  lightmaps.
+- The viewmodel is near-black (with Nuketown's grid it was teal): the light grid samples too
+  dark or from the wrong place.
+- The ceiling is dull grey, not cream.
+- Minimap: the grey room square and the player arrow show, but the letter-grid labels
+  (A2, B3, C4 ...) are still drawn over it; in one run the square looked rotated about 45
+  degrees.

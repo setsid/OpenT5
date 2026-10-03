@@ -105,3 +105,10 @@ zone_source/english/assetlist/mp_opent5box_modes.csv
 
 Work folder `C:\o5\modes\`: `mp_opent5box_modes.map` and the three `.bat` files
 (`_cod2map`, `_cod2rad`, `_linker`).
+
+## Result in RPCS3 (2026-10-03, local splitscreen)
+
+- Search and Destroy: the round starts ("DESTROY TARGET A OR B", the round timer runs) but no
+  A/B icons appear on the HUD or minimap, and there are no bomb site models and no bomb.
+- Domination: hangs on the load screen at "Awaiting challenge...0"; the local server never
+  finishes starting the map.
