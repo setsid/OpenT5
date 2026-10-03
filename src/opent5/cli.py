@@ -28,6 +28,10 @@ from pathlib import Path
 from typing import Any
 
 from opent5 import APP_NAME, LICENCE_NOTICE, __version__
+from opent5.index.cli import COMMANDS as INDEX_COMMANDS
+from opent5.index.cli import register as register_index
+from opent5.patch import cmd_patch, text_patch
+from opent5.patch import register as register_patch
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
 
@@ -789,7 +793,9 @@ COMMANDS = {
     "verify": (cmd_verify, text_verify),
     "rebuild": (cmd_rebuild, text_rebuild),
     "convert": (cmd_convert, text_convert),
+    "patch": (cmd_patch, text_patch),
 }
+COMMANDS.update(INDEX_COMMANDS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -931,6 +937,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="build this material anew even when the base has one of that name (repeat; "
         "all for every material)",
     )
+
+    register_patch(sub)
+    register_index(sub, parents=[common])
     return parser
 
 
@@ -942,10 +951,13 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
     from opent5.edit.types import EditError
 
-    for attr in ("zone", "against"):
-        value = getattr(args, attr, None)
-        if value:
-            setattr(args, attr, zone_by_name(value))
+    # search/index/patch take their own arguments (a glob, patch files); only the
+    # zone-path commands resolve a bare name through the configured folders.
+    if args.command not in ("search", "index", "patch"):
+        for attr in ("zone", "against"):
+            value = getattr(args, attr, None)
+            if value:
+                setattr(args, attr, zone_by_name(value))
     run, render = COMMANDS[args.command]
     as_json = getattr(args, "json", False)
     try:

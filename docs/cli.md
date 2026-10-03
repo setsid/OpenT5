@@ -345,3 +345,30 @@ docs/research/map-registration.md lists them); `--copy-pak` writes `mp_NAME.pak`
 game offers maps only from that table, so a custom map cannot be started without it (see
 docs/convert.md, the own-files rule, and docs/demo-box-named.md). The source patch_mp.ff is
 only read.
+
+## patch
+
+Share a mod as the difference from a stock zone, without redistributing game
+files. A patch holds only the changed assets; applying it checks the user's copy
+is the right source and reproduces the edited zone.
+
+    opent5 patch create STOCK EDITED -o mod.o5patch
+    opent5 patch apply mod.o5patch STOCK -o OUT.ff [--no-verify]
+    opent5 patch info mod.o5patch
+
+`apply` refuses a source whose hash does not match the patch (expected vs found).
+A text edit makes a patch of a few hundred bytes. Format: docs/patch-format.md.
+
+## search, index
+
+Search names and text (scripts, string tables, localised text, entity strings)
+across every configured zone at once, from a disk cache that makes repeat
+searches instant.
+
+    opent5 search TERM [--names] [--type T] [--kind K] [--regex] [--case]
+        [--zone GLOB] [--limit N] [--rebuild]
+    opent5 index build [--rebuild]
+    opent5 index status
+
+The first search builds the cache (about a minute for 178 zones); later ones are
+instant. Details: docs/search-index.md.
