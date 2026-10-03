@@ -220,3 +220,20 @@ Limits:
   loader reads needs the type's write side to re-emit the asset; that is not a byte
   splice.
 - Deferred (LARGE_RUNTIME / PHYSICAL_RUNTIME) data may only change in place.
+
+## 9. Results in RPCS3 (reported by the user, 2026-10-03)
+
+Run in RPCS3 with the signature-patched multiplayer client, each file replacing the disc's
+`USRDIR/english/code_post_gfx_mp.ff` in turn (retail sha1 `d658721a79bc541f51d2fd2ff28c7098ce703872`
+restored afterwards).
+
+| Test | File sha1 | Change | Result |
+|---|---|---|---|
+| a | `b728d86d0a4caadcef512612f6ed8eabec272331` | same-size value, "OPENT5 EDIT1" | button shows OPENT5 EDIT1; rest of menu normal; no crash |
+| b | `43ac232529ae3f337e73a16987c163f1faa1e88d` | +3 bytes, 1,599 pointers remapped | button shows OPENT5 REMAP OK; rest of menu normal; no crash |
+| b2 | `7e00990c394ee225716b90ef41419245d1332155` | +0x80 bytes, 20,680 pointers remapped, VIRTUAL block size grown | button shows OPENT5 REMAP OK; rest of menu normal; no crash |
+
+This settles the item marked INFERRED in section 7: the post-load work the emulator skips (asset
+registration, script-string remap, RSX offset conversion) accepts remapped zones, including one
+whose header block size changed. The product remap (section 8) reproduces b and b2 byte for byte.
+Console hardware was not tested.
