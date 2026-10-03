@@ -12,9 +12,11 @@ for the ones that differ. Layouts: OpenAssetTools src/Common/Game/T5/T5_Assets.h
 ``opent5.xfile.layouts_pc``); load rules: OpenAssetTools src/ZoneCode/Game/T5/XAssets/*.txt.
 
 Covered: everything a map built by cod2map / cod2rad / linker_pc contains (rawfile,
-com_map, techset with its shaders, material, image, gfx_map, game_map_mp, col_map_mp with
-its map_ents). XModel, FX, XAnim, sound, destructibledef and glasses differ on PC and are
-not covered (a stock PC map zone is walked from its com_map onward, ``walk_range``).
+com_map, techset with its shaders, material, image, xmodel, gfx_map, game_map_mp,
+col_map_mp with its map_ents), plus the xanim and glasses differences met in stock PC
+mp_nuked, which now walks from its first asset to its last (515 assets; every block but
+RUNTIME ends at the header size, RUNTIME 0x6600 short: open, docs/convert.md 12). FX, sound
+and destructibledef parse with the PS3 handlers there.
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ from pathlib import Path
 
 from opent5.xfile.constants import AssetType, Block
 from opent5.xfile.handlers.base import REGISTRY, Handler, array, asset_ref, items, runtime
+from opent5.xfile.handlers.misc import glass_def_body
+from opent5.xfile.handlers.xanim import _data_arrays, _part, delta_part_body
 from opent5.xfile.model import XFile, _entry, parse
 from opent5.xfile.stream import Chunk, Platform, XFileError, XStream
 
@@ -326,7 +330,9 @@ class PCGfxWorldHandler(Handler):
             runtime(io, h, 0x37C + 4 * k, 0, surface_vis)
         runtime(io, h, 0x388, 0, smodel_vis)
         runtime(io, h, 0x38C, 0, surface_vis)
-        runtime(io, h, 0x390, 127, 32 * smodel_vis)
+        # lodData: align 4 (with 128 the box with 8 static models, mp_opent5box_props,
+        # ends RUNTIME 0x80 past its header size; the box without models cannot tell).
+        runtime(io, h, 0x390, 3, 32 * smodel_vis)
         array(io, h, 0x394, 1, 2 * static_surfaces, node, "sorted_surf_index", owned=True)
         array(io, h, 0x398, 3, 40 * smodels, node, "smodel_insts", owned=True)
         for s, element in items(io, h, 0x39C, 15, 80, surfaces, node, "surfaces", owned=True) or ():
@@ -355,6 +361,176 @@ class PCGfxWorldHandler(Handler):
         array(io, h, 0x428, 3, 24 * h.u32(0x424), node, "outdoor_bounds", owned=True)
         array(io, h, 0x434, 3, 56 * h.u32(0x42C), node, "hero_lights", owned=True)
         array(io, h, 0x438, 3, 24 * h.u32(0x430), node, "hero_light_tree", owned=True)
+        io.pop()
+
+
+def _pc_collision_tree(io: XStream, node: dict) -> None:
+    ct = io.load(0x28, node, "raw")
+    array(io, ct, 0x1C, 15, 16 * ct.u32(0x18), node, "nodes", owned=True)
+    array(io, ct, 0x24, 1, 2 * ct.u32(0x20), node, "leafs", owned=True)
+
+
+def _pc_xsurface(io: XStream, s: Chunk, node: dict) -> None:
+    """PC XSurface (0x44): vertInfo, verts0 (GfxPackedVertex, 32 bytes), vertList,
+    triIndices (OpenAssetTools XModel.txt reorder); verts0, vertList, collision trees and
+    triIndices are reusable."""
+    v = [s.s16(0x10 + 2 * k) for k in range(4)]
+    array(io, s, 0x18, 1, 2 * (v[0] + 3 * v[1] + 5 * v[2] + 7 * v[3]), node, "verts_blend")
+    array(io, s, 0x1C, 3, 48 * (v[0] + v[1] + v[2] + v[3]), node, "tension_data")
+    if reusable(io, s, 0x20):
+        io.alloc(15)
+        io.load(32 * s.u16(4), node, "verts0")
+    elif io.reading:
+        node["verts0"] = None
+    lists = None
+    if reusable(io, s, 0x28):
+        io.alloc(3)
+        lists = io.items(12, s.u8(1), node, "vert_lists", "PC.XRigidVertList")
+    elif io.reading:
+        node["vert_lists"] = None
+    for vl, element in lists or ():
+        if reusable(io, vl, 8):
+            io.alloc(3)
+            _pc_collision_tree(
+                io, element.setdefault("collision_tree", {"_t": "PC.XSurfaceCollisionTree"})
+            )
+    if reusable(io, s, 0xC):
+        io.alloc(15)
+        io.load(6 * s.u16(6), node, "tri_indices")
+    elif io.reading:
+        node["tri_indices"] = None
+
+
+def _pc_brush(io: XStream, node: dict) -> None:
+    b = io.load(0x60, node, "raw")
+    sides = items(io, b, 0x20, 3, 0xC, b.u32(0x1C), node, "sides", kind="PC.cbrushside_t")
+    for side, element in sides or ():
+        if reusable(io, side, 0):
+            io.alloc(3)
+            io.load(0x14, element, "plane")
+    if reusable(io, b, 0x58):
+        io.alloc(3)
+        io.load(0xC * b.u32(0x54), node, "verts")
+    if reusable(io, b, 0x5C):
+        io.alloc(3)
+        io.load(0x14 * b.u32(0x1C), node, "planes")
+
+
+def _pc_collmap(io: XStream, c: Chunk, node: dict) -> None:
+    geom_list = array(io, c, 0, 3, 0xC, node, "geom_list")
+    if geom_list is None:
+        return
+    geoms = items(
+        io, geom_list, 4, 15, 0x44, geom_list.u32(0), node, "geoms", kind="PC.PhysGeomInfo"
+    )
+    for g, geom in geoms or ():
+        if reusable(io, g, 0):
+            io.alloc(15)
+            _pc_brush(io, geom.setdefault("brush", {"_t": "PC.BrushWrapper"}))
+
+
+@_pc
+class PCXModelHandler(Handler):
+    """XModel (0xfc on PC; 0xf8 on PS3): OpenAssetTools T5 XModel and
+    src/ZoneCode/Game/T5/XAssets/XModel.txt. lodInfo is 4 x 32 bytes from +0x28 (PS3 4 x
+    28), collSurfs +0xac (0x2c each with collTris, 48 x numCollTris), boneInfo +0xb8,
+    highMipBounds +0xdc, physPreset +0xec, collmaps +0xf4 (count u8 +0xf0),
+    physConstraints +0xf8."""
+
+    kind = "PC.XModel"
+    asset_type = AssetType.XMODEL
+    header_size = 0xFC
+
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        bones, roots, surf_count = h.u8(4), h.u8(5), h.u8(6)
+        for off, mask, size, key in (
+            (0x8, 1, 2 * bones, "bone_names"),
+            (0xC, 0, bones - roots, "parent_list"),
+            (0x10, 1, 8 * (bones - roots), "quats"),
+            (0x14, 3, 16 * (bones - roots), "trans"),
+            (0x18, 0, bones, "part_classification"),
+            (0x1C, 3, 0x20 * bones, "base_mat"),
+        ):
+            if reusable(io, h, off):
+                io.alloc(mask)
+                io.load(size, node, key)
+            elif io.reading:
+                node[key] = None
+        surfs = items(io, h, 0x20, 3, 0x44, surf_count, node, "surfs", True, "PC.XSurface")
+        for s, surface in surfs or ():
+            _pc_xsurface(io, s, surface)
+        materials = items(io, h, 0x24, 3, 4, surf_count, node, "materials", True, "XModelMaterial")
+        for m, element in materials or ():
+            asset_ref(io, m, 0, AssetType.MATERIAL, element, "material")
+        coll = items(io, h, 0xAC, 3, 0x2C, h.s32(0xB0), node, "coll_surfs", True, "PC.CollSurf")
+        for c, element in coll or ():
+            array(io, c, 0, 3, 48 * c.s32(4), element, "coll_tris", owned=True)
+        array(io, h, 0xB8, 3, 0x2C * bones, node, "bone_info", owned=True)
+        array(io, h, 0xDC, 3, 0x10 * surf_count, node, "high_mip_bounds", owned=True)
+        asset_ref(io, h, 0xEC, AssetType.PHYSPRESET, node, "phys_preset")
+        collmaps = items(io, h, 0xF4, 3, 4, h.u8(0xF0), node, "collmaps", True, "PC.Collmap")
+        for c, element in collmaps or ():
+            _pc_collmap(io, c, element)
+        asset_ref(io, h, 0xF8, AssetType.PHYSCONSTRAINTS, node, "phys_constraints")
+        io.pop()
+
+
+@_pc
+class PCGlassesHandler(Handler):
+    """Glasses (56): as PS3 but workMemory (+0xc) is never loaded on PC (OpenAssetTools
+    src/ZoneCode/Game/T5/XAssets/Glasses.txt ``set condition workMemory never``); the
+    PS3 RUNTIME reservation runs PC mp_nuked's asset 513 past the stream end."""
+
+    kind = "Glasses"
+    asset_type = AssetType.GLASSES
+    header_size = 56
+
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        for g, glass in items(io, h, 8, 3, 124, h.u32(4), node, "glasses", True, "Glass") or ():
+            if reusable(io, g, 0):
+                io.alloc(3)
+                if io.reading:
+                    glass["glass_def"] = {"_t": "GlassDef"}
+                glass_def = glass["glass_def"]
+                glass_def_body(io, io.load(60, glass_def, "raw"), glass_def)
+            elif io.reading:
+                glass["glass_def"] = None
+            array(io, g, 0x40, 3, 8 * g.u8(0x3D), glass, "outline", owned=True)
+        io.pop()
+
+
+@_pc
+class PCXAnimHandler(Handler):
+    """XAnimParts (104): as PS3 but boneCount has 10 entries (PS3 12), so the bone
+    names count is boneCount[9] at u8 +0x21 (OpenAssetTools XAnimParts.txt ``set count
+    names boneCount[9]``) and notifyCount is u8 +0x22 (PS3 +0x23 and +0x24). PC mp_nuked
+    asset 512 (0x4b2e60c): +0x21 = 1 name (``6701``), +0x22 = 1 notify (``0302 0000
+    0000803f``: name 0x203, time 1.0); with the PS3 offsets the asset ends 2 bytes late
+    and the glasses header (``ffffffff 3e000000 ffffffff``) at 0x4b2edc6 is missed."""
+
+    kind = "XAnimParts"
+    asset_type = AssetType.XANIM
+    header_size = 104
+
+    def body(self, io: XStream, h: Chunk, node: dict) -> None:
+        io.push(Block.VIRTUAL)
+        io.string(h, 0, node, "name")
+        numframes = h.u16(14)
+        array(io, h, 64, 1, 2 * h.u8(33), node, "names", owned=True)
+        array(io, h, 96, 3, 8 * h.u8(34), node, "notify", owned=True)
+        delta = _part(io, h, 100, node, "delta_part", "XAnimDeltaPart")
+        if delta is not None:
+            delta_part_body(io, numframes, delta)
+        for key, off, count, mask, size in _data_arrays(h):
+            array(io, h, off, mask, size * count, node, key, owned=True)
+        if numframes <= 255:
+            array(io, h, 92, 0, h.u32(44), node, "indices", owned=True)
+        else:
+            array(io, h, 92, 1, 2 * h.u32(44), node, "indices", owned=True)
         io.pop()
 
 
