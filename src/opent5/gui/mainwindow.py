@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import traceback
 from pathlib import Path
 
@@ -39,6 +40,8 @@ from opent5.gui.tree import human_size
 from opent5.gui.zonepage import VIEWS, ZonePage
 
 MAX_RECENT = 12
+
+_log = logging.getLogger(__name__)
 
 
 class _Signals(QObject):
@@ -244,9 +247,14 @@ class MainWindow(QMainWindow):
         self._update_state()
 
         # -- update checks (owned by opent5.gui.updates; __main__ calls .start()) ----------
-        from opent5.gui import updates
+        # Updates are optional: if that module cannot load, the editor still starts.
+        try:
+            from opent5.gui import updates
 
-        self.updates = updates.attach(self)
+            self.updates = updates.attach(self)
+        except Exception as exc:  # noqa: BLE001
+            self.updates = None
+            _log.warning("update checks disabled: %r", exc)
 
     # -- actions --------------------------------------------------------------------------
 

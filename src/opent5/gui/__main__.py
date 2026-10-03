@@ -59,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
         window._apply_theme(args.theme)
     window.resize(1440, 900)
     window.show()
-    if not args.screenshot:
+    if not args.screenshot and window.updates is not None:
         window.updates.start()  # background update check (opent5.gui.updates)
     if args.zones:
         window.open_paths(args.zones)
