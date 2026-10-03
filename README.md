@@ -35,6 +35,16 @@ python.org Python 3.12 (not the Store build, which breaks the 260-character path
 limit) and writes `dist\OpenT5.exe`. Put a `.env` next to the exe to list your zone
 folders on the start page.
 
+Then smoke-test the built exe itself (not the source tree): it opens the zones
+offscreen, shows one asset of every type in every view, and fails on any view that
+could not load:
+
+    .venv/bin/python tools/exe_smoke.py 'C:\o5\src\dist\OpenT5.exe' \
+        'C:\...\english\mp_nuked.ff' 'C:\...\english\zombietron.ff'
+
+`OpenT5.exe --screenshots DIR` (with `QT_QPA_PLATFORM=offscreen`) renders the review
+screenshots from the exe.
+
 ## Layout
 
     src/opent5/container   the signed, encrypted, compressed fastfile container
