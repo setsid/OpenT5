@@ -11,13 +11,12 @@ when the test override is set); tests/test_no_network.py enforces both.
 
 from __future__ import annotations
 
-#: "owner/name" of the GitHub repository whose releases are checked. Empty: checking is
-#: disabled (logged once per check), which is the state until it is set.
-REPO = ""
+#: "owner/name" of the GitHub repository whose releases are checked. Empty disables checking.
+REPO = "setsid/OpenT5"
 
-#: The release signing public key (the base64 line `npm run keygen` prints). Empty:
-#: checking is disabled, since nothing could be verified.
-PUBLIC_KEY = ""
+#: The release signing public key (the base64 line `npm run keygen` prints). Empty disables
+#: checking, since nothing could be verified.
+PUBLIC_KEY = "RWSpUEfdF7q9tnP+cq9yBCwr+U6AfYFPe+2tP7hNeaEN6EXoWr1ZgEdq"
 
 #: The GitHub REST API, which lists releases and serves asset downloads.
 API_HOST = "api.github.com"
