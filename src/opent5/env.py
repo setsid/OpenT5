@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-KEYS = ("OPENT5_ZONES", "OPENT5_PATCH_ZONES", "OPENT5_DLC_ZONES", "OPENT5_ELF")
+KEYS = ("OPENT5_ZONES", "OPENT5_PATCH_ZONES", "OPENT5_DLC_ZONES", "OPENT5_ELF", "OPENT5_WADS")
 
 
 def load(path: Path | None = None) -> dict[str, str]:
