@@ -10,7 +10,7 @@ allowed for this track). Prototype code is in the track scratch directory (`p6/`
 Conventions: "PC zone" is the zlib-inflated payload of a PC `.ff` (from byte 12). "PS3 zone"
 is the inflated XFile stream. Offsets are into those streams. Type numbers are PS3 numbers
 (xfile.md section 5) unless "PC type" is written. "Box" is the map built here,
-`mp_opent5box`. Scratch is `/tmp/claude-1000/-home-cbolland-opent5/<session>/scratchpad/p6/`.
+`mp_opent5box`. Scratch is `a scratch folder`.
 
 Contents
 

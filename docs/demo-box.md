@@ -30,7 +30,7 @@ Made with:
 ## Install
 
 1. Back up the retail file first: copy
-   `C:\Users\bolst\Desktop\rpcs3\BLES01031\PS3_GAME\USRDIR\english\mp_nuked.ff`
+   `<OPENT5_ZONES>\mp_nuked.ff`
    to `mp_nuked.ff.retail.bak` in the same folder (or anywhere safe). Check its sha1 is the
    retail one above.
 2. Copy `out/demo/e_box/mp_nuked.ff` over that `mp_nuked.ff` (same folder, same name).

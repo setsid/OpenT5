@@ -28,7 +28,7 @@ decision.
 ## Install (the map's own files)
 
 1. Copy `mp_opent5box.ff` and `mp_opent5box.pak` into
-   `C:\Users\bolst\Desktop\rpcs3\BLES01031\PS3_GAME\USRDIR\english` (beside `mp_nuked.ff`;
+   `<OPENT5_ZONES>` (beside `mp_nuked.ff`;
    new names, nothing is overwritten). Leave `mp_nuked.ff` and `mp_nuked.pak` as they are
    (retail sha1s in docs/demo-box.md).
 2. Use the signature-patched multiplayer client.

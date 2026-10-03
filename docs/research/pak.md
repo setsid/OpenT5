@@ -233,7 +233,7 @@ image's pixels at the same size changes none of these fields, so the zone stays 
 ## 8. Inventory and round trip of every pak on the machine
 
 Searched recursively: the disc USRDIR (english and french), the update USRDIR, the HDD/DLC
-root of `.env` (`/home/cbolland/bo1-zones/hdd`: no paks; `dlc1..5.edat.off` there are 336-byte
+root of `.env` (`<OPENT5_DLC_ZONES>`: no paks; `dlc1..5.edat.off` there are 336-byte
 NPD licence headers, not paks), and the WAD dump folder. A wider search of the Windows user
 folder found no other file starting with `pak2`. DLC map paks exist only inside the
 unextracted DLC package. 54 paks, 11.9 GB.
