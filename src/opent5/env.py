@@ -7,15 +7,18 @@ checkout without the game still runs its unit tests.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+#: In the packaged build, .env sits next to OpenT5.exe.
+ENV_HOME = Path(sys.executable).parent if getattr(sys, "frozen", False) else ROOT
 KEYS = ("OPENT5_ZONES", "OPENT5_PATCH_ZONES", "OPENT5_DLC_ZONES", "OPENT5_ELF", "OPENT5_WADS")
 
 
 def load(path: Path | None = None) -> dict[str, str]:
     values: dict[str, str] = {}
-    source = path or ROOT / ".env"
+    source = path or ENV_HOME / ".env"
     if source.is_file():
         for line in source.read_text().splitlines():
             line = line.strip()
