@@ -22,9 +22,27 @@ Game files (`.ff`, `.self`, `.elf`, `.wad`, extracted assets) are never
 committed. Tests that need real zones find them through `.env` and skip when
 they are absent.
 
+## Running
+
+    .venv/bin/opent5 info mp_nuked          # command line; see docs/cli.md
+    npm run gui                             # desktop app; see docs/gui.md
+
+## Windows build
+
+`packaging\build.bat`, run on Windows from a copy of the source at a short path
+(for example `C:\o5\src`), creates a short-path venv at `C:\o5\v` with the
+python.org Python 3.12 (not the Store build, which breaks the 260-character path
+limit) and writes `dist\OpenT5.exe`. Put a `.env` next to the exe to list your zone
+folders on the start page.
+
 ## Layout
 
     src/opent5/container   the signed, encrypted, compressed fastfile container
+    src/opent5/xfile       the zone stream: parser, writer, field schemas, references, remap
+    src/opent5/edit        the editing API shared by the CLI and the GUI (docs/edit-api.md)
+    src/opent5/export      extraction to PNG, OBJ, JSON, CSV and text
+    src/opent5/gui         the desktop app
+    src/opent5/cli.py      the command line
     docs/research          format research; every claim carries its evidence
 
 ## Licence
