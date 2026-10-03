@@ -62,3 +62,17 @@ same regression the exe view-smoke catches) runs after each GUI-affecting change
 and the full exe smoke (views + update) runs once at release prep after all
 feature work lands. If that final smoke fails, the offending change is fixed
 before the report is called done.
+
+**Verified a conflicting agent claim.** The blocky-map track reported the PC Mod
+Tools were not installed, which contradicted earlier tracks that compiled real
+PC zones. Checked first-hand: launcher_ldr.exe, cod2map.dll and linker_pc.dll are
+present in the Steam game bin folder, and the compiled PC zones are real
+(mp_opent5box_full.ff sha1 d1790102 matches the integration input). The map track
+had looked in the wrong place; nothing was fabricated. Resumed it to compile and
+convert now that the path is confirmed.
+
+**Landed:** global search index (ce8bf2e: SQLite cache, 178 zones, cold build
+~47 s then warm ~0.3 s, queries 55-230 ms) and the blocky-map generator (8b16d30:
+seeded terrain, greedy-meshed well under the uint16 brush/surface caps, 11 own
+pixel-art textures). CLI wiring for the index is deferred to a single cli.py pass
+with the mod-patch track.

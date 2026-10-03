@@ -46,6 +46,22 @@ Order to run them, newest work first:
 
 (Earlier test files g_box_lit, i_box_modes, j_pak_resize already reported; j_pak_resize passed on device.)
 
+### Global search (commit ce8bf2e)
+
+Search names and text (scripts, string tables, localised text, entity strings)
+across all 178 zones at once, cached on disk in SQLite. Cold build about 47 s,
+warm about 0.3 s, queries 55 to 230 ms. CLI and a GUI panel are wired in the
+morning's final pass.
+
+### Blocky-terrain map generator (commit 8b16d30)
+
+A seeded generator for blocky voxel terrain (hills, caves, trees, water, a small
+village), greedy-meshed so brush and surface counts sit far under the engine's
+uint16 caps, with 11 original pixel-art textures (grass, dirt, stone, sand, wood,
+leaves, water, cobble). The PC compile and PS3 conversion are building now that
+the tools path is confirmed; test files will be under opent5-hwtest/minecraft/.
+No Mojang assets or names are used; only the blocky style is shared.
+
 ## Still inferred / needs a device run
 
 - A: whether the primary-light grid is bright enough (dim vs wrong).
