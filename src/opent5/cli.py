@@ -7,6 +7,7 @@
     opent5 unpack ZONE DIR / opent5 pack DIR -o OUT
     opent5 verify ZONE [--against SOURCE]
     opent5 rebuild ZONE -o OUT
+    opent5 convert PC_MAP.ff --base mp_nuked -o OUTDIR
 
 Exit codes: 0 done, 1 failed (the message says why), 2 usage. Nothing is ever written into
 the game folders named in .env, or over the zone being read. docs/cli.md has every command
@@ -592,6 +593,54 @@ def text_rebuild(d: dict) -> str:
     )
 
 
+def cmd_convert(args) -> dict:
+    from opent5.convert.mapzone import convert_map
+    from opent5.xfile import XFileError
+
+    pc_path = Path(args.pc)
+    base = Path(zone_by_name(args.base))
+    folder = out_dir(args.output)
+    target = out_file(folder / f"{base.stem}.ff", base, pc_path)
+    started = time.perf_counter()
+    try:
+        result = convert_map(pc_path.read_bytes(), base, lighting=args.lighting)
+    except XFileError as exc:
+        raise Failure(str(exc)) from None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(result.fastfile)
+    report = result.report
+    data = {
+        "source": str(pc_path),
+        "base": str(base),
+        "base_sha1": sha1_of(base),
+        "output": str(target),
+        "sha1": report["zone"]["sha1"],
+        "bytes": report["zone"]["fastfile_bytes"],
+        "checks": report["checks"],
+        "gametypes_ready": [g for g, v in report["gametypes"].items() if v == "ready"],
+        "seconds": round(time.perf_counter() - started, 2),
+        "report": str(folder / "convert.json"),
+    }
+    (folder / "convert.json").write_text(json.dumps({**data, **report}, indent=1, default=str))
+    return data
+
+
+def text_convert(d: dict) -> str:
+    c = d["checks"]
+    return "\n".join(
+        [
+            f"converted {d['source']} onto a copy of {d['base']} (the base is only read)",
+            f"  reparse  {'exact' if c['reparse_exact'] else 'NOT EXACT'}; written back "
+            f"{'identically' if c['write_identical'] else 'DIFFERENTLY'}; "
+            f"{c['unresolved']} of {c['offset_and_alias_pointers']} pointers unresolved",
+            f"  ready    {', '.join(d['gametypes_ready'])}",
+            f"  output   {d['sha1']}  {d['output']}",
+            f"  report   {d['report']}",
+            "  the console signature no longer matches: signature-patched client only",
+        ]
+    )
+
+
 def text_generic(d: dict) -> str:
     lines = []
     for k, v in d.items():
@@ -611,6 +660,7 @@ COMMANDS = {
     "pack": (cmd_pack, text_generic),
     "verify": (cmd_verify, text_verify),
     "rebuild": (cmd_rebuild, text_rebuild),
+    "convert": (cmd_convert, text_convert),
 }
 
 
@@ -678,6 +728,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("zone")
     p.add_argument("-o", "--output", required=True)
     p.add_argument("--recompress", action="store_true", help="deflate every chunk afresh")
+
+    p = sub.add_parser(
+        "convert", parents=[common], help="convert a PC Mod Tools map into a PS3 map zone"
+    )
+    p.add_argument("pc", help="the PC map .ff (zone/English/<map>.ff of the PC Mod Tools)")
+    p.add_argument("--base", required=True, help="the PS3 map zone whose world is replaced")
+    p.add_argument("-o", "--output", required=True, help="output folder (gets <base>.ff)")
+    p.add_argument(
+        "--lighting",
+        choices=("flat", "sunlit", "keep"),
+        default="flat",
+        help="flat (default): light each surface evenly from the brightest even patch of the "
+        "base map's lightmap on the same material; sunlit: the same among sunlit patches; "
+        "keep: the PC lightmap coordinates",
+    )
     return parser
 
 

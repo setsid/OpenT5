@@ -19,6 +19,7 @@ OpenAssetTools, which is GPL-3.0.
 | src/opent5/xfile/layouts_pc.py | OpenAssetTools @ ecfdab39 | src/Common/Game/T5/T5_Assets.h | Every PC T5 struct's member names, types and offsets (32-bit), produced by compiling the header and printing each struct with gdb `ptype /o`, flattened to leaf fields | Generated data, no code; used by src/opent5/xfile/structs.py only where the PS3 struct has the PC size and its loaded pointers at the PC offsets, checked on all 178 zones (docs/research/fields.md) |
 | src/opent5/xfile/structs.py | OpenAssetTools @ ecfdab39 | src/Common/Game/T5/T5_Assets.h | Names and order of members for PS3 structs whose layout differs from PC (menuDef_t, itemDef_s, textDef_s, listBoxDef_s, editFieldDef_s, cbrush_t, BrushWrapper, GfxLight, CollisionAabbTree, XSurfaceCollisionNode, MaterialConstantDef, GfxSurface, ItemDefType values) | Names only; PS3 offsets from t5mp.elf, the zones and docs/research |
 | src/opent5/export/ (path nodes), docs/extract.md | OpenAssetTools @ ecfdab39 | src/Common/Game/T5/T5_Assets.h | pathnode_constant_t field names and order | Names only; offsets confirmed against the loader and mp_nuked data |
+| src/opent5/convert/pc.py (PC handlers) | OpenAssetTools @ ecfdab39 | src/Common/Game/T5/T5_Assets.h, src/ZoneCode/Game/T5/ | Field names and the PC load order the PC handlers follow | No code copied; layouts and order confirmed by walking the PC box zone and PC mp_nuked exactly (docs/research/box-map.md) |
 
 ## Derived from game data, not copied
 
