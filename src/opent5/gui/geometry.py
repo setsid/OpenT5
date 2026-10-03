@@ -13,8 +13,10 @@ triangles, XModel LOD0 surfaces through the XSurface vertex formats. Results
 are cached per parsed zone.
 
 ``MeshData.groups`` holds one id per triangle: the surface index (world,
-model), the brush index (collision brushes), -1 (collision triangles) or
-``STATIC_MODEL`` (a placed static model's LOD0, ``world_models``).
+model), the brush index (collision brushes) or -1 (collision triangles). For
+``world_models`` the world surfaces keep their indices and each placed static
+model's surfaces take the next ids after them, so every id (world or placed) is
+an index into ``MeshData.materials`` for the shaded, textured renderer.
 """
 
 from __future__ import annotations
@@ -27,7 +29,6 @@ from opent5.gui.backend import EditError, MeshData
 from opent5.xfile.constants import AssetType as T
 
 WORLD_TYPES = (T.GFX_MAP,)
-STATIC_MODEL = -2
 COLLISION_TYPES = (T.COL_MAP_MP, T.COL_MAP_SP)
 KIND_OF_TYPE = {T.GFX_MAP: "world", T.COL_MAP_MP: "collision", T.COL_MAP_SP: "collision",
                 T.XMODEL: "model"}  # fmt: skip
@@ -35,6 +36,10 @@ KIND_OF_TYPE = {T.GFX_MAP: "world", T.COL_MAP_MP: "collision", T.COL_MAP_SP: "co
 #: Per parsed zone: an exporter shell (index, resolver, model cache) and the meshes.
 _helpers: dict[int, tuple[Any, Any]] = {}
 _cache: dict[tuple[int, str, Any], MeshData] = {}
+#: Decoded, downscaled colour maps, keyed by (id(xfile), material name). None = none usable.
+_texcache: dict[tuple[int, str], np.ndarray | None] = {}
+#: Largest colour-map side kept for the shaded preview (GL mip-maps the rest down).
+TEXTURE_MAX = 256
 
 
 def kind_for_type(asset_type: int) -> str | None:
@@ -56,6 +61,7 @@ def _helper(xfile):
     h.model_meshes = {}
     h.script_strings = xfile.script_strings
     _helpers.clear()  # one zone's helper at a time; it holds the parse alive
+    _texcache.clear()
     _helpers[id(xfile)] = (xfile, h)
     return h
 
@@ -113,6 +119,89 @@ def model_mesh(zdoc, node, name: str) -> MeshData:
     return _cache[key]
 
 
+# -- textures for the shaded renderer --------------------------------------------------------
+
+
+def _colormap_nodes(h) -> dict[str, Any]:
+    """Material name -> its colorMap image node (or None), from the material's textures."""
+    from opent5.export.zone import SAMPLER_BY_HASH
+    from opent5.xfile.schema import view
+
+    out: dict[str, Any] = {}
+    for name, node in h.index.of(T.MATERIAL).items():
+        chosen = None
+        for t in node.get("textures") or []:
+            if SAMPLER_BY_HASH.get(view(t).fields.nameHash) == "colorMap":
+                chosen = h.resolver.node(t.get("image"))
+                break
+        out[name] = chosen
+    return out
+
+
+def _downscale(rgba: np.ndarray, maxdim: int = TEXTURE_MAX) -> np.ndarray:
+    h, w = rgba.shape[:2]
+    factor = max(1, int(max(h, w) // maxdim))
+    if factor > 1:
+        rgba = rgba[::factor, ::factor]
+    return np.ascontiguousarray(rgba, np.uint8)
+
+
+def _decode_colormap(xfile, name: str, node, paks) -> np.ndarray | None:
+    key = (id(xfile), name)
+    if key in _texcache:
+        return _texcache[key]
+    from opent5.export.images import ImageError, decode_image
+
+    rgba = None
+    if node is not None:
+        try:
+            decoded = decode_image(node, paks)
+            if decoded.layers:
+                rgba = _downscale(decoded.layers[0][1])
+        except (ImageError, ValueError, KeyError, IndexError, TypeError):
+            rgba = None
+    _texcache[key] = rgba
+    return rgba
+
+
+def textures(doc, mesh: MeshData):
+    """Decode each material's colour map and map it to the mesh's triangles.
+
+    Returns ``(tri_tex, texture_list)``: ``tri_tex[i]`` is the index into
+    ``texture_list`` for triangle ``i`` (its surface's material's colour map), or
+    -1 where there is none (no material, an undecodable colour map, or a streamed
+    texture whose .pak is absent). Textures that cannot be decoded fall back to a
+    flat shade this way. Pure CPU, safe to call on a worker thread."""
+    from opent5.export.images import PakSet
+    from opent5.gui.backend import pak_dirs
+
+    xfile = _xfile(doc)
+    mats = mesh.materials
+    if not mats or mesh.groups is None:
+        return np.full(len(mesh.triangles), -1, np.int32), []
+    h = _helper(xfile)
+    cmaps = _colormap_nodes(h)
+    paks = PakSet(doc.zone_name, pak_dirs(doc.path))
+    try:
+        slot_of_name: dict[str, int] = {}
+        texture_list: list[np.ndarray] = []
+        for name in dict.fromkeys(m for m in mats if m):
+            rgba = _decode_colormap(xfile, name, cmaps.get(name), paks)
+            if rgba is not None:
+                slot_of_name[name] = len(texture_list)
+                texture_list.append(rgba)
+    finally:
+        paks.close()
+    group_slot = np.full(len(mats), -1, np.int32)
+    for i, name in enumerate(mats):
+        group_slot[i] = slot_of_name.get(name, -1) if name else -1
+    groups = np.asarray(mesh.groups)
+    valid = (groups >= 0) & (groups < len(mats))
+    tri_tex = np.full(len(groups), -1, np.int32)
+    tri_tex[valid] = group_slot[groups[valid]]
+    return tri_tex, texture_list
+
+
 def world_mesh(xfile, asset) -> MeshData:
     from opent5.export import vertex as vx
     from opent5.xfile.schema import view
@@ -127,12 +216,15 @@ def world_mesh(xfile, asset) -> MeshData:
     except ValueError as exc:
         raise EditError(f"world mesh of {g.get('name')}: {exc}") from exc
     groups = np.repeat(np.arange(len(ranges), dtype=np.int32), [n for _a, n in ranges])
+    resolver = _helper(xfile).resolver
+    materials = [resolver.name(s.get("material")) for s in g["surfaces"]]
     return MeshData(
         m.positions.astype(np.float32),
         m.triangles.astype(np.int32),
         m.normals,
         m.uvs,
         groups,
+        materials=materials,
         label=g.get("name") or asset.name or "world",
         notes=[f"{len(surfs)} surfaces"],
     )
@@ -143,8 +235,16 @@ def with_static_models(xfile, asset, world: MeshData) -> MeshData:
     (``ZoneExporter.static_models``: origin + scale x position @ axes)."""
     h = _helper(xfile)
     placements = h.static_models(asset.data)
+    n_world = len(world.positions)
     positions, tris, groups = [world.positions], [world.triangles], [world.groups]
-    at, placed, missing = len(world.positions), 0, 0
+    zeros_uv = np.zeros((n_world, 2), np.float32)
+    zeros_n = np.zeros((n_world, 3), np.float32)
+    world_uvs = world.uvs if world.uvs is not None else zeros_uv
+    world_normals = world.normals if world.normals is not None else zeros_n
+    normals, uvs = [world_normals.astype(np.float32)], [world_uvs.astype(np.float32)]
+    materials = list(world.materials or [])
+    group_id = len(materials)
+    at, placed, missing = n_world, 0, 0
     for p in placements:
         node = h.index.get(T.XMODEL, p["model"])
         try:
@@ -155,11 +255,20 @@ def with_static_models(xfile, asset, world: MeshData) -> MeshData:
             missing += 1
             continue
         axes, origin = np.array(p["axes"]), np.array(p["origin"])
-        for _mat, m in parts:
+        for mat, m in parts:
             positions.append((origin + p["scale"] * (m.positions @ axes)).astype(np.float32))
             tris.append((m.triangles + at).astype(np.int32))
-            groups.append(np.full(len(m.triangles), STATIC_MODEL, np.int32))
-            at += len(m.positions)
+            groups.append(np.full(len(m.triangles), group_id, np.int32))
+            n = len(m.positions)
+            if m.normals is not None:
+                normals.append((m.normals @ axes).astype(np.float32))
+            else:
+                normals.append(np.zeros((n, 3), np.float32))
+            muv = m.uvs.astype(np.float32) if m.uvs is not None else np.zeros((n, 2), np.float32)
+            uvs.append(muv)
+            materials.append(mat)
+            group_id += 1
+            at += n
         placed += 1
     notes = [*world.notes, f"{placed} static models"]
     if missing:
@@ -167,7 +276,10 @@ def with_static_models(xfile, asset, world: MeshData) -> MeshData:
     return MeshData(
         np.concatenate(positions),
         np.concatenate(tris),
+        normals=np.concatenate(normals),
+        uvs=np.concatenate(uvs),
         groups=np.concatenate(groups),
+        materials=materials,
         label=world.label,
         notes=notes,
     )
@@ -228,16 +340,26 @@ def _model(xfile, node, name: str) -> MeshData:
         raise EditError(f"model {name}: LOD0 does not decode ({exc})") from exc
     if not parts:
         raise EditError(f"model {name}: no surfaces in LOD0")
-    positions, tris, groups, at = [], [], [], 0
-    for i, (_mat, m) in enumerate(parts):
+    positions, tris, groups, normals, uvs, materials, at = [], [], [], [], [], [], 0
+    have_normals = all(m.normals is not None for _mat, m in parts)
+    have_uvs = all(m.uvs is not None for _mat, m in parts)
+    for i, (mat, m) in enumerate(parts):
         positions.append(m.positions.astype(np.float32))
         tris.append(m.triangles + at)
         groups.append(np.full(len(m.triangles), i, np.int32))
+        if have_normals:
+            normals.append(m.normals.astype(np.float32))
+        if have_uvs:
+            uvs.append(m.uvs.astype(np.float32))
+        materials.append(mat)
         at += len(m.positions)
     return MeshData(
         np.concatenate(positions),
         np.concatenate(tris).astype(np.int32),
+        normals=np.concatenate(normals) if have_normals else None,
+        uvs=np.concatenate(uvs) if have_uvs else None,
         groups=np.concatenate(groups),
+        materials=materials,
         label=name,
         notes=[f"LOD0, {len(parts)} surfaces"],
     )

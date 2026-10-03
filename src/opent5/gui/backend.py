@@ -121,6 +121,9 @@ class MeshData:
     uvs: np.ndarray | None = None
     #: Optional (m,) int group id per triangle (surface, brush), for tinting.
     groups: np.ndarray | None = None
+    #: Optional material name per non-negative group id (materials[group]); for the
+    #: shaded, textured renderer. None where the geometry has no materials (collision).
+    materials: list | None = None
     label: str = ""
     notes: list[str] = field(default_factory=list)
 

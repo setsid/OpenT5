@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import threading
+
+import numpy as np
 from PySide6.QtCore import (
     QAbstractItemModel,
     QModelIndex,
+    QObject,
+    QRunnable,
+    QSize,
     QSortFilterProxyModel,
     Qt,
+    QThreadPool,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
@@ -20,12 +27,101 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from opent5.gui import theme
+from opent5.gui import icons, theme
 from opent5.gui.backend import Ref, ZoneDoc
+from opent5.xfile.constants import AssetType as T
 
 ROLE = Qt.ItemDataRole
 NO_INDEX = QModelIndex()
 REF_ROLE = Qt.ItemDataRole.UserRole + 1
+#: Thumbnail side in logical pixels; kept small so the tree stays dense.
+THUMB_PX = 18
+
+
+class _ThumbSignals(QObject):
+    ready = Signal(object, object)  # (asset key, scaled QImage) or (key, None)
+
+
+class _ThumbJob(QRunnable):
+    def __init__(self, loader: ThumbnailLoader, ref: Ref):
+        super().__init__()
+        self.loader, self.ref = loader, ref
+
+    def run(self) -> None:
+        self.loader.signals.ready.emit(self.ref.key, self.loader.decode(self.ref))
+
+
+class ThumbnailLoader:
+    """Decodes small image thumbnails on worker threads, lazily and once per asset.
+
+    It uses its own .pak handles (not the document's), so it never races the image
+    view or the geometry textures, and serialises its own decodes with a lock."""
+
+    def __init__(self, doc: ZoneDoc, px: int = THUMB_PX):
+        self.doc = doc
+        self.px = px
+        self.signals = _ThumbSignals()
+        self._lock = threading.Lock()
+        self._paks = None
+
+    def request(self, ref: Ref) -> None:
+        QThreadPool.globalInstance().start(_ThumbJob(self, ref))
+
+    def decode(self, ref: Ref):
+        from opent5.export.images import ImageError, PakSet, decode_image
+        from opent5.gui.backend import pak_dirs
+
+        node = self.doc.node(ref)
+        if not isinstance(node, dict):
+            return None
+        try:
+            with self._lock:
+                if self._paks is None:
+                    self._paks = PakSet(self.doc.zone_name, pak_dirs(self.doc.path))
+                decoded = decode_image(node, self._paks)
+            rgba = decoded.layers[0][1] if decoded.layers else None
+        except (ImageError, ValueError, KeyError, IndexError, TypeError):
+            return None
+        if rgba is None or not len(rgba):
+            return None
+        return _scaled_image(rgba, self.px)
+
+    def close(self) -> None:
+        if self._paks is not None:
+            self._paks.close()
+            self._paks = None
+
+
+def _scaled_image(rgba: np.ndarray, px: int) -> QImage:
+    """RGBA array -> a QImage no larger than px, keeping aspect (worker-thread safe)."""
+    arr = np.ascontiguousarray(rgba, np.uint8)
+    h, w = arr.shape[:2]
+    image = QImage(arr.tobytes(), w, h, 4 * w, QImage.Format.Format_RGBA8888).copy()
+    target = px * 2  # 2x for crisp thumbnails on high-dpi displays
+    return image.scaled(
+        target,
+        target,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
+def _thumb_icon(image: QImage, px: int) -> QIcon:
+    """Centre a scaled thumbnail on a px square with a 1px border (GUI thread)."""
+    ratio = image.width() / max(1, image.height())
+    side = px * 2
+    pm = QPixmap(side, side)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    iw = side if ratio >= 1 else round(side * ratio)
+    ih = side if ratio <= 1 else round(side / ratio)
+    x, y = (side - iw) // 2, (side - ih) // 2
+    p.drawImage(x, y, image.scaled(iw, ih))
+    p.setPen(QColor(theme.current().border))
+    p.drawRect(x, y, iw - 1, ih - 1)
+    p.end()
+    pm.setDevicePixelRatio(2.0)
+    return QIcon(pm)
 
 
 def human_size(n: int) -> str:
@@ -55,11 +151,21 @@ class AssetTreeModel(QAbstractItemModel):
         self.groups: list[_Group] = []
         self.edited: set = set()
         self._group_of: dict = {}
+        self.thumbs: dict = {}  # asset key -> QIcon thumbnail
+        self._thumb_requested: set = set()
+        self.loader: ThumbnailLoader | None = None
 
     def set_doc(self, doc: ZoneDoc | None) -> None:
         self.beginResetModel()
         self.groups = []
+        self.thumbs = {}
+        self._thumb_requested = set()
+        if self.loader is not None:
+            self.loader.close()
+        self.loader = None
         if doc is not None:
+            self.loader = ThumbnailLoader(doc)
+            self.loader.signals.ready.connect(self._thumb_ready)
             by_type: dict[str, list[Ref]] = {}
             for r in doc.all_refs:
                 by_type.setdefault(r.type_name, []).append(r)
@@ -141,6 +247,8 @@ class AssetTreeModel(QAbstractItemModel):
                 if index.column() == 0:
                     return ("* " if edited else "") + group.type_name
                 return str(len(group.refs))
+            if role == ROLE.DecorationRole and index.column() == 0:
+                return icons.type_icon(group.type_name)
             if role == ROLE.ForegroundRole:
                 if edited and index.column() == 0:
                     return QColor(t.modified)
@@ -160,6 +268,8 @@ class AssetTreeModel(QAbstractItemModel):
             return "inline" if r.inline else human_size(r.size)
         if role == REF_ROLE:
             return r
+        if role == ROLE.DecorationRole and index.column() == 0:
+            return self._decoration(r)
         if role == ROLE.ToolTipRole and index.column() == 0:
             where = "loaded inside another asset" if r.inline else f"asset {r.key}"
             off = f", zone offset 0x{r.offset:x}" if r.offset is not None else ""
@@ -172,6 +282,25 @@ class AssetTreeModel(QAbstractItemModel):
         if role == ROLE.TextAlignmentRole and index.column() == 1:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return None
+
+    def _decoration(self, r: Ref) -> QIcon:
+        """A cached thumbnail for an image asset (requested lazily on first sight),
+        else the per-type line icon."""
+        if r.type == T.IMAGE:
+            thumb = self.thumbs.get(r.key)
+            if thumb is not None:
+                return thumb
+            if r.key not in self._thumb_requested and self.loader is not None:
+                self._thumb_requested.add(r.key)
+                self.loader.request(r)
+        return icons.type_icon(r.type_name)
+
+    def _thumb_ready(self, key, image) -> None:
+        if image is not None:
+            self.thumbs[key] = _thumb_icon(image, THUMB_PX)
+        idx = self.index_of(key)
+        if idx.isValid():
+            self.dataChanged.emit(idx, idx, [ROLE.DecorationRole])
 
     def headerData(self, section, orientation, role=ROLE.DisplayRole):  # noqa: N802
         if role == ROLE.DisplayRole and orientation == Qt.Orientation.Horizontal:
@@ -228,6 +357,7 @@ class AssetTree(QWidget):
         self.view = QTreeView()
         self.view.setModel(self.proxy)
         self.view.setUniformRowHeights(True)
+        self.view.setIconSize(QSize(THUMB_PX, THUMB_PX))
         self.view.setIndentation(12)
         self.view.setRootIsDecorated(True)
         self.view.setHeaderHidden(False)

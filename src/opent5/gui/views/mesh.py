@@ -334,6 +334,30 @@ class _MeshJob(QRunnable):
         self.signals.done.emit(self.generation, mesh)
 
 
+class _SceneJob(QRunnable):
+    """Decodes the mesh's colour maps and prepares a shaded scene, off the GUI thread.
+    The GL upload and drawing stay on the GUI thread."""
+
+    def __init__(self, generation: int, doc: ZoneDoc, mesh: MeshData):
+        super().__init__()
+        self.generation, self.doc, self.mesh = generation, doc, mesh
+        self.signals = _Signals()
+
+    def run(self) -> None:
+        try:
+            from opent5.gui import geometry, glrender
+
+            tri_tex, textures = geometry.textures(self.doc, self.mesh)
+            scene = glrender.build_scene(
+                self.mesh.positions, self.mesh.triangles, self.mesh.normals,
+                self.mesh.uvs, tri_tex, textures,
+            )  # fmt: skip
+        except (EditError, ValueError, KeyError, IndexError, TypeError) as exc:
+            self.signals.failed.emit(self.generation, str(exc))
+            return
+        self.signals.done.emit(self.generation, (scene, len(textures)))
+
+
 # -- widgets ---------------------------------------------------------------------------------
 
 
@@ -350,6 +374,12 @@ class MeshCanvas(QWidget):
         self.camera = Camera()
         self.counts = (0, 0, 0)
         self.title = ""
+        self.shaded = False
+        self._gl = None  # a glrender.ShadedRenderer, made on first shaded frame
+        self._gl_failed = False
+        self._scene = None  # a glrender.Scene awaiting upload, or already uploaded
+        self._scene_uploaded = False
+        self._tex_count = 0
         self._image: QImage | None = None
         self._key = None
         self._drag = None
@@ -363,6 +393,32 @@ class MeshCanvas(QWidget):
         self.renderer.set_mesh(positions, triangles)
         self.counts = (len(positions), len(triangles), len(self.renderer.edges))
         self.title = title
+        self._scene = None  # the shaded scene is rebuilt for the new mesh
+        self._scene_uploaded = False
+        self._tex_count = 0
+        self.invalidate()
+
+    def set_shaded(self, on: bool) -> None:
+        self.shaded = on
+        self.invalidate()
+
+    def gl_available(self) -> bool:
+        if self._gl_failed:
+            return False
+        if self._gl is None:
+            from opent5.gui.glrender import ShadedRenderer
+
+            self._gl = ShadedRenderer()
+        if not self._gl.available():
+            self._gl_failed = True
+            return False
+        return True
+
+    def set_scene(self, scene, tex_count: int) -> None:
+        """A prepared shaded scene (vertices, index runs and decoded textures)."""
+        self._scene = scene
+        self._scene_uploaded = False
+        self._tex_count = tex_count
         self.invalidate()
 
     def invalidate(self) -> None:
@@ -388,17 +444,37 @@ class MeshCanvas(QWidget):
         self.camera.pitch = math.radians(30.0)
         self.frame_all(focus=True)
 
+    def _shaded_ready(self) -> bool:
+        return self.shaded and self._scene is not None and self.gl_available()
+
     def render_image(self, fast: bool = False) -> QImage:
         ratio = self.devicePixelRatioF()
         w, h = max(1, int(self.width() * ratio)), max(1, int(self.height() * ratio))
         c = self.camera
-        key = (w, h, fast, c.yaw, c.pitch, c.distance, tuple(c.target),
-               self.renderer.depth_cue, self.renderer.grid, theme.current().name)  # fmt: skip
+        shaded = self._shaded_ready()
+        key = (w, h, fast, c.yaw, c.pitch, c.distance, tuple(c.target), self.renderer.depth_cue,
+               self.renderer.grid, theme.current().name, shaded)  # fmt: skip
         if key != self._key or self._image is None:
-            self._image = self.renderer.render(self.camera, w, h, fast)
+            self._image = self._gl_image(w, h) if shaded else None
+            if self._image is None:
+                self._image = self.renderer.render(self.camera, w, h, fast)
             self._image.setDevicePixelRatio(ratio)
             self._key = key
         return self._image
+
+    def _gl_image(self, w: int, h: int) -> QImage | None:
+        if not self._scene_uploaded:
+            if not self._gl.set_scene(self._scene):
+                self._gl_failed = True
+                return None
+            self._scene_uploaded = True
+        eye, _right, up, _fwd = self.camera.basis()
+        lo, hi = self.renderer.bounds
+        diag = float(np.linalg.norm(hi - lo)) or 1024.0
+        far = self.camera.distance + diag * 1.5 + 16.0
+        near = max(self.camera.distance * 0.002, 0.5)
+        bg = _rgb(theme.current().base)
+        return self._gl.render(eye, self.camera.target, up, w, h, bg, near, far)
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
@@ -411,12 +487,17 @@ class MeshCanvas(QWidget):
         p.setFont(theme.mono_font(8))
         p.setPen(QColor(t.text_dim))
         verts, tris, edges = self.counts
-        shown = self.renderer.last_edges
+        shaded = self._shaded_ready()
+        if shaded:
+            third = f"shaded  {self._tex_count:,} textures"
+        else:
+            third = f"{self.renderer.last_edges:,} edges drawn  {self.renderer.last_ms:.0f} ms" + (
+                "  (preview)" if self._dragging else ""
+            )
         lines = [
             self.title,
             f"{verts:,} vertices  {tris:,} triangles  {edges:,} edges",
-            f"{shown:,} edges drawn  {self.renderer.last_ms:.0f} ms"
-            + ("  (preview)" if self._dragging else ""),
+            third,
         ]
         fm = p.fontMetrics()
         back = QColor(t.base)
@@ -427,7 +508,7 @@ class MeshCanvas(QWidget):
         for line in lines:
             p.drawText(8, y, line)
             y += fm.height()
-        if self.renderer.grid:
+        if self.renderer.grid and not shaded:
             step = self.renderer.grid_step
             p.drawText(8, self.height() - 8, f"grid {step:g} units")
         self._paint_gizmo(p)
@@ -514,6 +595,7 @@ class MeshView(AssetView):
         self.mesh: MeshData | None = None
         self.mesh_kind: str | None = None
         self._generation = 0
+        self._sync = False
         self._jobs: set = set()
 
         bar = QWidget(self)
@@ -521,6 +603,8 @@ class MeshView(AssetView):
         row = QHBoxLayout(bar)
         row.setContentsMargins(4, 0, 4, 0)
         row.setSpacing(2)
+        self.shaded_button = self._toggle("Shaded", False, self._set_shaded)
+        self.shaded_button.setToolTip("Shaded, textured (GPU) instead of wireframe")
         self.depth_button = self._toggle("Depth cue", True, self._set_depth)
         self.grid_button = self._toggle("Grid", True, self._set_grid)
         self.models_button = self._toggle("Static models", False, self._set_models)
@@ -536,7 +620,8 @@ class MeshView(AssetView):
         self.frame_button.clicked.connect(lambda: self.canvas.frame_all())
         self.info = QLabel("", bar)
         self.info.setObjectName("AssetMeta")
-        for w in (self.depth_button, self.grid_button, self.models_button, self.mode):
+        for w in (self.shaded_button, self.depth_button, self.grid_button,
+                  self.models_button, self.mode):  # fmt: skip
             row.addWidget(w)
         row.addStretch(1)
         row.addWidget(self.info)
@@ -580,6 +665,57 @@ class MeshView(AssetView):
         b.setChecked(on)
         b.toggled.connect(slot)
         return b
+
+    def _set_shaded(self, on: bool) -> None:
+        if on and not self.canvas.gl_available():
+            self.shaded_button.blockSignals(True)
+            self.shaded_button.setChecked(False)
+            self.shaded_button.blockSignals(False)
+            self.status.emit("Shaded view needs OpenGL, which is not available here")
+            return
+        self.depth_button.setEnabled(not on)
+        self.grid_button.setEnabled(not on)
+        if on and self.mesh is not None and self.canvas._scene is None:
+            self._build_scene()
+        self.canvas.set_shaded(on)
+
+    def _build_scene(self) -> None:
+        if self.doc is None or self.mesh is None:
+            return
+        self.status.emit("Decoding textures ...")
+        job = _SceneJob(self._generation, self.doc, self.mesh)
+        job.signals.done.connect(self._scene_done)
+        job.signals.failed.connect(self._scene_failed)
+        self._jobs.add(job.signals)
+        QThreadPool.globalInstance().start(job)
+
+    def _scene_done(self, generation: int, payload) -> None:
+        if generation != self._generation:
+            return
+        scene, tex_count = payload
+        self.canvas.set_scene(scene, tex_count)
+        self.status.emit(f"Shaded: {tex_count:,} textures")
+
+    def _scene_failed(self, generation: int, message: str) -> None:
+        if generation != self._generation:
+            return
+        self.shaded_button.blockSignals(True)
+        self.shaded_button.setChecked(False)
+        self.shaded_button.blockSignals(False)
+        self.canvas.set_shaded(False)
+        self.status.emit(f"Shaded view unavailable: {message}")
+
+    def _build_scene_sync(self) -> None:
+        if self.doc is None or self.mesh is None:
+            return
+        from opent5.gui import geometry, glrender
+
+        tri_tex, textures = geometry.textures(self.doc, self.mesh)
+        scene = glrender.build_scene(
+            self.mesh.positions, self.mesh.triangles, self.mesh.normals,
+            self.mesh.uvs, tri_tex, textures,
+        )  # fmt: skip
+        self.canvas.set_scene(scene, len(textures))
 
     def _set_depth(self, on: bool) -> None:
         self.canvas.renderer.depth_cue = on
@@ -649,12 +785,17 @@ class MeshView(AssetView):
         kind = self._world_kind(kind)
         self.mesh_kind = kind
         self.models_button.setVisible(kind in ("world", "world_models"))
+        self._sync = True
         try:
             mesh = doc.mesh(kind, ref)
         except (EditError, ValueError, KeyError, IndexError, TypeError) as exc:
             self._failed(self._generation, str(exc))
+            self._sync = False
             return
         self._done(self._generation, mesh)
+        if self.shaded_button.isChecked() and self.mesh is not None:
+            self._build_scene_sync()
+        self._sync = False
 
     def _done(self, generation: int, mesh: MeshData) -> None:
         if generation != self._generation:
@@ -669,6 +810,8 @@ class MeshView(AssetView):
         self._apply_mode()
         self.stack.setCurrentWidget(self.canvas)
         self.canvas.reset_camera()
+        if self.shaded_button.isChecked() and not self._sync:
+            self._build_scene()
 
     def _failed(self, generation: int, message: str) -> None:
         if generation != self._generation:

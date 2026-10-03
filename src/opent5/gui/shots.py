@@ -104,6 +104,72 @@ class Shooter:
         settle(self.app, 0.1)
         return ref, view
 
+    def shaded(self, name: str, page, asset: str, type_name: str) -> None:
+        """The geometry view in shaded, textured mode (the GPU path, offscreen)."""
+        ref = page.find_ref(asset, type_name)
+        if ref is None:
+            print(f"  skip: {name} has no {type_name} {asset}")
+            return
+        page.open_ref(ref, "geometry")
+        view = page.current_view()
+        if not view.canvas.gl_available():
+            print(f"  skip: {name} needs OpenGL, not available here")
+            return
+        view.shaded_button.setChecked(True)
+        view.load_sync(page.doc, ref)
+        settle(self.app, 0.1)
+        self.shot(name)
+        view.shaded_button.setChecked(False)
+
+    def thumbnails(self, nuked) -> None:
+        """The asset tree with image thumbnails: the image group expanded, a few rows
+        visible long enough for their thumbnails to decode on the worker."""
+        from PySide6.QtCore import Qt
+
+        self.win.tabs.setCurrentWidget(nuked)
+        nuked.show_ref(None)
+        tree = nuked.tree
+        tree.filter.clear()
+        tree.view.collapseAll()
+        image_idx = None
+        for row in range(tree.proxy.rowCount()):
+            idx = tree.proxy.index(row, 0)
+            if idx.data() == "image":
+                tree.view.expand(idx)
+                image_idx = idx
+        # Point at the streamed colour maps (names start with '~'): these carry their
+        # pixels in this zone's .pak and decode, unlike the ',' cross-zone references.
+        if image_idx is not None:
+            total = tree.proxy.rowCount(image_idx)
+            start = 0
+            for row in range(total):
+                name = tree.proxy.index(row, 0, image_idx).data() or ""
+                if name.startswith("~-g") and "_c" in name:  # streamed colour maps
+                    start = row
+                    break
+            tree.view.scrollTo(
+                tree.proxy.index(start, 0, image_idx), tree.view.ScrollHint.PositionAtTop
+            )
+            rows = range(start, min(start + 34, total))
+            for row in rows:
+                child = tree.proxy.index(row, 0, image_idx)
+                tree.model.data(tree.proxy.mapToSource(child), Qt.ItemDataRole.DecorationRole)
+            import time as _t
+
+            end = _t.perf_counter() + 15
+            target = int(len(rows) * 0.8)
+            while _t.perf_counter() < end and len(tree.model.thumbs) < target:
+                settle(self.app, 0.05)
+            tree.view.scrollTo(
+                tree.proxy.index(start, 0, image_idx), tree.view.ScrollHint.PositionAtTop
+            )
+        self.shot("23_thumbnails_dark")
+        self.theme("light")
+        settle(self.app, 0.3)
+        self.shot("23_thumbnails_light")
+        self.theme("dark")
+        tree.view.collapseAll()
+
     def run(self) -> None:
         win = self.win
         if self.wanted("00_start"):
@@ -241,6 +307,15 @@ class Shooter:
                 self.theme("light")
                 self.shot("07_world_wire_light")
                 self.theme("dark")
+            if self.wanted("07_world_shaded"):
+                self.shaded("07_world_shaded_dark", nuked,
+                            "maps/mp/mp_nuked.d3dbsp", "gfx_map")  # fmt: skip
+            if self.wanted("07_xmodel_shaded"):
+                model = next(
+                    (r for r in nuked.doc.refs if r.type_name == "xmodel" and "truck" in r.name),
+                    next(r for r in nuked.doc.refs if r.type_name == "xmodel"),
+                )
+                self.shaded("07_xmodel_shaded_dark", nuked, model.name, "xmodel")
             if self.wanted("07_collision"):
                 ref = next(r for r in nuked.doc.refs if r.type_name == "col_map_mp")
                 nuked.open_ref(ref, "geometry")
@@ -260,6 +335,8 @@ class Shooter:
                 self.shot("07_map_ents_dark")
             if self.wanted("21_image_resize") and nuked.doc.can_save:
                 self.image_resize(nuked)
+            if self.wanted("23_thumbnails"):
+                self.thumbnails(nuked)
 
         ui = self.page("ui_mp")
         if ui is not None and self.wanted("05_localize_ui"):

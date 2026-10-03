@@ -12,9 +12,11 @@ from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+from opent5.xfile.constants import AssetType, type_name  # noqa: E402
 from opent5.xfile.constants import AssetType as T  # noqa: E402
 
 APP = QApplication.instance() or QApplication([])
@@ -163,6 +165,38 @@ def test_tree_counts_filter_and_markers(doc):
     doc.set_text(doc.refs[1], "set g_speed 250\n")
     m.set_edited(doc.edited_keys())
     assert m.index_of(1).data().startswith("* ")
+
+
+def test_type_icons_cover_every_asset_type():
+    for t in AssetType:
+        assert not icons.type_icon(type_name(t)).isNull()
+    assert not icons.type_icon("something_unknown").isNull()  # falls back to the generic icon
+
+
+def test_thumbnail_scaling_and_icon():
+    rgba = np.zeros((40, 20, 4), np.uint8)
+    rgba[..., 3] = 255
+    rgba[..., 0] = 200
+    img = tree._scaled_image(rgba, tree.THUMB_PX)
+    assert max(img.width(), img.height()) <= tree.THUMB_PX * 2
+    icon = tree._thumb_icon(img, tree.THUMB_PX)
+    assert not icon.isNull()
+
+
+def test_tree_decorates_types_and_requests_image_thumbnails(doc):
+    m = tree.AssetTreeModel()
+    m.set_doc(doc)
+    dec = tree.ROLE.DecorationRole
+    rawfile = next(i for i, g in enumerate(m.groups) if g.type_name == "rawfile")
+    assert not m.data(m.index(rawfile, 0), dec).isNull()  # a per-type icon on the group row
+    image = next(i for i, g in enumerate(m.groups) if g.type_name == "image")
+    img_row = m.index(0, 0, m.index(image, 0))
+    assert not m.data(img_row, dec).isNull()  # the image icon, as a placeholder
+    key = m.groups[image].refs[0].key
+    assert key in m._thumb_requested  # a thumbnail was requested once the row was seen
+    # the fake backend's node is not decodable, so no thumbnail is cached: it stays on the icon
+    m._thumb_ready(key, None)
+    assert key not in m.thumbs
 
 
 def test_search_names_and_contents(doc):

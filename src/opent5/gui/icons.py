@@ -260,6 +260,46 @@ def _lock(p):
     _poly(p, [(5.5, 7.5), (5.5, 5), (8, 2.5), (10.5, 5), (10.5, 7.5)])
 
 
+def _world(p):
+    p.drawEllipse(QRectF(2.5, 2.5, 11, 11))
+    p.drawEllipse(QRectF(6, 2.5, 4, 11))  # meridian
+    _lines(p, (2.5, 8, 13.5, 8), (3.5, 5, 12.5, 5), (3.5, 11, 12.5, 11))
+
+
+def _material(p):
+    p.drawRect(QRectF(2.5, 2.5, 11, 11))
+    _lines(p, (2.5, 13.5, 13.5, 2.5))  # swatch split
+
+
+def _sound(p):
+    _poly(p, [(2, 6), (5, 6), (8.5, 3), (8.5, 13), (5, 10), (2, 10)], True)
+    path = QPainterPath(QPointF(11, 5))
+    path.cubicTo(QPointF(13, 7), QPointF(13, 9), QPointF(11, 11))
+    p.drawPath(path)
+
+
+def _font(p):
+    _poly(p, [(4, 13), (8, 3), (12, 13)])  # letter A
+    _lines(p, (5.5, 9, 10.5, 9))
+
+
+def _fx(p):
+    _lines(p, (8, 2, 8, 14), (2, 8, 14, 8), (4, 4, 12, 12), (12, 4, 4, 12))
+
+
+def _localize(p):
+    _poly(p, [(2.5, 3), (13.5, 3), (13.5, 10.5), (7, 10.5), (4.5, 13.5), (4.5, 10.5), (2.5, 10.5)],
+          True)  # fmt: skip
+    _lines(p, (5, 6.5, 11, 6.5), (5, 8.5, 9, 8.5))
+
+
+def _asset(p):
+    _poly(p, [(3, 2.5), (3, 13.5)])  # left bracket
+    _lines(p, (3, 2.5, 5, 2.5), (3, 13.5, 5, 13.5))
+    _poly(p, [(13, 2.5), (13, 13.5)])  # right bracket
+    _lines(p, (11, 2.5, 13, 2.5), (11, 13.5, 13, 13.5))
+
+
 DRAW = {
     "link": _link,
     "lock": _lock,
@@ -283,7 +323,56 @@ DRAW = {
     "down": _down,
     "export": _export,
     "import": _import,
+    "world": _world,
+    "material": _material,
+    "sound": _sound,
+    "font": _font,
+    "fx": _fx,
+    "localize": _localize,
+    "asset": _asset,
 }
+
+#: Asset type name -> line-icon name for the asset tree. Anything unlisted gets "asset".
+TYPE_ICONS = {
+    "image": "image",
+    "material": "material",
+    "techset": "material",
+    "pixelshader": "material",
+    "vertexshader": "material",
+    "xmodel": "mesh",
+    "xmodelalias": "mesh",
+    "xmodelpieces": "mesh",
+    "mphead": "mesh",
+    "mpbody": "mesh",
+    "xanim": "mesh",
+    "gfx_map": "world",
+    "com_map": "world",
+    "game_map_mp": "world",
+    "game_map_sp": "world",
+    "ui_map": "world",
+    "col_map_mp": "world",
+    "col_map_sp": "world",
+    "map_ents": "world",
+    "rawfile": "text",
+    "menu": "text",
+    "menufile": "text",
+    "ddl": "text",
+    "stringtable": "table",
+    "texturelist": "table",
+    "packindex": "table",
+    "emblemset": "table",
+    "localize": "localize",
+    "sound": "sound",
+    "sound_patch": "sound",
+    "snddriverglobals": "sound",
+    "font": "font",
+    "fx": "fx",
+    "impactfx": "fx",
+}
+
+
+def type_icon(type_name: str) -> QIcon:
+    return icon(TYPE_ICONS.get(type_name, "asset"))
 
 _cache: dict[tuple[str, str, str], QIcon] = {}
 
