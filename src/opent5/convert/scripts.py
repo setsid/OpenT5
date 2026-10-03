@@ -218,6 +218,8 @@ def parse_entities(text: str) -> list[dict[str, str]]:
 
 #: What each gametype's script needs from the map (stock common_mp / patch_mp
 #: maps/mp/gametypes/*.gsc; docs/convert.md): (classnames, "targetname=..." entities).
+#: Presence only; ``entities.check`` applies the full rules (counts, links, gameobject
+#: filtering, trigger kinds, brush models) with the evidence for each.
 GAMETYPES = {
     "tdm": (("mp_tdm_spawn_allies_start", "mp_tdm_spawn_axis_start", "mp_tdm_spawn"), ()),
     "dm": (("mp_dm_spawn",), ()),
@@ -240,7 +242,7 @@ GAMETYPES = {
     ),
     "dom": (
         ("mp_dom_spawn_allies_start", "mp_dom_spawn_axis_start", "mp_dom_spawn"),
-        ("targetname=flag_primary",),
+        ("targetname=flag_primary", "targetname=flag_descriptor"),
     ),
     "ctf": (
         (
@@ -258,9 +260,14 @@ GAMETYPES = {
             "mp_sab_spawn_allies",
             "mp_sab_spawn_axis",
         ),
-        ("targetname=sab_bomb_pickup_trig", "targetname=sab_bomb", "targetname=sab_bomb_allies"),
+        (
+            "targetname=sab_bomb_pickup_trig",
+            "targetname=sab_bomb",
+            "targetname=sab_bomb_allies",
+            "targetname=sab_bomb_axis",
+        ),
     ),
-    "koth": (("mp_tdm_spawn",), ("targetname=hq_hardpoint",)),
+    "koth": (("mp_tdm_spawn",), ("targetname=hq_hardpoint", "targetname=radiotrigger")),
 }
 #: Every gametype needs these (maps/mp/gametypes/_spawnlogic.gsc getRandomIntermissionPoint
 #: asserts one mp_global_intermission).
