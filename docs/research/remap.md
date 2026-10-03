@@ -153,3 +153,70 @@ Other dependencies on absolute VIRTUAL positions. Checked:
   registration, script string remap, RSX offset conversion). They act on pointers the loader
   has already resolved, so they should not need block positions. INFERRED; the hardware test
   will confirm it.
+
+## 8. Product remap (`src/opent5/xfile/remap.py`)
+
+The product remap does what the oracle does, using only the parser's event log (no
+emulator). The parse logs every READ, STRING, DEFER, TAIL, PUSH, POP, ALLOC, INSERT and
+POINTER event (`src/opent5/xfile/events.py`). In code_post_gfx_mp it logs 45620 OFFSET and
+1856 ALIAS_REF pointers. The emulated loader converts the same counts: 45620 to-pointer and
+1856 to-alias (section 3).
+
+Algorithm (`remap(xfile, content, edits)`; an edit is `Edit(offset, old_length, data)`, or
+`string_edit` for a NUL-terminated string):
+
+1. Locate each edit's READ / STRING (or TAIL, same length only) by file offset. An edit
+   may not cross a read boundary, a string must keep exactly one NUL, and an edit may not
+   overlap a rewritten pointer field.
+2. Replay the log with the loader's rules: push and pop (TEMP rewinds on pop), alloc with
+   its mask, reads, strings, deferred reservations, and InsertPointer (align 4, +4 in
+   VIRTUAL). The first replay checks every logged position. The second uses the edited
+   sizes. Each event that takes block memory becomes an allocation: block, logged start
+   and size, new start and size.
+3. Map every OFFSET / ALIAS_REF target through the allocation that held it when the
+   pointer was read, keeping the offset inside the allocation:
+   - Non-TEMP blocks: a bisect, since those blocks only grow.
+   - TEMP: the latest TEMP allocation before the pointer event.
+   - A target one byte past an allocation keeps its distance. A target in padding raises
+     `RemapError`.
+4. Write:
+   - changed pointer fields, at their original file offsets;
+   - the size fields declared by `SIZE_FIELDS[type]` (the extension point; `@size_rule`
+     registers one; rawfile `len` is the built-in example);
+   - the splices;
+   - each `blockSize[b]`, moved by the change in that block's final position (for TEMP, by
+     the change in its high-water mark);
+   - `size = len - 36`.
+5. `compare(before, after)` is the parse-level check. The reparse must be exact, every
+   pointer must have the same kind, and every OFFSET / ALIAS_REF must have the same
+   logical target: the same allocation (by order in its block) and the same offset
+   inside it. `remap(..., check=True)` runs it.
+
+Evidence (`tests/test_xfile_remap.py`, 25 tests, about 40 s with the zones):
+
+- (b) and (b2) are reproduced byte for byte from the retail code_post_gfx_mp.ff
+  (sha1 43ac2325... and 7e00990c...). The 1599 and 20680 pointer rewrites and the VIRTUAL
+  relayout runs equal the oracle fixtures.
+- Synthetic zones cover string grow and shrink across 4- and 16-byte alignments with
+  pointers to moved data, a rawfile buffer resize (`len` 11 -> 18), and rejected edits.
+- Random single resizes (deltas from -5, -2, -1, 1, 3, 4, 5, 8, 13, 16, 17, 127, 128, 129,
+  300) of localize values, rawfile names and stringtable cells in code_post_gfx_mp and
+  patch_mp: every reparse is exact with the same logical targets.
+- Six edits at once per zone, mixing the three types: the same checks pass.
+- A sample was also checked with the emulated loader (`tools/remap_oracle.py`,
+  `check_remap`). The edits were the six mixed resizes (-5, +3, +17, +129, +4, -1),
+  applied once to patch_mp and once to code_post_gfx_mp:
+  - patch_mp: 29355 pointers rewritten. The VIRTUAL shift goes -16, -13, -12, +5, +4,
+    +133, +137, +144 as the alignments change it. blockSize[4] goes 0x2c46d1 -> 0x2c4761.
+  - code_post_gfx_mp: 21918 pointers rewritten. blockSize[4] goes 0x276c61 -> 0x276cf1.
+  - In both, the loader read the whole file, the final block positions equal the new
+    header, and every converted pointer equals the emulator-derived mapping
+    (0 mismatches). The VIRTUAL images are identical after mapping back, with
+    0 unexplained bytes.
+
+Limits:
+
+- Edits change sizes only. An edit that changes counts, markers or the number of
+  loader reads needs the type's write side to re-emit the asset; that is not a byte
+  splice.
+- Deferred (LARGE_RUNTIME / PHYSICAL_RUNTIME) data may only change in place.

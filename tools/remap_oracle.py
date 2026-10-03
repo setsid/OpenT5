@@ -148,7 +148,17 @@ class TracingEmu(Emu):
         return self.m.read(self.bbase[b], size)
 
 
-def replay(ops, grow_file_offset: int | None = None, delta: int = 0, check: bool = False):
+def _growth(fo, grow_file_offset, delta: int) -> int:
+    """Size change of the advance whose bytes start at file offset fo. grow_file_offset
+    is one offset (with delta) or a dict {file offset of a string or read: delta}."""
+    if fo is None:
+        return 0
+    if isinstance(grow_file_offset, dict):
+        return grow_file_offset.get(fo, 0)
+    return delta if fo == grow_file_offset else 0
+
+
+def replay(ops, grow_file_offset=None, delta: int = 0, check: bool = False):
     """Re-simulate VIRTUAL positions. Returns segments
     [(old_start, new_start, old_len, new_len, file_offset)] and the final position."""
     pos = 0
@@ -163,7 +173,7 @@ def replay(ops, grow_file_offset: int | None = None, delta: int = 0, check: bool
             segs.append((before, pos, 4, 4, None))
             pos += 4
         else:
-            n = arg + (delta if fo is not None and fo == grow_file_offset else 0)
+            n = arg + _growth(fo, grow_file_offset, delta)
             segs.append((before, pos, arg, n, fo))
             pos += n
     return segs, pos
@@ -189,12 +199,12 @@ def alignment_effects(ops, grow_file_offset: int, delta: int):
             po, pn = ((po + 3) & ~3) + 4, ((pn + 3) & ~3) + 4
         else:
             po += arg
-            pn += arg + (delta if fo == grow_file_offset else 0)
+            pn += arg + _growth(fo, grow_file_offset, delta)
     return seen, changes
 
 
 class Relayout:
-    def __init__(self, ops, grow_at: int, delta: int):
+    def __init__(self, ops, grow_at, delta: int = 0):
         # The unchanged replay (every logged position checked) gives the old starts.
         old, self.old_end = replay(ops, check=True)
         new, self.new_end = replay(ops, grow_at, delta)
@@ -372,14 +382,16 @@ def validate(orig: bytes, edited: bytes, tr0: TracingEmu, lay: Relayout, new_tex
     explain(old_img, rebuilt, lay.old_end)
     # The grown string's allocation is not copied back, so every remaining difference
     # is unexplained (neither relocation nor a mapped pointer).
-    grown = [s for s in lay.segs if s[3] != s[1]][0]
+    grown_all = [s for s in lay.segs if s[3] != s[1]]
     report["virtual_pointer_words_mapped_back"] = explained
     report["virtual_unexplained_bytes"] = unexplained
     report["virtual_diff_bytes_after_mapping"] = sum(
         1 for x, y in zip(old_img, rebuilt, strict=False) if x != y
     )
-    report["grown_allocations"] = sum(1 for s in lay.segs if s[3] != s[1])
-    report["string_loaded"] = new_img[grown[2] : grown[2] + grown[3]].rstrip(b"\0").decode()
+    report["grown_allocations"] = len(grown_all)
+    report["strings_loaded"] = [
+        new_img[g[2] : g[2] + g[3]].rstrip(b"\0").decode("latin-1") for g in grown_all[:8]
+    ]
     # Other blocks: same positions, so compare directly with pointers mapped.
     for b in range(7):
         if b == VIRTUAL or not hdr[2 + b]:
@@ -407,6 +419,21 @@ def validate(orig: bytes, edited: bytes, tr0: TracingEmu, lay: Relayout, new_tex
     report["pointed_checked"] = pointed_checked
     report["pointed_raw_equal"] = pointed_raw_equal
     report["pointed_bad"] = pointed_bad
+    return report
+
+
+def check_remap(orig: bytes, edited: bytes, grow: dict[int, int]) -> dict:
+    """Validate an edit made by any remapper (the product's included) with the emulated
+    loader: ``grow`` maps the original file offset of each resized VIRTUAL read or string
+    to its size change. Returns the validate() report plus the relayout's own check that
+    every pointer value in ``edited`` equals the emulator-derived mapping."""
+    tr = TracingEmu(orig)
+    if tr.run() != len(orig):
+        raise AssertionError("original zone not consumed exactly")
+    lay = Relayout(tr.ops, grow)
+    report = validate(orig, edited, tr, lay, b"")
+    report["virtual_new_end"] = lay.new_end
+    report["header_virtual"] = struct.unpack_from(">I", edited, 8 + 4 * VIRTUAL)[0]
     return report
 
 
