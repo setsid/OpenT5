@@ -16,6 +16,10 @@ hidden = collect_submodules("opent5")
 # PyNaCl's compiled _sodium module imports cffi's backend from C, which static
 # analysis cannot see.
 hidden.append("_cffi_backend")
+# The shaded viewer imports these at runtime; keep them in the build even though the
+# offscreen screenshot path cannot exercise GL. The view falls back to wireframe when a
+# GL context is unavailable.
+hidden += ["PySide6.QtOpenGL", "PySide6.QtOpenGLWidgets"]
 
 import opent5  # noqa: E402
 from PyInstaller.utils.win32.versioninfo import (  # noqa: E402

@@ -11,6 +11,7 @@ rest in a process pool, prunes zones that left the dump, and reports progress.
 from __future__ import annotations
 
 import os
+import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
@@ -159,6 +160,10 @@ def default_jobs() -> int:
     env = os.environ.get("OPENT5_INDEX_JOBS")
     if env and env.isdigit() and int(env) > 0:
         return int(env)
+    # A PyInstaller exe has no separate Python to spawn as a pool worker (the worker would
+    # re-launch the exe), so index serially when frozen.
+    if getattr(sys, "frozen", False):
+        return 1
     return max(1, min((os.cpu_count() or 2), 6))
 
 
@@ -206,8 +211,17 @@ def build(
                 indexed += 1
                 _report(progress, done, total, result)
         else:
-            with ProcessPoolExecutor(max_workers=workers) as pool:
-                for result in pool.map(index_zone, [str(p) for p in to_parse]):
+            try:
+                with ProcessPoolExecutor(max_workers=workers) as pool:
+                    for result in pool.map(index_zone, [str(p) for p in to_parse]):
+                        done += 1
+                        failed += _store_result(store, result)
+                        indexed += 1
+                        _report(progress, done, total, result)
+            except Exception:  # a pool that cannot start (e.g. a frozen build) falls back to serial
+                workers = 1
+                for p in to_parse[indexed:]:
+                    result = index_zone(str(p))
                     done += 1
                     failed += _store_result(store, result)
                     indexed += 1
