@@ -18,6 +18,15 @@ Supporting tool (not product code): `tools/convert_map.py convert | compare | or
 Conventions: "PC zone" is the inflated PC stream, "PS3 zone" the inflated PS3 XFile stream;
 offsets are into those streams. Type numbers are PS3 numbers.
 
+
+## Rule: a custom map lives in its own files
+
+Everything a converted map needs lives in its own files: its zone (`mp_<name>.ff`), its own
+`.pak` if it streams images, and images such as the compass stored inside its own zone in the
+end-of-zone image block (docs/research/textures.md, deferred pixels). Stock zones and stock
+paks (`patch_mp.ff`, `images_low.pak`, `common.pak` and the rest) are never modified: two
+custom maps would otherwise collide, and stock files must stay stock.
+
 ## 1. Design
 
 Strategy (box-map.md 4.2): keep a stock PS3 map zone, which already holds everything the PC
