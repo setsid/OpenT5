@@ -1,5 +1,7 @@
 # OpenT5
 
+By setsid.
+
 A standalone toolkit for Call of Duty: Black Ops (engine T5) PS3 fastfiles:
 open, browse, edit and rebuild zones, and in time build custom maps.
 
@@ -57,6 +59,6 @@ screenshots from the exe.
 
 ## Licence
 
-OpenT5 is free software under the GNU General Public License, version 3 or
+OpenT5 is by setsid and is free software under the GNU General Public License, version 3 or
 later; see LICENSE. Some code is adapted from OpenAssetTools (also GPLv3);
 docs/provenance.md records what was taken from where.

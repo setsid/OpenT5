@@ -14,6 +14,42 @@ resources = root / "src" / "opent5" / "gui" / "resources"
 sys.path.insert(0, str(root / "src"))
 hidden = collect_submodules("opent5")
 
+import opent5  # noqa: E402
+from PyInstaller.utils.win32.versioninfo import (  # noqa: E402
+    FixedFileInfo,
+    StringFileInfo,
+    StringStruct,
+    StringTable,
+    VarFileInfo,
+    VarStruct,
+    VSVersionInfo,
+)
+
+_v = tuple(int(x) for x in opent5.__version__.split(".")) + (0,)
+version = VSVersionInfo(
+    ffi=FixedFileInfo(filevers=_v, prodvers=_v),
+    kids=[
+        StringFileInfo(
+            [
+                StringTable(
+                    "080904B0",
+                    [
+                        StringStruct("CompanyName", opent5.APP_AUTHOR),
+                        StringStruct("FileDescription", f"{opent5.APP_NAME} by {opent5.APP_AUTHOR}"),
+                        StringStruct("FileVersion", opent5.__version__),
+                        StringStruct("InternalName", opent5.APP_NAME),
+                        StringStruct("LegalCopyright", f"Copyright (C) 2026 {opent5.APP_AUTHOR}. GPL-3.0-or-later."),
+                        StringStruct("OriginalFilename", f"{opent5.APP_NAME}.exe"),
+                        StringStruct("ProductName", opent5.APP_NAME),
+                        StringStruct("ProductVersion", opent5.__version__),
+                    ],
+                )
+            ]
+        ),
+        VarFileInfo([VarStruct("Translation", [0x0809, 1200])]),
+    ],
+)
+
 a = Analysis(
     [str(root / "packaging" / "launch.py")],
     pathex=[str(root / "src")],
@@ -34,6 +70,7 @@ exe = EXE(
     [],
     name="OpenT5",
     icon=str(resources / "opent5.ico"),
+    version=version,
     console=False,
     upx=False,
     debug=False,

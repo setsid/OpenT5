@@ -13,5 +13,6 @@
     "build": ".venv/bin/python -m compileall -q src && .venv/bin/python -m opent5 --version",
     "opent5": ".venv/bin/python -m opent5",
     "gui": ".venv/bin/python -m opent5.gui"
-  }
+  },
+  "author": "setsid"
 }
