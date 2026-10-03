@@ -57,7 +57,7 @@ from opent5.xfile.constants import (
 )
 from opent5.xfile.events import NONE, EventKind, PtrKind
 from opent5.xfile.model import XFile, parse
-from opent5.xfile.stream import XFileError, XStream, XWriter
+from opent5.xfile.stream import Platform, XFileError, XStream, XWriter
 
 READ, STRING, DEFER, TAIL = EventKind.READ, EventKind.STRING, EventKind.DEFER, EventKind.TAIL
 PUSH, POP, ALLOC, POINTER = EventKind.PUSH, EventKind.POP, EventKind.ALLOC, EventKind.POINTER
@@ -596,31 +596,34 @@ class _Tracing:
 
 
 class _TracingStream(_Tracing, XStream):
-    def __init__(self, data: bytes):
-        XStream.__init__(self, data, log=True)
+    def __init__(self, data: bytes, platform: Platform | None = None):
+        XStream.__init__(self, data, log=True, platform=platform)
         self._setup_trace()
 
 
 class _TracingWriter(_Tracing, XWriter):
-    def __init__(self):
-        XWriter.__init__(self, log=True)
+    def __init__(self, platform: Platform | None = None):
+        XWriter.__init__(self, log=True, platform=platform)
         self._setup_trace()
 
 
-def traced_parse(content: bytes | bytearray | memoryview, progress=None) -> tuple[XFile, _Trace]:
+def traced_parse(
+    content: bytes | bytearray | memoryview, progress=None, platform: Platform | None = None
+) -> tuple[XFile, _Trace]:
     """``parse(content)`` (with its event log), plus the trace ``Rewrite`` needs.
     ``progress(stage, done, total)`` is optional (asset counts)."""
     from opent5.xfile.constants import ASSET_LIST_OFFSET, ASSET_LIST_SIZE
-    from opent5.xfile.model import XFileHeader, _walk
+    from opent5.xfile.model import PS3, XFileHeader, _walk
 
+    platform = platform or PS3
     data = bytes(content)
-    header = XFileHeader.parse(data)
+    header = XFileHeader.parse(data, platform.endian)
     if len(data) < ASSET_LIST_OFFSET + ASSET_LIST_SIZE:
         raise XFileError(
             f"XAssetList at {ASSET_LIST_OFFSET:#x}: expected {ASSET_LIST_SIZE} bytes, "
             f"stream is {len(data)}"
         )
-    st = _TracingStream(data)
+    st = _TracingStream(data, platform)
     st.progress = progress
     list_bytes = data[ASSET_LIST_OFFSET : ASSET_LIST_OFFSET + ASSET_LIST_SIZE]
     st.fp = ASSET_LIST_OFFSET + ASSET_LIST_SIZE
@@ -643,6 +646,7 @@ def traced_parse(content: bytes | bytearray | memoryview, progress=None) -> tupl
         script_string_ptrs=parts.get("script_string_ptrs"),
         asset_entries=parts.get("asset_entries"),
         refs=st.refs,
+        platform=platform,
     )
     return xfile, st.trace
 
@@ -651,9 +655,10 @@ def traced_write(xfile: XFile, progress=None):
     """``write(xfile)`` with the header derived from the stream, plus its trace."""
     from opent5.xfile.model import TEMP_SLACK, Written, XFileHeader, _walk
 
-    writer = _TracingWriter()
+    endian = xfile.platform.endian
+    writer = _TracingWriter(xfile.platform)
     writer.progress = progress
-    writer.raw(xfile.header.pack())
+    writer.raw(xfile.header.pack(endian))
     list_at = writer.raw(xfile.asset_list)
     parts = {
         "script_string_ptrs": xfile.script_string_ptrs,
@@ -665,7 +670,7 @@ def traced_write(xfile: XFile, progress=None):
     sizes = list(writer.pos)
     sizes[TEMP] = writer.temp_high + TEMP_SLACK
     header = XFileHeader(len(content) - HEADER_SIZE, xfile.header.external_size, tuple(sizes))
-    content[0:HEADER_SIZE] = header.pack()
+    content[0:HEADER_SIZE] = header.pack(endian)
     written = Written(
         content=bytes(content),
         header=header,
@@ -705,9 +710,14 @@ class Rewrite:
     ``build`` may be called again after further edits; the reference is always the content
     the Rewrite was made from."""
 
-    def __init__(self, content: bytes | bytearray | memoryview, progress=None):
+    def __init__(
+        self,
+        content: bytes | bytearray | memoryview,
+        progress=None,
+        platform: Platform | None = None,
+    ):
         self.content = bytes(content)
-        self.xfile, self.trace = traced_parse(self.content, progress)
+        self.xfile, self.trace = traced_parse(self.content, progress, platform)
         self._layout: _Layout | None = None
         self._by_ident: dict[tuple, int] | None = None
         self._reads: tuple[list[int], list[int]] | None = None
@@ -789,6 +799,7 @@ class Rewrite:
                     duplicate.add(ident)
                 by_ident[ident] = a
         positions: dict[int, dict[int, int]] = {}
+        endian = self.xfile.platform.endian
         out = bytearray(written.content)
         pointers: list[tuple[int, int, int]] = []
         movable = _movable_pointers(new_rows)
@@ -838,7 +849,7 @@ class Rewrite:
             if value != raw:
                 if at == NONE:
                     raise RemapError(f"pointer event {j}: field has no file bytes (RUNTIME)")
-                struct.pack_into(">I", out, at, value)
+                struct.pack_into(endian + "I", out, at, value)
                 pointers.append((at, raw, value))
         moved: dict[int, list[Allocation]] = {b: [] for b in range(BLOCK_COUNT)}
         for b, allocs in old.by_block.items():
@@ -852,12 +863,14 @@ class Rewrite:
             content=bytes(out),
             pointers=pointers,
             fields=[],
-            header_before=struct.unpack_from(">9I", self.content, 0),
-            header_after=struct.unpack_from(">9I", out, 0),
+            header_before=struct.unpack_from(endian + "9I", self.content, 0),
+            header_after=struct.unpack_from(endian + "9I", out, 0),
             allocations=moved,
         )
         if check:
-            problems = list(parse(result.content, log=False).problems())
+            problems = list(
+                parse(result.content, log=False, platform=self.xfile.platform).problems()
+            )
             if problems:
                 raise RemapError("rewrite check failed: " + "; ".join(problems[:5]))
         return result

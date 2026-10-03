@@ -280,3 +280,12 @@ exits 1 if it is not). Chunks whose content is unchanged are carried as stored;
 Every retail zone is signed at 0x3c and the signature cannot be regenerated. A zone whose
 content changed loads only on a client with the signature check patched out; `replace` says
 so in `signature_note` every time.
+
+## convert
+
+Convert a map built with the PC Mod Tools into a PS3 zone: the base zone's world assets
+(gfx_map, col_map_mp and its entities, com_map, game_map_mp) are replaced with the PC
+map's, everything else is kept. The base is only read; the result goes to OUTDIR.
+Details, supported gametypes and limits: docs/convert.md.
+
+    opent5 convert PC_MAP.ff --base mp_nuked -o OUTDIR [--lighting flat|sunlit|keep] [--json]

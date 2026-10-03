@@ -36,9 +36,9 @@ from opent5.xfile.constants import (
     type_name,
 )
 from opent5.xfile.events import NONE, EventKind, EventLog
-from opent5.xfile.handlers.base import REGISTRY
+from opent5.xfile.handlers.base import PS3
 from opent5.xfile.refs import Refs, Target
-from opent5.xfile.stream import Chunk, DeferredData, XFileError, XStream, XWriter
+from opent5.xfile.stream import DeferredData, Platform, XFileError, XStream, XWriter
 
 #: blockSize[0] (TEMP) is the TEMP high-water mark plus 16 in every zone walked
 #: (TEMP rewinds after each asset, so the final position is 0). INFERRED: the
@@ -49,21 +49,21 @@ TEMP_SLACK = ASSET_LIST_SIZE
 
 @dataclass(frozen=True)
 class XFileHeader:
-    """The 36-byte prefix: nine big-endian u32."""
+    """The 36-byte prefix: nine u32 (big-endian on PS3; ``endian`` "<" for PC)."""
 
     size: int
     external_size: int
     block_sizes: tuple[int, ...]
 
     @classmethod
-    def parse(cls, data: bytes) -> XFileHeader:
+    def parse(cls, data: bytes, endian: str = ">") -> XFileHeader:
         if len(data) < HEADER_SIZE:
             raise XFileError(f"XFile header: expected {HEADER_SIZE} bytes, found {len(data)}")
-        words = struct.unpack_from(">9I", data, 0)
+        words = struct.unpack_from(endian + "9I", data, 0)
         return cls(words[0], words[1], tuple(words[2:9]))
 
-    def pack(self) -> bytes:
-        return struct.pack(">9I", self.size, self.external_size, *self.block_sizes)
+    def pack(self, endian: str = ">") -> bytes:
+        return struct.pack(endian + "9I", self.size, self.external_size, *self.block_sizes)
 
 
 @dataclass
@@ -142,6 +142,8 @@ class XFile:
     asset_entries: bytes | None = field(repr=False, default=None)
     #: Pointer resolution records (opent5.xfile.refs).
     refs: Refs | None = field(repr=False, default=None)
+    #: Byte order, handlers and type map the zone was parsed with (PS3 unless given).
+    platform: Platform = field(repr=False, default=PS3)
 
     def resolve(self, value: int) -> Target | None:
         """What a raw pointer value names: the asset behind an alias, or the node,
@@ -193,18 +195,25 @@ class XFile:
         return out
 
 
-def parse(content: bytes | bytearray | memoryview, log: bool = True, progress=None) -> XFile:
+def parse(
+    content: bytes | bytearray | memoryview,
+    log: bool = True,
+    progress=None,
+    platform: Platform | None = None,
+) -> XFile:
     """Walk a whole decompressed zone. Raises AssetError (an XFileError) naming
     the asset, handler and offset at the first asset that does not parse.
-    ``progress(stage, done, total)`` is optional (asset counts)."""
+    ``progress(stage, done, total)`` is optional (asset counts). ``platform``
+    (default PS3) gives the byte order, handlers and asset type map."""
+    platform = platform or PS3
     data = bytes(content)
-    header = XFileHeader.parse(data)
+    header = XFileHeader.parse(data, platform.endian)
     if len(data) < ASSET_LIST_OFFSET + ASSET_LIST_SIZE:
         raise XFileError(
             f"XAssetList at {ASSET_LIST_OFFSET:#x}: expected {ASSET_LIST_SIZE} bytes, "
             f"stream is {len(data)}"
         )
-    st = XStream(data, log=log)
+    st = XStream(data, log=log, platform=platform)
     st.progress = progress
     # The XAssetList is read raw: it occupies no block memory.
     list_bytes = data[ASSET_LIST_OFFSET : ASSET_LIST_OFFSET + ASSET_LIST_SIZE]
@@ -228,6 +237,7 @@ def parse(content: bytes | bytearray | memoryview, log: bool = True, progress=No
         script_string_ptrs=parts.get("script_string_ptrs"),
         asset_entries=parts.get("asset_entries"),
         refs=st.refs,
+        platform=platform,
     )
 
 
@@ -242,7 +252,7 @@ class _Walked:
 def _walk(io: XStream, list_bytes: bytes, list_at: int, parts: dict, source: XFile | None):
     """Script strings, the asset array, every asset, the deferred tail: both directions.
     Reading fills `parts` and returns new Assets; writing takes them from `source`."""
-    asset_list = Chunk(memoryview(bytearray(list_bytes)), list_at, NONE, NONE)
+    asset_list = io.platform.chunk_type(memoryview(bytearray(list_bytes)), list_at, NONE, NONE)
     string_count, asset_count = asset_list.u32(0), asset_list.u32(8)
 
     io.push(Block.VIRTUAL)
@@ -292,8 +302,9 @@ def write(
     from the final block positions, TEMP as its high-water mark plus 16); for an
     unedited parse that is the original header. pointer_values overrides pointer
     fields by ordinal (see XWriter)."""
-    writer = XWriter(log=log, pointer_values=pointer_values)
-    writer.raw(xfile.header.pack())
+    endian = xfile.platform.endian
+    writer = XWriter(log=log, pointer_values=pointer_values, platform=xfile.platform)
+    writer.raw(xfile.header.pack(endian))
     list_at = writer.raw(xfile.asset_list)
     parts = {
         "script_string_ptrs": xfile.script_string_ptrs,
@@ -308,7 +319,7 @@ def write(
         header = XFileHeader(len(content) - HEADER_SIZE, xfile.header.external_size, tuple(sizes))
     else:
         header = xfile.header
-    content[0:HEADER_SIZE] = header.pack()
+    content[0:HEADER_SIZE] = header.pack(endian)
     return Written(
         content=bytes(content),
         header=header,
@@ -335,19 +346,20 @@ class Written:
     log: EventLog | None = field(repr=False, default=None)
 
 
-def write_asset(asset: Asset, log: bool = False) -> bytes:
+def write_asset(asset: Asset, log: bool = False, platform: Platform | None = None) -> bytes:
     """One asset's own bytes (its file span; deferred bytes it queues are not
     included), from its node."""
-    handler = REGISTRY[asset.type]
-    writer = XWriter(log=log)
+    platform = platform or PS3
+    handler = platform.registry[asset.type]
+    writer = XWriter(log=log, platform=platform)
     writer.push(Block.VIRTUAL)
     handler.write(asset.data, writer, asset.header_ptr)
     writer.pop()
     return writer.getvalue()
 
 
-def _entry(io: XStream, entries: Chunk, index: int, data: Any) -> Asset:
-    asset_type = entries.u32(8 * index)
+def _entry(io: XStream, entries, index: int, data: Any) -> Asset:
+    asset_type = io.platform.asset_type(entries.u32(8 * index))
     start = io.fp
     before = io.cursors()
     io.asset_index = index
@@ -356,7 +368,7 @@ def _entry(io: XStream, entries: Chunk, index: int, data: Any) -> Asset:
     if io.log is not None:
         event_start = len(io.log)
         io.log.append(EventKind.ASSET, index, asset_type, start)
-    handler = REGISTRY.get(asset_type)
+    handler = io.registry.get(asset_type)
     raw = entries.u32(8 * index + 4)
     try:
         if handler is None:

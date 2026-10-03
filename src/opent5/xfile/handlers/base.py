@@ -28,7 +28,7 @@ from opent5.xfile.constants import (
     type_name,
 )
 from opent5.xfile.events import NONE
-from opent5.xfile.stream import AssetLink, Chunk, XStream
+from opent5.xfile.stream import AssetLink, Chunk, Platform, XStream
 
 
 class Handler:
@@ -100,6 +100,10 @@ class Handler:
 
 REGISTRY: dict[int, Handler] = {}
 
+#: The PS3 zones: big-endian, these handlers, asset types as stored. The default
+#: platform of every parse and write.
+PS3 = Platform("ps3", ">", REGISTRY)
+
 
 def register(cls: type[Handler]) -> type[Handler]:
     """Class decorator: register one handler instance for its asset type."""
@@ -114,8 +118,9 @@ def handler_for(asset_type: int) -> Handler | None:
 
 
 def load_asset(io: XStream, asset_type: int, raw: int, node: Any = None) -> Any:
-    """Load (or write) an asset pointer of the given type through its handler."""
-    handler = REGISTRY.get(asset_type)
+    """Load (or write) an asset pointer of the given type through its handler (from
+    the stream's platform registry)."""
+    handler = io.registry.get(asset_type)
     if handler is None:
         raise io.fail(f"asset type {asset_type} ({type_name(asset_type)}) has no loader")
     return handler.load_ptr(io, raw, node)

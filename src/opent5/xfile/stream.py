@@ -37,6 +37,11 @@ same block, alignment, RUNTIME and deferred bookkeeping and the same event log.
 Because every decision a handler makes (counts, pointer tests, union tags) is
 computed from the bytes it has just loaded or emitted, the two directions cannot
 drift: writing a parsed node reproduces the bytes it was parsed from.
+
+Byte order and handler set are a ``Platform``: PS3 (big-endian, the handlers
+registered in ``handlers.REGISTRY``) is the default; a PC zone (little-endian, its
+own handlers and asset type numbers, ``opent5.convert.pc.PC``) is read and written by
+the same primitives through ``ChunkLE`` and the platform's pointer word format.
 """
 
 from __future__ import annotations
@@ -62,6 +67,11 @@ _S16 = struct.Struct(">h").unpack_from
 _U32 = struct.Struct(">I").unpack_from
 _S32 = struct.Struct(">i").unpack_from
 _F32 = struct.Struct(">f").unpack_from
+_U16_LE = struct.Struct("<H").unpack_from
+_S16_LE = struct.Struct("<h").unpack_from
+_U32_LE = struct.Struct("<I").unpack_from
+_S32_LE = struct.Struct("<i").unpack_from
+_F32_LE = struct.Struct("<f").unpack_from
 
 READ = EventKind.READ
 STRING = EventKind.STRING
@@ -126,7 +136,7 @@ class Chunk:
 
     def sub(self, off: int, size: int) -> Chunk:
         at = self.at + off if self.at != NONE else NONE
-        return Chunk(self.data[off : off + size], at, self.block, self.mem + off)
+        return self.__class__(self.data[off : off + size], at, self.block, self.mem + off)
 
     def items(self, size: int, count: int):
         """The chunk as `count` consecutive elements of `size` bytes."""
@@ -134,6 +144,66 @@ class Chunk:
 
     def bytes(self) -> bytes:
         return bytes(self.data)
+
+
+class ChunkLE(Chunk):
+    """A Chunk whose scalars are little-endian (a PC zone)."""
+
+    __slots__ = ()
+
+    def u16(self, off: int) -> int:
+        return _U16_LE(self.data, off)[0]
+
+    def s16(self, off: int) -> int:
+        return _S16_LE(self.data, off)[0]
+
+    def u32(self, off: int) -> int:
+        return _U32_LE(self.data, off)[0]
+
+    def s32(self, off: int) -> int:
+        return _S32_LE(self.data, off)[0]
+
+    def f32(self, off: int) -> float:
+        return _F32_LE(self.data, off)[0]
+
+
+class Platform:
+    """What a zone's bytes mean beyond the loader's primitives: the byte order of
+    every scalar and pointer, the handlers by asset type, and how the asset array's
+    type numbers map to the type numbers the handlers are registered under.
+
+    ``PS3`` (big-endian, ``handlers.REGISTRY``, types as stored) is the default
+    everywhere; another platform (``opent5.convert.pc.PC``) brings its own handler
+    registry and a type map, so two parses of different platforms coexist."""
+
+    def __init__(
+        self,
+        name: str,
+        endian: str,
+        registry: dict,
+        type_map: dict[int, int] | None = None,
+    ):
+        if endian not in (">", "<"):
+            raise ValueError(f"platform {name}: endian expected '>' or '<', found {endian!r}")
+        self.name = name
+        self.endian = endian
+        self.registry = registry
+        #: stored asset type -> registered type (absent: the same number)
+        self.type_map = dict(type_map or {})
+        self.chunk_type = Chunk if endian == ">" else ChunkLE
+        self.u32 = struct.Struct(endian + "I")
+
+    def asset_type(self, stored: int) -> int:
+        return self.type_map.get(stored, stored)
+
+    def __repr__(self) -> str:
+        return f"Platform({self.name!r}, {self.endian!r})"
+
+
+def default_platform() -> Platform:
+    from opent5.xfile.handlers.base import PS3
+
+    return PS3
 
 
 @dataclass
@@ -188,7 +258,14 @@ class XStream:
 
     reading = True
 
-    def __init__(self, data: bytes, log: bool = True):
+    def __init__(self, data: bytes, log: bool = True, platform: Platform | None = None):
+        platform = platform or default_platform()
+        #: Byte order, handler registry and type map (``Platform``).
+        self.platform = platform
+        self.registry = platform.registry
+        self._chunk = platform.chunk_type
+        self._u32 = platform.u32.unpack_from
+        self._pack_u32 = platform.u32.pack_into
         self.data = data
         self.view = memoryview(data)
         self.size = len(data)
@@ -336,7 +413,7 @@ class XStream:
         fp = self.fp
         mem = self.pos[block]
         if size == 0:
-            return Chunk(self.view[fp:fp], fp, block, mem)
+            return self._chunk(self.view[fp:fp], fp, block, mem)
         end = fp + size
         if end > self.size:
             raise self.fail(
@@ -350,7 +427,7 @@ class XStream:
             self._ev((READ, fp, size, block, mem, self._mask))
         self._mask = NONE
         self.fp = end
-        return Chunk(self.view[fp:end], fp, block, mem)
+        return self._chunk(self.view[fp:end], fp, block, mem)
 
     def reserve(
         self, size: int, node: Any = None, key: Any = None
@@ -437,7 +514,7 @@ class XStream:
 
     def _raw(self, chunk: Chunk, off: int) -> int:
         self.pointer_index += 1
-        return _U32(chunk.data, off)[0]
+        return self._u32(chunk.data, off)[0]
 
     def follows(self, chunk: Chunk, off: int, owned: bool = False) -> bool:
         """A pointer to sub-data: True when the data follows inline.
@@ -531,8 +608,13 @@ class XWriter(XStream):
 
     reading = False
 
-    def __init__(self, log: bool = True, pointer_values: dict[int, int] | None = None):
-        super().__init__(b"", log=log)
+    def __init__(
+        self,
+        log: bool = True,
+        pointer_values: dict[int, int] | None = None,
+        platform: Platform | None = None,
+    ):
+        super().__init__(b"", log=log, platform=platform)
         self.out = bytearray()
         self.pointer_values = pointer_values or {}
         self._queued: list[tuple[DeferredData, bytes]] = []
@@ -559,7 +641,7 @@ class XWriter(XStream):
             self._mask = NONE
             self.out += copy
         self.fp = len(self.out)
-        return Chunk(memoryview(copy), fp, block, mem)
+        return self._chunk(memoryview(copy), fp, block, mem)
 
     def _stored(self, node: Any, key: Any, size: int) -> bytes:
         if node is None:
@@ -681,8 +763,8 @@ class XWriter(XStream):
         self.pointer_index = index + 1
         value = self.pointer_values.get(index)
         if value is not None:
-            struct.pack_into(">I", chunk.data, off, value)
+            self._pack_u32(chunk.data, off, value)
             if chunk.at != NONE:
-                struct.pack_into(">I", self.out, chunk.at + off, value)
+                self._pack_u32(self.out, chunk.at + off, value)
             return value
-        return _U32(chunk.data, off)[0]
+        return self._u32(chunk.data, off)[0]
