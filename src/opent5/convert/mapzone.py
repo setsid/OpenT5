@@ -16,11 +16,12 @@ import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from opent5.container.fastfile import OFFSET_ZONE_NAME, ZONE_NAME_SIZE
 from opent5.container.zone import Zone
 from opent5.convert import lighting as lit
+from opent5.convert import mapname, world
 from opent5.convert import pc as pcmod
 from opent5.convert import scripts as sc
-from opent5.convert import world
 from opent5.convert.splice import BASE, Splice
 from opent5.convert.world import ConvertError
 from opent5.edit.content import mapents_bytes, mapents_text, rawfile_bytes, rawfile_text
@@ -65,13 +66,16 @@ def convert_map(
     base_path: str | Path,
     lighting: str = "flat",
     require: tuple[str, ...] = ("tdm", "dm"),
-    compat: bool = True,
+    compat: bool | None = None,
     progress=None,
+    name: str | None = None,
 ) -> ConvertResult:
     """Convert. ``pc_fastfile``: the PC ``.ff`` bytes (``IWffu100``); ``base_path``: the
     stock PS3 map zone whose world is replaced. ``lighting``: "flat" or "keep"
     (``lighting``). ``require``: gametypes whose spawns must be in the map. ``compat``:
-    add the entities the base map's stock script needs (``scripts.COMPAT_ENTITIES``)."""
+    add the entities the base map's stock script needs (``scripts.COMPAT_ENTITIES``);
+    default: only when the map keeps the base's name. ``name``: the map's own name (zone
+    ``<name>.ff``, ``mapname.validate`` rules); None keeps the base's name."""
     if lighting not in ("flat", "sunlit", "keep"):
         raise ConvertError(f"lighting: expected 'flat', 'sunlit' or 'keep', found {lighting!r}")
     report: dict = {"assets": {}, "notes": []}
@@ -107,6 +111,12 @@ def convert_map(
     base_name = stock_gfx.get("base_name")
     if not map_name or not base_name:
         raise ConvertError("base zone: its com_map / gfx_map carry no map name")
+    own = name if name is not None and name != base_name else None
+    renamed = own is not None
+    if own is not None:
+        mapname.validate(own, base_name)
+    if compat is None:
+        compat = not renamed
 
     # Materials and lighting.
     _progress(progress, "Converting the world")
@@ -175,16 +185,24 @@ def convert_map(
     world.convert_game(pgame)
     world.convert_clip(pclip)
 
-    # Names: the base's (the game finds the world by the zone's map name).
-    pcom["name"] = map_name
-    pgfx["name"] = targets[AssetType.GFX_MAP].data.get("name")
-    pgfx["base_name"] = base_name
-    pgame["name"] = targets[AssetType.GAME_MAP_MP].data.get("name")
-    pclip["name"] = targets[AssetType.COL_MAP_MP].data.get("name")
+    # Names: the base's, or the map's own (the game finds the world as
+    # maps/mp/<mapname>.d3dbsp, 0x4b5370).
     ents = pclip.get("map_ents")
-    if isinstance(ents, dict):
-        stock_ents = targets[AssetType.COL_MAP_MP].data.get("map_ents")
-        ents["name"] = stock_ents.get("name") if isinstance(stock_ents, dict) else map_name
+    if renamed:
+        world_name = f"maps/mp/{own}.d3dbsp"
+        pcom["name"] = pgfx["name"] = pgame["name"] = pclip["name"] = world_name
+        pgfx["base_name"] = own
+        if isinstance(ents, dict):
+            ents["name"] = world_name
+    else:
+        pcom["name"] = map_name
+        pgfx["name"] = targets[AssetType.GFX_MAP].data.get("name")
+        pgfx["base_name"] = base_name
+        pgame["name"] = targets[AssetType.GAME_MAP_MP].data.get("name")
+        pclip["name"] = targets[AssetType.COL_MAP_MP].data.get("name")
+        if isinstance(ents, dict):
+            stock_ents = targets[AssetType.COL_MAP_MP].data.get("map_ents")
+            ents["name"] = stock_ents.get("name") if isinstance(stock_ents, dict) else map_name
     stock_nodes = {t: targets[t].data for t in WORLD_TYPES}
     for t, node in zip(WORLD_TYPES, (pcom, pgfx, pgame, pclip), strict=True):
         a = targets[t]
@@ -262,6 +280,15 @@ def convert_map(
             "bytes_after": len(new),
         }
     report["scripts"] = {"changed": changed, "main_kept": plan.kept, "main_dropped": plan.dropped}
+    if renamed:
+        names = mapname.rename_assets(bx, base_name, own, mapname.name_pointer_nodes(base))
+        report["map_name"] = {
+            "base": base_name,
+            "name": own,
+            "world": f"maps/mp/{own}.d3dbsp",
+            "gfx_base_name": own,
+            **names.to_dict(),
+        }
 
     # Write and remap.
     _progress(progress, "Writing and remapping")
@@ -289,6 +316,10 @@ def convert_map(
     _progress(progress, "Checking")
     report["checks"] = check_content(result.content)
     zone.content[:] = result.content
+    if renamed:
+        zone.header[OFFSET_ZONE_NAME : OFFSET_ZONE_NAME + ZONE_NAME_SIZE] = own.encode(
+            "ascii"
+        ).ljust(ZONE_NAME_SIZE, b"\0")
     built = zone.build()
     report["zone"] = {
         "name": zone.name,

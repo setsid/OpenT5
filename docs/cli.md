@@ -288,4 +288,13 @@ Convert a map built with the PC Mod Tools into a PS3 zone: the base zone's world
 map's, everything else is kept. The base is only read; the result goes to OUTDIR.
 Details, supported gametypes and limits: docs/convert.md.
 
-    opent5 convert PC_MAP.ff --base mp_nuked -o OUTDIR [--lighting flat|sunlit|keep] [--json]
+    opent5 convert PC_MAP.ff --base mp_nuked -o OUTDIR [--lighting flat|sunlit|keep]
+        [--name mp_NAME [--copy-pak]] [--register --patch-mp PATCH_MP.ff
+        [--title TEXT] [--description TEXT] [--ui-slot N]] [--json]
+
+`--name` gives the map its own zone name (`mp_NAME.ff`, every internal occurrence renamed;
+docs/research/map-registration.md lists them); `--copy-pak` writes `mp_NAME.pak` beside it.
+`--register` is opt-in and writes a NEW copy of patch_mp.ff with one map-table row added: the
+game offers maps only from that table, so a custom map cannot be started without it (see
+docs/convert.md, the own-files rule, and docs/demo-box-named.md). The source patch_mp.ff is
+only read.
