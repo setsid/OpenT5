@@ -37,12 +37,12 @@ EXPRESSION_TYPES = frozenset((2, 6))
 FOCUS_TYPES = frozenset((19, 21))
 
 
-def sub(io: XStream, parent: Chunk, off: int, node: dict, key: str, mask: int = 3):
-    """An [nz] pointer to one sub-struct: align and return its node, or None."""
+def sub(io: XStream, parent: Chunk, off: int, node: dict, key: str, kind: str = ""):
+    """An [nz] pointer to one sub-struct: align 4 and return its node, or None."""
     if io.follows(parent, off, owned=True):
-        io.alloc(mask)
+        io.alloc(3)
         if io.reading:
-            node[key] = {}
+            node[key] = {"_t": kind} if kind else {}
         return node[key]
     if io.reading:
         node[key] = None
@@ -56,13 +56,14 @@ def chain(
     size: int,
     next_off: int,
     each: Callable[[XStream, Chunk, dict], None],
+    kind: str,
 ) -> None:
     """A linked list the loader reads element by element: LS size, the element's
     pointers, then +next_off [nz] -> align 4 and the next one. node[key] lists them."""
     elements = io.children(node, key)
     index = 0
     while True:
-        element = io.child(elements, index)
+        element = io.tag(io.child(elements, index), kind)
         c = io.load(size, element, "raw")
         each(io, c, element)
         if not io.follows(c, next_off, owned=True):
@@ -74,7 +75,7 @@ def chain(
 def expression(io: XStream, ex: Chunk, node: dict) -> None:
     """ExpressionStatement (16): +0 filename, +4 line, +8 numRpn, +0xc rpn [-1]."""
     io.string(ex, 0, node, "filename")
-    for r, rpn in items(io, ex, 12, 3, 12, ex.s32(8), node, "rpn") or ():
+    for r, rpn in items(io, ex, 12, 3, 12, ex.s32(8), node, "rpn", kind="expressionRpn") or ():
         if r.s32(0) == RPN_CONSTANT and r.s32(4) == VAL_STRING:
             io.string(r, 8, rpn, "string")
 
@@ -87,8 +88,8 @@ def event_script(io: XStream, s: Chunk, node: dict) -> None:
     """GenericEventScript (44): prerequisites, condition, action; +0x28 next."""
     prerequisites = sub(io, s, 0, node, "prerequisites")
     if prerequisites is not None:
-        chain(io, prerequisites, "conditions", 16, 12, _no_pointers)
-    expression(io, s.sub(4, 16), node.setdefault("condition", {}))
+        chain(io, prerequisites, "conditions", 16, 12, _no_pointers, "ScriptCondition")
+    expression(io, s.sub(4, 16), node.setdefault("condition", {"_t": "ExpressionStatement"}))
     io.string(s, 28, node, "action")
 
 
@@ -97,26 +98,26 @@ def event_handler(io: XStream, h: Chunk, node: dict) -> None:
     io.string(h, 0, node, "name")
     script = sub(io, h, 4, node, "script")
     if script is not None:
-        chain(io, script, "scripts", 44, 40, event_script)
+        chain(io, script, "scripts", 44, 40, event_script, "GenericEventScript")
 
 
 def key_handler(io: XStream, k: Chunk, node: dict) -> None:
     """ItemKeyHandler (12): +0 key, +4 keyScript [nz]; +8 next."""
     script = sub(io, k, 4, node, "script")
     if script is not None:
-        chain(io, script, "scripts", 44, 40, event_script)
+        chain(io, script, "scripts", 44, 40, event_script, "GenericEventScript")
 
 
 def event_handlers(io: XStream, parent: Chunk, off: int, node: dict, key: str) -> None:
     target = sub(io, parent, off, node, key)
     if target is not None:
-        chain(io, target, "handlers", 12, 8, event_handler)
+        chain(io, target, "handlers", 12, 8, event_handler, "GenericEventHandler")
 
 
 def key_handlers(io: XStream, parent: Chunk, off: int, node: dict, key: str) -> None:
     target = sub(io, parent, off, node, key)
     if target is not None:
-        chain(io, target, "handlers", 12, 8, key_handler)
+        chain(io, target, "handlers", 12, 8, key_handler, "ItemKeyHandler")
 
 
 def list_box(io: XStream, node: dict) -> None:
@@ -125,8 +126,12 @@ def list_box(io: XStream, node: dict) -> None:
     asset_ref(io, lb, 676, AssetType.MATERIAL, node, "background_item_listbox")
     asset_ref(io, lb, 680, AssetType.MATERIAL, node, "highlight_texture")
     columns = lb.s32(60)
-    for row, element in items(io, lb, 688, 3, 24, lb.s32(692), node, "rows", owned=True) or ():
-        for c, cell in items(io, row, 0, 3, 12, columns, element, "cells", owned=True) or ():
+    for row, element in (
+        items(io, lb, 688, 3, 24, lb.s32(692), node, "rows", owned=True, kind="MenuRow") or ()
+    ):
+        for c, cell in (
+            items(io, row, 0, 3, 12, columns, element, "cells", owned=True, kind="MenuCell") or ()
+        ):
             array(io, c, 8, 0, c.s32(4), cell, "string_value", owned=True)
         array(io, row, 4, 0, 32, element, "event_name", owned=True)
         array(io, row, 8, 0, 32, element, "on_focus_event_name", owned=True)
@@ -135,13 +140,13 @@ def list_box(io: XStream, node: dict) -> None:
 def focus_type_data(io: XStream, item_type: int, f: Chunk, node: dict) -> None:
     if not io.follows(f, 4, owned=True):
         return
-    data = node.setdefault("type_data", {})
+    data = node.setdefault("type_data", {"_t": "MenuTypeData"})
     if item_type == ITEM_TYPE_LISTBOX:
         io.alloc(3)
-        list_box(io, data.setdefault("list_box", {}))
+        list_box(io, data.setdefault("list_box", {"_t": "listBoxDef_s"}))
     elif item_type == ITEM_TYPE_MULTI:
         io.alloc(3)
-        multi = data.setdefault("multi", {})
+        multi = data.setdefault("multi", {"_t": "multiDef_s"})
         md = io.load(396, multi, "raw")
         strings = multi.setdefault("strings", {})
         for i in range(64):
@@ -151,7 +156,7 @@ def focus_type_data(io: XStream, item_type: int, f: Chunk, node: dict) -> None:
         io.load(48, data, "edit_field")
     elif item_type == ITEM_TYPE_DVARENUM:
         io.alloc(3)
-        enum = data.setdefault("enum_dvar", {})
+        enum = data.setdefault("enum_dvar", {"_t": "enumDvarDef_s"})
         e = io.load(4, enum, "raw")
         io.string(e, 0, enum, "name")
 
@@ -166,29 +171,29 @@ def focus_item(io: XStream, item_type: int, node: dict) -> None:
 def item_data(io: XStream, item_type: int, it: Chunk, node: dict) -> None:
     if not io.follows(it, 204, owned=True):
         return
-    data = node.setdefault("type_data", {})
+    data = node.setdefault("type_data", {"_t": "MenuTypeData"})
     if item_type in TEXT_TYPES:
         io.alloc(3)
-        text = data.setdefault("text_def", {})
+        text = data.setdefault("text_def", {"_t": "textDef_s"})
         t = io.load(140, text, "raw")
         io.string(t, 128, text, "text")
-        exp = sub(io, t, 132, text, "text_exp")
+        exp = sub(io, t, 132, text, "text_exp", "ExpressionStatement")
         if exp is not None:
             expression(io, io.load(16, exp, "raw"), exp)
         if io.follows(t, 136, owned=True):
             if item_type in TEXT_FOCUS_TYPES:
                 io.alloc(3)
-                focus_item(io, item_type, text.setdefault("focus", {}))
+                focus_item(io, item_type, text.setdefault("focus", {"_t": "focusItemDef_s"}))
             elif item_type == ITEM_TYPE_GAME_MESSAGE_WINDOW:
                 io.alloc(3)
                 io.load(8, text, "game_msg")
     elif item_type in EXPRESSION_TYPES:
         io.alloc(3)
-        exp = data.setdefault("expression", {})
+        exp = data.setdefault("expression", {"_t": "ExpressionStatement"})
         expression(io, io.load(16, exp, "raw"), exp)
     elif item_type in FOCUS_TYPES:
         io.alloc(3)
-        focus_item(io, item_type, data.setdefault("focus", {}))
+        focus_item(io, item_type, data.setdefault("focus", {"_t": "focusItemDef_s"}))
 
 
 def window(io: XStream, w: Chunk, node: dict) -> None:
@@ -205,7 +210,7 @@ def anim_info(io: XStream, node: dict) -> None:
         return
     states = io.children(node, "anim_states")
     for i in range(a.s32(0)):
-        state = io.child(states, i)
+        state = io.tag(io.child(states, i), "animParamsDef_t")
         if io.follows(table, 4 * i, owned=True):
             io.alloc(3)
             p = io.load(108, state, "raw")
@@ -220,15 +225,17 @@ def item(io: XStream, node: dict) -> None:
     io.string(it, 192, node, "dvar_test")
     io.string(it, 196, node, "enable_dvar")
     item_data(io, it.s32(176), it, node)
-    rect = sub(io, it, 212, node, "rect_exp_data")
+    rect = sub(io, it, 212, node, "rect_exp_data", "rectData_s")
     if rect is not None:
         r = io.load(64, rect, "raw")
         for k in range(4):
-            expression(io, r.sub(16 * k, 16), rect.setdefault(k, {}))
-    expression(io, it.sub(216, 16), node.setdefault("visible_exp", {}))
-    expression(io, it.sub(248, 16), node.setdefault("text_align_y_exp", {}))
+            expression(io, r.sub(16 * k, 16), rect.setdefault(k, {"_t": "ExpressionStatement"}))
+    expression(io, it.sub(216, 16), node.setdefault("visible_exp", {"_t": "ExpressionStatement"}))
+    expression(
+        io, it.sub(248, 16), node.setdefault("text_align_y_exp", {"_t": "ExpressionStatement"})
+    )
     event_handlers(io, it, 268, node, "on_event")
-    info = sub(io, it, 272, node, "anim_info")
+    info = sub(io, it, 272, node, "anim_info", "UIAnimInfo")
     if info is not None:
         anim_info(io, info)
 
@@ -241,11 +248,11 @@ def menu_body(io: XStream, m: Chunk, node: dict) -> None:
     io.string(m, 176, node, "font")
     event_handlers(io, m, 292, node, "on_open")
     key_handlers(io, m, 296, node, "on_key")
-    expression(io, m.sub(300, 16), node.setdefault("visible_exp", {}))
+    expression(io, m.sub(300, 16), node.setdefault("visible_exp", {"_t": "ExpressionStatement"}))
     io.string(m, 336, node, "allowed_binding")
     io.string(m, 340, node, "sound_name")
-    expression(io, m.sub(384, 16), node.setdefault("rect_x_exp", {}))
-    expression(io, m.sub(400, 16), node.setdefault("rect_y_exp", {}))
+    expression(io, m.sub(384, 16), node.setdefault("rect_x_exp", {"_t": "ExpressionStatement"}))
+    expression(io, m.sub(400, 16), node.setdefault("rect_y_exp", {"_t": "ExpressionStatement"}))
     count = m.s32(188)
     table = array(io, m, 416, 3, 4 * count, node, "item_ptrs", owned=True)
     if table is not None:
@@ -253,6 +260,7 @@ def menu_body(io: XStream, m: Chunk, node: dict) -> None:
         for i in range(count):
             element = io.child(elements, i)
             if io.follows(table, 4 * i, owned=True):
+                io.tag(element, "itemDef_s")
                 io.alloc(7)
                 item(io, element)
     io.pop()
@@ -260,6 +268,7 @@ def menu_body(io: XStream, m: Chunk, node: dict) -> None:
 
 @register
 class MenuHandler(Handler):
+    kind = "menuDef_t"
     asset_type = AssetType.MENU
     header_size = 424
     align = 7
@@ -276,6 +285,7 @@ class MenuFileHandler(Handler):
     """MenuList (12): +0 name, +4 menuCount, +8 menus [nz] (align 4, 4 x count,
     each a menu asset ref)."""
 
+    kind = "MenuList"
     asset_type = AssetType.MENUFILE
     header_size = 12
 

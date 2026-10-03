@@ -34,19 +34,24 @@ def material_body(io: XStream, h: Chunk, node: dict) -> None:
     io.string(h, 0, node, "name")
     asset_ref(io, h, 0x70, AssetType.TECHSET, node, "technique_set")
     texture_count, constant_count, state_bits_count = h.u8(0x67), h.u8(0x68), h.u8(0x69)
-    for d, texture in items(io, h, 0x74, 3, 16, texture_count, node, "textures") or ():
+    for d, texture in (
+        items(io, h, 0x74, 3, 16, texture_count, node, "textures", kind="MaterialTextureDef") or ()
+    ):
         if d.u8(7) == TS_WATER_MAP:
             water = None
             if io.follows(d, 12):
                 io.alloc(3)
-                water = texture.get("water") if not io.reading else {}
+                water = texture.get("water") if not io.reading else {"_t": "water_t"}
                 c = io.load(72, water, "raw")
                 water_body(io, c, water)
             io.note(texture, "water", water)
         else:
             asset_ref(io, d, 12, AssetType.IMAGE, texture, "image")
     array(io, h, 0x78, 15, 32 * constant_count, node, "constants")
-    for e, element in items(io, h, 0x7C, 3, 4, state_bits_count, node, "state_bits") or ():
+    for e, element in (
+        items(io, h, 0x7C, 3, 4, state_bits_count, node, "state_bits", kind="MaterialStateBitsRef")
+        or ()
+    ):
         raw = io.ref(e, 0)
         io.push(Block.TEMP)
         if raw in (PTR_INLINE, PTR_INSERT):
@@ -60,6 +65,7 @@ def material_body(io: XStream, h: Chunk, node: dict) -> None:
 
 @register
 class MaterialHandler(Handler):
+    kind = "Material"
     asset_type = AssetType.MATERIAL
     header_size = 0x80
 

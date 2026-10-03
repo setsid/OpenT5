@@ -31,6 +31,7 @@ class LocalizeEntry(dict):
 
 @register
 class LocalizeHandler(Handler):
+    kind = "LocalizeEntry"
     asset_type = AssetType.LOCALIZE
     header_size = 8
     node_type = LocalizeEntry

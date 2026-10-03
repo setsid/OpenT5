@@ -24,6 +24,7 @@ def shader_body(io: XStream, h: Chunk, node: dict, size_at: int) -> None:
 
 @register
 class PixelShaderHandler(Handler):
+    kind = "MaterialPixelShader"
     asset_type = AssetType.PIXELSHADER
     header_size = 12
 
@@ -33,6 +34,7 @@ class PixelShaderHandler(Handler):
 
 @register
 class VertexShaderHandler(Handler):
+    kind = "MaterialVertexShader"
     asset_type = AssetType.VERTEXSHADER
     header_size = 16
 

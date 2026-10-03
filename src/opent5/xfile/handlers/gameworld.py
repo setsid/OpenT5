@@ -26,13 +26,17 @@ def gameworld_body(io: XStream, h: Chunk, node: dict) -> None:
     io.string(h, 0, node, "name")
     node_count = h.u32(4)
     total = node_count + EXTRA_NODES
-    for n, element in items(io, h, 8, 3, PATHNODE_SIZE, total, node, "nodes") or ():
+    for n, element in (
+        items(io, h, 8, 3, PATHNODE_SIZE, total, node, "nodes", kind="pathnode_t") or ()
+    ):
         array(io, n, 0x40, 3, 12 * n.u16(0x3E), element, "links")
     runtime(io, h, 0xC, 15, 16 * total)  # basenodes
     array(io, h, 0x14, 1, 2 * node_count, node, "chain_node_for_node")
     array(io, h, 0x18, 1, 2 * node_count, node, "node_for_chain_node")
     array(io, h, 0x20, 0, h.u32(0x1C), node, "path_vis")
-    for t, element in items(io, h, 0x28, 3, 0x10, h.u32(0x24), node, "node_tree") or ():
+    for t, element in (
+        items(io, h, 0x28, 3, 0x10, h.u32(0x24), node, "node_tree", kind="pathnode_tree_t") or ()
+    ):
         if t.s32(0) < 0:
             array(io, t, 0xC, 1, 2 * t.u32(8), element, "nodes")
         else:
@@ -44,6 +48,7 @@ def gameworld_body(io: XStream, h: Chunk, node: dict) -> None:
 
 @register
 class GameWorldSpHandler(Handler):
+    kind = "GameWorld"
     asset_type = AssetType.GAME_MAP_SP
     header_size = 0x2C
 
@@ -53,6 +58,7 @@ class GameWorldSpHandler(Handler):
 
 @register
 class GameWorldMpHandler(Handler):
+    kind = "GameWorld"
     asset_type = AssetType.GAME_MAP_MP
     header_size = 0x2C
 

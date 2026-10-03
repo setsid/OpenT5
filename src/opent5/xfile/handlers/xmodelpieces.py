@@ -35,7 +35,7 @@ class XModelPiecesHandler(Handler):
         if raw != PTR_INLINE:
             return {"offset_pointer": raw} if io.reading else node
         if io.reading:
-            node = {}
+            node = {"_t": "XModelPieces"}
         io.trail.append(self.name)
         io.alloc(3)
         self.body(io, io.load(self.header_size, node, "header"), node)
@@ -44,5 +44,8 @@ class XModelPiecesHandler(Handler):
 
     def body(self, io: XStream, h: Chunk, node: dict) -> None:
         io.string(h, 0, node, "name")
-        for p, piece in items(io, h, 8, 3, PIECE_SIZE, h.s32(4), node, "pieces", owned=True) or ():
+        for p, piece in (
+            items(io, h, 8, 3, PIECE_SIZE, h.s32(4), node, "pieces", owned=True, kind="XModelPiece")
+            or ()
+        ):
             asset_ref(io, p, 0, AssetType.XMODEL, piece, "model")

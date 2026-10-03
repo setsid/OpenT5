@@ -77,6 +77,7 @@ class StringTable(dict):
 
 @register
 class StringTableHandler(Handler):
+    kind = "StringTable"
     asset_type = AssetType.STRINGTABLE
     header_size = 20
     node_type = StringTable
@@ -85,7 +86,7 @@ class StringTableHandler(Handler):
         io.push(Block.VIRTUAL)
         io.string(h, 0, node, "name")
         count = h.s32(4) * h.s32(8)
-        cells = items(io, h, 12, 3, 8, count, node, "cells", owned=True)
+        cells = items(io, h, 12, 3, 8, count, node, "cells", owned=True, kind="StringTableCell")
         for cell, element in cells or ():
             io.string(cell, 0, element, "string")
         array(io, h, 16, 1, 2 * count, node, "cell_index", owned=True)

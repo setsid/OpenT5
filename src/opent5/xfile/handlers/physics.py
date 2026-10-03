@@ -21,6 +21,7 @@ PHYS_CONSTRAINT_COUNT = 16
 
 @register
 class PhysPresetHandler(Handler):
+    kind = "PhysPreset"
     asset_type = AssetType.PHYSPRESET
     header_size = 0x54
 
@@ -42,6 +43,7 @@ def phys_constraint(io: XStream, c: Chunk, node: dict) -> None:
 class PhysConstraintsHandler(Handler):
     """Node: "header", "name", "data" (16 constraint nodes, sliced from the header)."""
 
+    kind = "PhysConstraints"
     asset_type = AssetType.PHYSCONSTRAINTS
     header_size = 0xA88
 
@@ -82,6 +84,7 @@ def piece(io: XStream, p: Chunk, node: dict) -> None:
 
 @register
 class DestructibleDefHandler(Handler):
+    kind = "DestructibleDef"
     asset_type = AssetType.DESTRUCTIBLEDEF
     header_size = 0x18
 
@@ -90,7 +93,17 @@ class DestructibleDefHandler(Handler):
         io.string(h, 0, node, "name")
         asset_ref(io, h, 4, AssetType.XMODEL, node, "model")
         asset_ref(io, h, 8, AssetType.XMODEL, node, "pristine_model")
-        pieces = items(io, h, 0x10, 3, DESTRUCTIBLE_PIECE_SIZE, h.u32(0xC), node, "pieces")
+        pieces = items(
+            io,
+            h,
+            0x10,
+            3,
+            DESTRUCTIBLE_PIECE_SIZE,
+            h.u32(0xC),
+            node,
+            "pieces",
+            kind="DestructiblePiece",
+        )
         for p, element in pieces or ():
             piece(io, p, element)
         io.pop()

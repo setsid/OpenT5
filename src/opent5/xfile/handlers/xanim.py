@@ -18,12 +18,12 @@ from opent5.xfile.handlers.base import Handler, array, register
 from opent5.xfile.stream import Chunk, XStream
 
 
-def _part(io: XStream, parent: Chunk, off: int, node: dict, key: str) -> dict | None:
+def _part(io: XStream, parent: Chunk, off: int, node: dict, key: str, kind: str) -> dict | None:
     """An [nz] pointer to a sub-node; returns the node to fill, or None."""
     if io.follows(parent, off, owned=True):
         io.alloc(3)
         if io.reading:
-            node[key] = {}
+            node[key] = {"_t": kind}
         return node[key]
     if io.reading:
         node[key] = None
@@ -33,7 +33,7 @@ def _part(io: XStream, parent: Chunk, off: int, node: dict, key: str) -> dict | 
 def delta_part_body(io: XStream, numframes: int, node: dict) -> None:
     dp = io.load(8, node, "raw")
     index_size = 1 if numframes <= 255 else 2
-    trans = _part(io, dp, 0, node, "trans")
+    trans = _part(io, dp, 0, node, "trans", "XAnimPartTrans")
     if trans is not None:
         head = io.load(4, trans, "head")
         size, small = head.u16(0), head.u8(2)
@@ -46,7 +46,7 @@ def delta_part_body(io: XStream, numframes: int, node: dict) -> None:
                 array(io, frames, 24, 0, 3 * (size + 1), trans, "frames", owned=True)
             else:
                 array(io, frames, 24, 3, 6 * (size + 1), trans, "frames", owned=True)
-    quat = _part(io, dp, 4, node, "quat")
+    quat = _part(io, dp, 4, node, "quat", "XAnimDeltaPartQuat")
     if quat is not None:
         head = io.load(4, quat, "head")
         size = head.u16(0)
@@ -77,7 +77,7 @@ def xanim_body(io: XStream, h: Chunk, node: dict) -> None:
     numframes = h.u16(14)
     array(io, h, 64, 1, 2 * h.u8(35), node, "names", owned=True)
     array(io, h, 96, 3, 8 * h.u8(36), node, "notify", owned=True)
-    delta = _part(io, h, 100, node, "delta_part")
+    delta = _part(io, h, 100, node, "delta_part", "XAnimDeltaPart")
     if delta is not None:
         delta_part_body(io, numframes, delta)
     for key, off, count, mask, size in _data_arrays(h):
@@ -92,6 +92,7 @@ def xanim_body(io: XStream, h: Chunk, node: dict) -> None:
 
 @register
 class XAnimHandler(Handler):
+    kind = "XAnimParts"
     asset_type = AssetType.XANIM
     header_size = 104
 

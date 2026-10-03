@@ -30,14 +30,16 @@ def pass_body(io: XStream, p: Chunk, node: dict) -> None:
     asset_ref(io, p, 4, AssetType.VERTEXSHADER, node, "vertex_shader")
     asset_ref(io, p, 8, AssetType.PIXELSHADER, node, "pixel_shader")
     count = p.u8(12) + p.u8(13) + p.u8(14)
-    for a, arg in items(io, p, 20, 3, 8, count, node, "args", owned=True) or ():
+    for a, arg in (
+        items(io, p, 20, 3, 8, count, node, "args", owned=True, kind="MaterialShaderArgument") or ()
+    ):
         if a.u16(0) in LITERAL_ARG_TYPES:
             array(io, a, 4, 3, 16, arg, "literal")
 
 
 def technique_body(io: XStream, node: dict) -> None:
     head = io.load(8, node, "head")
-    for p, element in io.items(24, head.u16(6), node, "passes"):
+    for p, element in io.items(24, head.u16(6), node, "passes", "MaterialPass"):
         pass_body(io, p, element)
     io.string(head, 0, node, "name")
 
@@ -52,13 +54,14 @@ def techset_body(io: XStream, h: Chunk, node: dict) -> None:
         if io.follows(h, 8 + 4 * i):
             io.alloc(3)
             if io.reading:
-                techniques[i] = {}
+                techniques[i] = {"_t": "MaterialTechnique"}
             technique_body(io, techniques[i])
     io.pop()
 
 
 @register
 class TechsetHandler(Handler):
+    kind = "MaterialTechniqueSet"
     asset_type = AssetType.TECHSET
     header_size = 292
 

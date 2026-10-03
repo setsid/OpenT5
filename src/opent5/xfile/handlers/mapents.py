@@ -14,6 +14,7 @@ from opent5.xfile.stream import Chunk, XStream
 
 @register
 class MapEntsHandler(Handler):
+    kind = "MapEnts"
     asset_type = AssetType.MAP_ENTS
     header_size = 0xC
 

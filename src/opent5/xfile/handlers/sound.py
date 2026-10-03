@@ -20,12 +20,12 @@ from opent5.xfile.stream import Chunk, XStream
 SAT_LOADED = 1
 
 
-def _sub(io: XStream, parent: Chunk, off: int, node: dict, key: str, owned: bool = False):
-    """A pointer to one sub-struct: align 4 and return its node, or None."""
-    if io.follows(parent, off, owned):
+def _sub(io: XStream, parent: Chunk, off: int, node: dict, key: str, kind: str):
+    """A pointer to one sub-struct ([-1]): align 4 and return its node, or None."""
+    if io.follows(parent, off):
         io.alloc(3)
         if io.reading:
-            node[key] = {}
+            node[key] = {"_t": kind}
         return node[key]
     if io.reading:
         node[key] = None
@@ -34,7 +34,7 @@ def _sub(io: XStream, parent: Chunk, off: int, node: dict, key: str, owned: bool
 
 def sound_file_body(io: XStream, sf: Chunk, node: dict) -> None:
     if sf.u8(4) == SAT_LOADED:
-        loaded = _sub(io, sf, 0, node, "loaded")
+        loaded = _sub(io, sf, 0, node, "loaded", "LoadedSound")
         if loaded is not None:
             ls = io.load(60, loaded, "raw")
             io.string(ls, 0, loaded, "name")
@@ -45,11 +45,11 @@ def sound_file_body(io: XStream, sf: Chunk, node: dict) -> None:
             io.pop()
             io.pop()
     else:
-        streamed = _sub(io, sf, 0, node, "streamed")
+        streamed = _sub(io, sf, 0, node, "streamed", "StreamedSound")
         if streamed is not None:
             ss = io.load(24, streamed, "raw")
             io.string(ss, 0, streamed, "filename")
-            prime = _sub(io, ss, 4, streamed, "prime_snd")
+            prime = _sub(io, ss, 4, streamed, "prime_snd", "PrimedSound")
             if prime is not None:
                 ps = io.load(12, prime, "raw")
                 io.string(ps, 0, prime, "name")
@@ -62,13 +62,14 @@ def alias_body(io: XStream, a: Chunk, node: dict) -> None:
     io.string(a, 0, node, "name")
     io.string(a, 8, node, "subtitle")
     io.string(a, 12, node, "secondary_name")
-    sound_file = _sub(io, a, 16, node, "sound_file")
+    sound_file = _sub(io, a, 16, node, "sound_file", "SoundFile")
     if sound_file is not None:
         sound_file_body(io, io.load(8, sound_file, "raw"), sound_file)
 
 
 @register
 class SoundHandler(Handler):
+    kind = "SndBank"
     asset_type = AssetType.SOUND
     header_size = 40
 
@@ -77,11 +78,15 @@ class SoundHandler(Handler):
         io.string(h, 0, node, "name")
         count = h.u32(4)
         for entry, alias_list in (
-            items(io, h, 8, 3, 20, count, node, "alias_lists", owned=True) or ()
+            items(io, h, 8, 3, 20, count, node, "alias_lists", owned=True, kind="snd_alias_list_t")
+            or ()
         ):
             io.string(entry, 0, alias_list, "name")
             n = entry.s32(12)
-            for a, alias in items(io, entry, 8, 3, 84, n, alias_list, "aliases", owned=True) or ():
+            for a, alias in (
+                items(io, entry, 8, 3, 84, n, alias_list, "aliases", owned=True, kind="snd_alias_t")
+                or ()
+            ):
                 alias_body(io, a, alias)
         array(io, h, 12, 3, 4 * count, node, "alias_index", owned=True)
         array(io, h, 0x1C, 3, 96 * h.u32(0x18), node, "radverbs", owned=True)
@@ -91,6 +96,7 @@ class SoundHandler(Handler):
 
 @register
 class SoundPatchHandler(Handler):
+    kind = "SndPatch"
     asset_type = AssetType.SOUND_PATCH
     header_size = 20
 
@@ -98,7 +104,7 @@ class SoundPatchHandler(Handler):
         io.push(Block.VIRTUAL)
         io.string(h, 0, node, "name")
         array(io, h, 8, 3, 4 * h.u32(4), node, "elements", owned=True)
-        for f, element in items(io, h, 16, 3, 8, h.u32(12), node, "files") or ():
+        for f, element in items(io, h, 16, 3, 8, h.u32(12), node, "files", kind="SoundFile") or ():
             sound_file_body(io, f, element)
         io.pop()
 
@@ -116,6 +122,7 @@ DRIVER_ARRAYS = (
 
 @register
 class SndDriverGlobalsHandler(Handler):
+    kind = "SndDriverGlobals"
     asset_type = AssetType.SNDDRIVERGLOBALS
     header_size = 52
 

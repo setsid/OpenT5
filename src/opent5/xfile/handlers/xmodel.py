@@ -49,17 +49,21 @@ def xsurface(io: XStream, s: Chunk, node: dict) -> None:
         array(io, s, 0x24, mask, size * vert_count, node, "vertex_stream")
         if block is not None:
             io.pop()
-    lists = items(io, s, 0x2C, 3, 12, s.u8(1), node, "vert_lists")
+    lists = items(io, s, 0x2C, 3, 12, s.u8(1), node, "vert_lists", kind="XRigidVertList")
     for vl, element in lists or ():
         if io.follows(vl, 8):
             io.alloc(3)
-            collision_tree(io, element.setdefault("collision_tree", {}))
+            collision_tree(
+                io, element.setdefault("collision_tree", {"_t": "XSurfaceCollisionTree"})
+            )
     array(io, s, 0x8, 15, 6 * tri_count, node, "tri_indices")
 
 
 def brush_wrapper(io: XStream, node: dict) -> None:
     b = io.load(0x60, node, "raw")
-    for side, element in items(io, b, 0x20, 3, 0xC, b.u32(0x1C), node, "sides") or ():
+    for side, element in (
+        items(io, b, 0x20, 3, 0xC, b.u32(0x1C), node, "sides", kind="cbrushside_t") or ()
+    ):
         array(io, side, 0, 3, 0x14, element, "plane")
     array(io, b, 0x58, 3, 0xC * b.u32(0x54), node, "verts")
     io.convert(b, 0x5C)  # converted only (offset pointers seen; never loaded)
@@ -70,10 +74,12 @@ def collmap(io: XStream, chunk: Chunk, off: int, node: dict) -> None:
     if geom_list is None:
         return
     count = geom_list.u32(0)
-    for g, geom in items(io, geom_list, 4, 15, 0x44, count, node, "geoms") or ():
+    for g, geom in (
+        items(io, geom_list, 4, 15, 0x44, count, node, "geoms", kind="PhysGeomInfo") or ()
+    ):
         if io.follows(g, 0):
             io.alloc(15)
-            brush_wrapper(io, geom.setdefault("brush", {}))
+            brush_wrapper(io, geom.setdefault("brush", {"_t": "BrushWrapper"}))
 
 
 def xmodel_body(io: XStream, h: Chunk, node: dict) -> None:
@@ -86,15 +92,19 @@ def xmodel_body(io: XStream, h: Chunk, node: dict) -> None:
     array(io, h, 0x14, 3, 16 * (bones - roots), node, "trans")
     array(io, h, 0x18, 0, bones, node, "part_classification")
     array(io, h, 0x1C, 3, 0x20 * bones, node, "base_mat")
-    for s, surface in items(io, h, 0x20, 3, XSURFACE_SIZE, surf_count, node, "surfs") or ():
+    for s, surface in (
+        items(io, h, 0x20, 3, XSURFACE_SIZE, surf_count, node, "surfs", kind="XSurface") or ()
+    ):
         xsurface(io, s, surface)
-    for m, element in items(io, h, 0x24, 3, 4, surf_count, node, "materials") or ():
+    for m, element in (
+        items(io, h, 0x24, 3, 4, surf_count, node, "materials", kind="XModelMaterial") or ()
+    ):
         asset_ref(io, m, 0, AssetType.MATERIAL, element, "material")
     array(io, h, 0xA0, 3, 0x24 * h.u32(0xA4), node, "coll_surfs")
     array(io, h, 0xAC, 3, 0x2C * bones, node, "bone_info")
     array(io, h, 0xD0, 3, 0x10 * surf_count, node, "high_mip_bounds")
     asset_ref(io, h, 0xE8, AssetType.PHYSPRESET, node, "phys_preset")
-    for c, element in items(io, h, 0xF0, 3, 4, h.u8(0xEC), node, "collmaps") or ():
+    for c, element in items(io, h, 0xF0, 3, 4, h.u8(0xEC), node, "collmaps", kind="Collmap") or ():
         collmap(io, c, 0, element)
     asset_ref(io, h, 0xF4, AssetType.PHYSCONSTRAINTS, node, "phys_constraints")
     io.pop()
@@ -102,6 +112,7 @@ def xmodel_body(io: XStream, h: Chunk, node: dict) -> None:
 
 @register
 class XModelHandler(Handler):
+    kind = "XModel"
     asset_type = AssetType.XMODEL
     header_size = 0xF8
 

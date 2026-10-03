@@ -45,11 +45,28 @@ def elem_def_body(io: XStream, e: Chunk, node: dict) -> None:
     array(io, e, 188, 3, 96 * (e.u8(186) + 1), node, "vel_samples", owned=True)
     array(io, e, 192, 3, 48 * (e.u8(187) + 1), node, "vis_samples", owned=True)
     if elem_type == ELEM_TYPE_DECAL:
-        for d, decal in items(io, e, 196, 3, 8, visual_count, node, "visuals", owned=True) or ():
+        for d, decal in (
+            items(
+                io,
+                e,
+                196,
+                3,
+                8,
+                visual_count,
+                node,
+                "visuals",
+                owned=True,
+                kind="FxElemMarkVisuals",
+            )
+            or ()
+        ):
             asset_ref(io, d, 0, AssetType.MATERIAL, decal, "material0")
             asset_ref(io, d, 4, AssetType.MATERIAL, decal, "material1")
     elif visual_count > 1:
-        for v, element in items(io, e, 196, 3, 4, visual_count, node, "visuals", owned=True) or ():
+        for v, element in (
+            items(io, e, 196, 3, 4, visual_count, node, "visuals", owned=True, kind="FxElemVisuals")
+            or ()
+        ):
             visual(io, v, 0, elem_type, element, "visual")
     else:
         visual(io, e, 196, elem_type, node, "visual")
@@ -60,7 +77,7 @@ def elem_def_body(io: XStream, e: Chunk, node: dict) -> None:
     trail = None
     if io.follows(e, 256, owned=True):
         io.alloc(3)
-        trail = {} if io.reading else node["trail_def"]
+        trail = {"_t": "FxTrailDef"} if io.reading else node["trail_def"]
         t = io.load(28, trail, "raw")
         array(io, t, 16, 3, 20 * t.s32(12), trail, "verts", owned=True)
         array(io, t, 24, 1, 2 * t.s32(20), trail, "inds", owned=True)
@@ -72,7 +89,9 @@ def fx_body(io: XStream, h: Chunk, node: dict) -> None:
     io.push(Block.VIRTUAL)
     io.string(h, 0, node, "name")
     count = h.s32(16) + h.s32(20) + h.s32(24)
-    elems = items(io, h, 0x1C, 3, FX_ELEM_DEF_SIZE, count, node, "elem_defs", owned=True)
+    elems = items(
+        io, h, 0x1C, 3, FX_ELEM_DEF_SIZE, count, node, "elem_defs", owned=True, kind="FxElemDef"
+    )
     for e, element in elems or ():
         elem_def_body(io, e, element)
     io.pop()
@@ -80,6 +99,7 @@ def fx_body(io: XStream, h: Chunk, node: dict) -> None:
 
 @register
 class FxHandler(Handler):
+    kind = "FxEffectDef"
     asset_type = AssetType.FX
     header_size = 60
 
@@ -96,6 +116,7 @@ IMPACT_EFFECTS = IMPACT_ROWS * IMPACT_EFFECTS_PER_ROW
 class ImpactFxHandler(Handler):
     """FxImpactTable; node "table" holds 735 effect refs (21 rows of 35)."""
 
+    kind = "FxImpactTable"
     asset_type = AssetType.IMPACTFX
     header_size = 8
 

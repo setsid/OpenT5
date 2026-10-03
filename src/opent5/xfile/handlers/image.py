@@ -61,6 +61,7 @@ def image_body(io: XStream, h: Chunk, node: dict) -> None:
 
 @register
 class ImageHandler(Handler):
+    kind = "GfxImage"
     asset_type = AssetType.IMAGE
     header_size = 0x70
 

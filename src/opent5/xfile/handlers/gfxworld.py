@@ -23,9 +23,13 @@ def reflection_probe(io: XStream, p: Chunk, node: dict) -> None:
 
 
 def cell(io: XStream, c: Chunk, node: dict) -> None:
-    for t, tree in items(io, c, 0x1C, 3, 0x28, c.u32(0x18), node, "aabb_tree") or ():
+    for t, tree in (
+        items(io, c, 0x1C, 3, 0x28, c.u32(0x18), node, "aabb_tree", kind="GfxAabbTree") or ()
+    ):
         array(io, t, 0x20, 1, 2 * t.u16(0x1E), tree, "smodel_indexes")
-    for p, portal in items(io, c, 0x24, 3, 0x44, c.u32(0x20), node, "portals") or ():
+    for p, portal in (
+        items(io, c, 0x24, 3, 0x44, c.u32(0x20), node, "portals", kind="GfxPortal") or ()
+    ):
         io.convert(p, 0x20)  # cell, converted only
         array(io, p, 0x24, 3, 0xC * p.u8(0x28), portal, "vertices")
     array(io, c, 0x34, 0, c.u8(0x30), node, "reflection_probes")
@@ -41,7 +45,7 @@ def gfxworld_body(io: XStream, h: Chunk, node: dict) -> None:
     array(io, h, 0x3C, 3, 4 * h.u32(0x38), node, "sky_start_surfs")
     asset_ref(io, h, 0x40, AssetType.IMAGE, node, "sky_image")
     io.string(h, 0x48, node, "sky_box_model")
-    sun = node.setdefault("sun_light", {})
+    sun = node.setdefault("sun_light", {"_t": "GfxLight"})
     sun_raw = array(io, h, 0x100, 15, 0x170, sun, "raw")
     if sun_raw is not None:
         asset_ref(io, sun_raw, 0x160, AssetType.LIGHTDEF, sun, "def")  # GfxLight.def
@@ -54,15 +58,23 @@ def gfxworld_body(io: XStream, h: Chunk, node: dict) -> None:
     array(io, h, 0x158, 3, 0x14 * planes, node, "planes")
     array(io, h, 0x15C, 1, 2 * nodes, node, "nodes")
     runtime(io, h, 0x160, 3, 4 * 0x200 * cells)  # sceneEntCellBits
-    for c, element in items(io, h, 0x168, 3, CELL_SIZE, cells, node, "cells") or ():
+    for c, element in items(io, h, 0x168, 3, CELL_SIZE, cells, node, "cells", kind="GfxCell") or ():
         cell(io, c, element)
     # draw
     probe_count = h.u32(0x16C)
-    for p, probe in items(io, h, 0x170, 3, 0x18, probe_count, node, "reflection_probes") or ():
+    for p, probe in (
+        items(
+            io, h, 0x170, 3, 0x18, probe_count, node, "reflection_probes", kind="GfxReflectionProbe"
+        )
+        or ()
+    ):
         reflection_probe(io, p, probe)
     runtime(io, h, 0x174, 3, 0x18 * probe_count)  # reflectionProbeTextures
     lightmap_count = h.u32(0x178)
-    for m, lightmap in items(io, h, 0x17C, 3, 0xC, lightmap_count, node, "lightmaps") or ():
+    for m, lightmap in (
+        items(io, h, 0x17C, 3, 0xC, lightmap_count, node, "lightmaps", kind="GfxLightmapArray")
+        or ()
+    ):
         for k in range(3):
             asset_ref(io, m, 4 * k, AssetType.IMAGE, lightmap, k)
     for off in (0x180, 0x184, 0x188):  # lightmap textures
@@ -78,13 +90,16 @@ def gfxworld_body(io: XStream, h: Chunk, node: dict) -> None:
     # light grid at +0x230
     row_axis = h.u32(0x244)
     lo, hi = h.u16(0x238 + 2 * row_axis), h.u16(0x23E + 2 * row_axis)
-    grid = node.setdefault("light_grid", {})
+    grid = node.setdefault("light_grid", {"_t": "GfxLightGrid"})
     array(io, h, 0x24C, 1, 2 * (hi - lo + 1), grid, "row_data_start")
     array(io, h, 0x254, 3, h.u32(0x250), grid, "raw_row_data")
     array(io, h, 0x25C, 3, 4 * h.u32(0x258), grid, "entries")
     array(io, h, 0x264, 3, 0xA8 * h.u32(0x260), grid, "colors")
     array(io, h, 0x26C, 3, 0x3C * h.u32(0x268), node, "models")
-    for m, element in items(io, h, 0x290, 3, 8, h.u32(0x28C), node, "material_memory") or ():
+    for m, element in (
+        items(io, h, 0x290, 3, 8, h.u32(0x28C), node, "material_memory", kind="MaterialMemory")
+        or ()
+    ):
         asset_ref(io, m, 0, AssetType.MATERIAL, element, "material")
     asset_ref(io, h, 0x298, AssetType.MATERIAL, node, "sun_sprite_material")
     asset_ref(io, h, 0x29C, AssetType.MATERIAL, node, "sun_flare_material")
@@ -99,11 +114,18 @@ def gfxworld_body(io: XStream, h: Chunk, node: dict) -> None:
     runtime(io, h, 0x348, 3, 4 * dyn_client[0] * shadow_lights)
     runtime(io, h, 0x34C, 3, 4 * dyn_client[1] * shadow_lights)
     runtime(io, h, 0x350, 0, dyn_client[0])
-    for e, geom in items(io, h, 0x354, 3, 0xC, light_count, node, "shadow_geom") or ():
+    for e, geom in (
+        items(io, h, 0x354, 3, 0xC, light_count, node, "shadow_geom", kind="GfxShadowGeometry")
+        or ()
+    ):
         array(io, e, 4, 1, 2 * e.u16(0), geom, "sorted_surf_index")
         array(io, e, 8, 1, 2 * e.u16(2), geom, "smodel_index")
-    for e, region in items(io, h, 0x358, 3, 8, light_count, node, "light_region") or ():
-        for hull, element in items(io, e, 4, 3, 0x50, e.u32(0), region, "hulls") or ():
+    for e, region in (
+        items(io, h, 0x358, 3, 8, light_count, node, "light_region", kind="GfxLightRegion") or ()
+    ):
+        for hull, element in (
+            items(io, e, 4, 3, 0x50, e.u32(0), region, "hulls", kind="GfxLightRegionHull") or ()
+        ):
             array(io, hull, 0x4C, 3, 0x14 * hull.u32(0x48), element, "axis")
     # dpvs static
     smodel_count, static_surface_count = h.u32(0x35C), h.u32(0x364)
@@ -117,11 +139,26 @@ def gfxworld_body(io: XStream, h: Chunk, node: dict) -> None:
     runtime(io, h, 0x3A8, 127, 8 * smodel_vis)
     array(io, h, 0x3AC, 1, 2 * static_surface_count, node, "sorted_surf_index")
     array(io, h, 0x3B0, 3, 0x28 * smodel_count, node, "smodel_insts")
-    for s, surface in items(io, h, 0x3B4, 15, 0x60, surfaces, node, "surfaces") or ():
+    for s, surface in (
+        items(io, h, 0x3B4, 15, 0x60, surfaces, node, "surfaces", kind="GfxSurface") or ()
+    ):
         asset_ref(io, s, 0x40, AssetType.MATERIAL, surface, "material")
     # cullGroups: 32 x cullGroupCount (+0x118); [nz] (0x250c64)
     array(io, h, 0x3B8, 3, 0x20 * h.u32(0x118), node, "cull_groups", owned=True)
-    for d, inst in items(io, h, 0x3BC, 3, 0x2C, smodel_count, node, "smodel_draw_insts") or ():
+    for d, inst in (
+        items(
+            io,
+            h,
+            0x3BC,
+            3,
+            0x2C,
+            smodel_count,
+            node,
+            "smodel_draw_insts",
+            kind="GfxStaticModelDrawInst",
+        )
+        or ()
+    ):
         asset_ref(io, d, 0x20, AssetType.XMODEL, inst, "model")
     runtime(io, h, 0x3C0, 3, 8 * static_surface_count)  # surfaceMaterials
     runtime(io, h, 0x3C4, 127, 4 * surface_vis)  # surfaceCastsSunShadow
@@ -151,6 +188,7 @@ def gfxworld_body(io: XStream, h: Chunk, node: dict) -> None:
 
 @register
 class GfxWorldHandler(Handler):
+    kind = "GfxWorld"
     asset_type = AssetType.GFX_MAP
     header_size = 0x454
 

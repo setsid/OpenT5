@@ -58,6 +58,7 @@ class RawFile(dict):
 
 @register
 class RawFileHandler(Handler):
+    kind = "RawFile"
     asset_type = AssetType.RAWFILE
     header_size = 12
     node_type = RawFile

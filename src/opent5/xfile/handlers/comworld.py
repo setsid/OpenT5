@@ -17,6 +17,7 @@ PRIMARY_LIGHT_SIZE = 0xDC
 
 @register
 class ComWorldHandler(Handler):
+    kind = "ComWorld"
     asset_type = AssetType.COM_MAP
     header_size = 0x40
 
@@ -24,13 +25,34 @@ class ComWorldHandler(Handler):
         io.push(Block.VIRTUAL)
         io.string(h, 0, node, "name")
         lights = items(
-            io, h, 0xC, 3, PRIMARY_LIGHT_SIZE, h.u32(8), node, "primary_lights", owned=True
+            io,
+            h,
+            0xC,
+            3,
+            PRIMARY_LIGHT_SIZE,
+            h.u32(8),
+            node,
+            "primary_lights",
+            owned=True,
+            kind="ComPrimaryLight",
         )
         for light, element in lights or ():
             io.string(light, 0xD8, element, "def_name")
         array(io, h, 0x24, 3, 8 * h.u32(0x20), node, "water_cells", owned=True)
         for cell, element in (
-            items(io, h, 0x3C, 3, 12, h.u32(0x38), node, "burnable_cells", owned=True) or ()
+            items(
+                io,
+                h,
+                0x3C,
+                3,
+                12,
+                h.u32(0x38),
+                node,
+                "burnable_cells",
+                owned=True,
+                kind="ComBurnableCell",
+            )
+            or ()
         ):
             array(io, cell, 8, 0, 32, element, "data", owned=True)
         io.pop()

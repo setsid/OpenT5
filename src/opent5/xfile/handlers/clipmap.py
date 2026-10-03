@@ -78,7 +78,9 @@ def clipmap_body(io: XStream, h: Chunk, node: dict) -> None:
     for key, off, mask, size, count_at in _ARRAYS_1:
         _plain(io, h, node, key, off, mask, size, h.u32(count_at))
     count = h.u32(0x38)
-    for n, element in items(io, h, 0x3C, 3, 0x14, count, node, "leafbrush_nodes") or ():
+    for n, element in (
+        items(io, h, 0x3C, 3, 0x14, count, node, "leafbrush_nodes", kind="cLeafBrushNode_s") or ()
+    ):
         brushes = n.s16(2)
         if brushes > 0:
             array(io, n, 8, 1, 2 * brushes, element, "brushes")
@@ -95,7 +97,9 @@ def clipmap_body(io: XStream, h: Chunk, node: dict) -> None:
     dyn_counts = [h.u16(0xFE + 2 * k) for k in range(4)]
     for k in range(2):
         key = f"dyn_ent_def_list{k}"
-        defs = items(io, h, 0x108 + 4 * k, 3, DYN_ENT_DEF_SIZE, dyn_counts[k], node, key)
+        defs = items(
+            io, h, 0x108 + 4 * k, 3, DYN_ENT_DEF_SIZE, dyn_counts[k], node, key, kind="DynEntityDef"
+        )
         for d, element in defs or ():
             dyn_ent_def(io, d, element)
     # RUNTIME lists: pose[2], client[2], server[2], coll[4].
@@ -107,7 +111,17 @@ def clipmap_body(io: XStream, h: Chunk, node: dict) -> None:
     runtime(io, h, 0x124, 3, 8 * dyn_counts[3])
     for k in range(4):
         runtime(io, h, 0x128 + 4 * k, 3, 0x20 * dyn_counts[k])
-    constraints = items(io, h, 0x13C, 3, PHYS_CONSTRAINT_SIZE, h.u32(0x138), node, "constraints")
+    constraints = items(
+        io,
+        h,
+        0x13C,
+        3,
+        PHYS_CONSTRAINT_SIZE,
+        h.u32(0x138),
+        node,
+        "constraints",
+        kind="PhysConstraint",
+    )
     for c, element in constraints or ():
         phys_constraint(io, c, element)
     runtime(io, h, 0x144, 3, ROPE_SIZE * h.u32(0x140))
@@ -116,6 +130,7 @@ def clipmap_body(io: XStream, h: Chunk, node: dict) -> None:
 
 @register
 class ClipMapSpHandler(Handler):
+    kind = "clipMap_t"
     asset_type = AssetType.COL_MAP_SP
     header_size = 0x14C
 
@@ -125,6 +140,7 @@ class ClipMapSpHandler(Handler):
 
 @register
 class ClipMapMpHandler(Handler):
+    kind = "clipMap_t"
     asset_type = AssetType.COL_MAP_MP
     header_size = 0x14C
 

@@ -41,6 +41,8 @@ class Handler:
     align: ClassVar[int] = 3
     #: The node class (a dict subclass may add typed accessors).
     node_type: ClassVar[type] = dict
+    #: The node kind of the asset's root ("_t"), naming its field schema.
+    kind: ClassVar[str] = ""
 
     @property
     def name(self) -> str:
@@ -61,6 +63,8 @@ class Handler:
         if raw in (PTR_INLINE, PTR_INSERT):
             if io.reading:
                 node = self.node_type()
+                if self.kind:
+                    node["_t"] = self.kind
             elif not isinstance(node, dict):
                 raise io.fail(f"{self.name}: the pointer says inline, found {type(node).__name__}")
             io.trail.append(self.name)
@@ -156,12 +160,14 @@ def items(
     node: Any,
     key: Any,
     owned: bool = False,
+    kind: str | None = None,
 ) -> list[tuple[Chunk, dict]] | None:
     """A pointer to an array of `count` structs: when inline, align and load them
-    as element nodes in node[key]; returns (chunk, element) pairs, else None."""
+    as element nodes in node[key] (each tagged `kind`); returns (chunk, element)
+    pairs, else None."""
     if io.follows(chunk, off, owned):
         io.alloc(mask)
-        return io.items(size, count, node, key)
+        return io.items(size, count, node, key, kind)
     if io.reading:
         node[key] = None
     return None

@@ -13,6 +13,7 @@ from opent5.xfile.stream import Chunk, XStream
 
 @register
 class LightDefHandler(Handler):
+    kind = "GfxLightDef"
     asset_type = AssetType.LIGHTDEF
     header_size = 0x10
 

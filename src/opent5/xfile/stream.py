@@ -281,11 +281,20 @@ class XStream:
             node[key] = chunk.bytes()
         return chunk
 
-    def items(self, size: int, count: int, node: Any, key: Any) -> list[tuple[Chunk, dict]]:
+    def items(
+        self, size: int, count: int, node: Any, key: Any, kind: str | None = None
+    ) -> list[tuple[Chunk, dict]]:
         """One Load_Stream of `count` structs of `size` bytes, stored as node[key] = a
-        list of element nodes, each {"raw": its bytes}; returns (chunk, element) pairs."""
+        list of element nodes, each {"raw": its bytes} (and "_t": kind when given);
+        returns (chunk, element) pairs."""
         chunk = self._read(size * count)
-        elements = [{"raw": chunk.data[size * i : size * (i + 1)].tobytes()} for i in range(count)]
+        data = chunk.data
+        if kind is None:
+            elements = [{"raw": data[size * i : size * (i + 1)].tobytes()} for i in range(count)]
+        else:
+            elements = [
+                {"_t": kind, "raw": data[size * i : size * (i + 1)].tobytes()} for i in range(count)
+            ]
         node[key] = elements
         return list(zip(chunk.items(size, count), elements, strict=True))
 
@@ -293,6 +302,12 @@ class XStream:
         """Store a decoded value for the reader's convenience (ignored when writing;
         the bytes stay authoritative)."""
         node[key] = value
+
+    def tag(self, node: dict, kind: str) -> dict:
+        """Name the node's kind ("_t"), which keys its field schema
+        (opent5.xfile.structs.KINDS). Reading only; returns the node."""
+        node["_t"] = kind
+        return node
 
     def children(self, node: Any, key: Any) -> list:
         """A list that holds child nodes: created when reading, fetched when writing."""
@@ -559,7 +574,9 @@ class XWriter(XStream):
             return self._emit(b"")
         return self._emit(self._stored(node, key, size))
 
-    def items(self, size: int, count: int, node: Any, key: Any) -> list[tuple[Chunk, dict]]:
+    def items(
+        self, size: int, count: int, node: Any, key: Any, kind: str | None = None
+    ) -> list[tuple[Chunk, dict]]:
         elements = node.get(key) if isinstance(node, dict) else node[key]
         if elements is None or len(elements) != count:
             found = None if elements is None else len(elements)
@@ -572,6 +589,9 @@ class XWriter(XStream):
 
     def note(self, node: Any, key: Any, value: Any) -> None:
         pass
+
+    def tag(self, node: dict, kind: str) -> dict:
+        return node
 
     def children(self, node: Any, key: Any) -> list:
         items = node[key]

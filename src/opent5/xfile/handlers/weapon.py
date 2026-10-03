@@ -17,11 +17,11 @@ WEAPON_DEF_SIZE = 2056
 FLAME_TABLE_SIZE = 476
 
 
-def _sub(io: XStream, parent: Chunk, off: int, node: dict, key: str) -> dict | None:
+def _sub(io: XStream, parent: Chunk, off: int, node: dict, key: str, kind: str) -> dict | None:
     if io.follows(parent, off):
         io.alloc(3)
         if io.reading:
-            node[key] = {}
+            node[key] = {"_t": kind}
         return node[key]
     if io.reading:
         node[key] = None
@@ -121,7 +121,7 @@ def weapon_def_body(io: XStream, d: Chunk, node: dict) -> None:
     for off in (1984, 1988, 1992, 2024, 2028):  # rumbles, flame table names
         s(off)
     for key, off in (("flameTableFirstPerson", 2032), ("flameTableThirdPerson", 2036)):
-        table = _sub(io, d, off, node, key)
+        table = _sub(io, d, off, node, key, "FlameTable")
         if table is not None:
             flame_table_body(io, table)
     effect(2040)
@@ -131,7 +131,7 @@ def weapon_def_body(io: XStream, d: Chunk, node: dict) -> None:
 def weapon_body(io: XStream, h: Chunk, node: dict) -> None:
     io.push(Block.VIRTUAL)
     io.string(h, 0, node, "name")
-    weap_def = _sub(io, h, 8, node, "weapDef")
+    weap_def = _sub(io, h, 8, node, "weapDef", "WeaponDef")
     if weap_def is not None:
         weapon_def_body(io, io.load(WEAPON_DEF_SIZE, weap_def, "raw"), weap_def)
     io.string(h, 12, node, "szDisplayName")
@@ -152,6 +152,7 @@ def weapon_body(io: XStream, h: Chunk, node: dict) -> None:
 
 @register
 class WeaponHandler(Handler):
+    kind = "WeaponVariantDef"
     asset_type = AssetType.WEAPON
     header_size = 228
 
