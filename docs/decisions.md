@@ -76,3 +76,21 @@ convert now that the path is confirmed.
 seeded terrain, greedy-meshed well under the uint16 brush/surface caps, 11 own
 pixel-art textures). CLI wiring for the index is deferred to a single cli.py pass
 with the mod-patch track.
+
+**PARKED: PC Mod Tools loader wedged (needs you).** Partway through the night the
+LinkerMod loader (launcher_ldr) started returning "Access is denied" (exit 5) for
+every map compile, including a trivial box, while cod2map.exe alone still runs
+(but writes the old v31 BSP, not the v45 the linker needs). A protected
+launcher-x64 process (seen earlier as PID 12280, session 0) could not be killed
+by this WSL user (taskkill and PowerShell both denied). Likely a pile-up of
+concurrent builds wedged it, or a Defender/DLL-injection policy. It is not in the
+task list now, so a restart or clearing that process should free it. This blocks
+ONLY new PC map compiles: the fixC/fixD box builds and the blocky-map PS3
+conversion. Everything that does not need a fresh compile (the k_box_full and
+l_box_full demos, all app features, the exe) is unaffected. Morning: clear the
+process or restart, then run the blockmap build/convert and the fixC/fixD builds
+(exact commands in the overnight report).
+
+**Landed:** GUI panels for cross-zone search and mod patches (0d575cd, self-test
+109/0), blocky-map material/image registration and conversion wiring (1389817).
+Full lint clean.
