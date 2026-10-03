@@ -146,3 +146,22 @@ def test_restart_refused_in_test_mode(window, tmp_path):
     window.updates.outcome = check.Outcome("ready", "r", "9.0.0", path=exe, test_mode=True)
     window.updates.restart()
     assert "never installed" in window.st_message.text()
+
+
+def test_window_starts_when_the_updater_cannot_load(monkeypatch, tmp_path):
+    """A broken update module (for example a crypto library missing from a frozen build)
+    disables update checks; the editor still opens."""
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+
+    from opent5.gui import mainwindow, updates
+
+    def broken(window):
+        raise ModuleNotFoundError("No module named '_cffi_backend'")
+
+    monkeypatch.setattr(updates, "attach", broken)
+    QApplication.instance() or QApplication(["opent5"])
+    win = mainwindow.MainWindow(QSettings(str(tmp_path / "s.ini"), QSettings.Format.IniFormat))
+    assert win.updates is None
+    win.ask_before_discard = False
+    win.close()
