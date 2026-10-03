@@ -18,11 +18,11 @@ from pathlib import Path
 
 from opent5.container.fastfile import OFFSET_ZONE_NAME, ZONE_NAME_SIZE
 from opent5.container.zone import Zone
+from opent5.convert import compass, mapname, world
 from opent5.convert import lighting as lit
-from opent5.convert import mapname, world
 from opent5.convert import pc as pcmod
 from opent5.convert import scripts as sc
-from opent5.convert.splice import BASE, Splice
+from opent5.convert.splice import BASE, FOREIGN, Splice
 from opent5.convert.world import ConvertError
 from opent5.edit.content import mapents_bytes, mapents_text, rawfile_bytes, rawfile_text
 from opent5.xfile import AssetType, parse, write
@@ -36,6 +36,7 @@ WORLD_TYPES = (
     AssetType.GAME_MAP_MP,
     AssetType.COL_MAP_MP,
 )
+LIGHTING = ("baked", "flat", "sunlit", "keep")
 GAMETYPES = ("dm", "sab", "sd", "tdm", "ctf", "koth", "dom", "dem", "hlnd", "oic", "gun", "shrp")
 
 
@@ -45,6 +46,8 @@ class ConvertResult:
     fastfile: bytes
     zone_name: str
     report: dict = field(default_factory=dict)
+    #: The compass image drawn for the map (RGBA), when one was made.
+    compass: object = None
 
 
 def _one(xfile, asset_type: int, what: str):
@@ -64,20 +67,24 @@ def _progress(progress, stage: str) -> None:
 def convert_map(
     pc_fastfile: bytes,
     base_path: str | Path,
-    lighting: str = "flat",
+    lighting: str = "baked",
     require: tuple[str, ...] = ("tdm", "dm"),
     compat: bool | None = None,
     progress=None,
     name: str | None = None,
+    with_compass: bool = True,
 ) -> ConvertResult:
     """Convert. ``pc_fastfile``: the PC ``.ff`` bytes (``IWffu100``); ``base_path``: the
-    stock PS3 map zone whose world is replaced. ``lighting``: "flat" or "keep"
-    (``lighting``). ``require``: gametypes whose spawns must be in the map. ``compat``:
-    add the entities the base map's stock script needs (``scripts.COMPAT_ENTITIES``);
-    default: only when the map keeps the base's name. ``name``: the map's own name (zone
-    ``<name>.ff``, ``mapname.validate`` rules); None keeps the base's name."""
-    if lighting not in ("flat", "sunlit", "keep"):
-        raise ConvertError(f"lighting: expected 'flat', 'sunlit' or 'keep', found {lighting!r}")
+    stock PS3 map zone whose world is replaced. ``lighting``: "baked" (the PC map's own
+    cod2rad lightmaps, probes and outdoor image, ``lightmaps``), or "flat", "sunlit", "keep"
+    (the base's lightmaps, ``lighting``). ``require``: gametypes whose spawns must be in the
+    map. ``compat``: add the entities the base map's stock script needs
+    (``scripts.COMPAT_ENTITIES``); default: only when the map keeps the base's name.
+    ``name``: the map's own name (zone ``<name>.ff``, ``mapname.validate`` rules); None
+    keeps the base's name. ``with_compass``: add the compass material and image
+    (``compass``)."""
+    if lighting not in LIGHTING:
+        raise ConvertError(f"lighting: expected one of {LIGHTING}, found {lighting!r}")
     report: dict = {"assets": {}, "notes": []}
     _progress(progress, "Reading the PC zone")
     pc_content = pcmod.read_pc_fastfile(pc_fastfile)
@@ -166,11 +173,12 @@ def convert_map(
             },
         }
     else:
-        report["lighting"] = {"mode": "keep"}
+        report["lighting"] = {"mode": lighting}
 
     words = {name: w for name, (w, _) in stock_words.items()}
-    gres = world.convert_gfx(pgfx, stock_gfx, words)
+    gres = world.convert_gfx(pgfx, stock_gfx, words, baked=lighting == "baked")
     report["notes"] += gres.notes
+    report["lighting"].update(gres.lighting)
     surfaces = gres.node["surfaces"] or []
     for element, name in zip(surfaces, pc_names, strict=True):
         element["material"] = stock_words[name][1]
@@ -217,19 +225,38 @@ def convert_map(
     # Entities and gametypes.
     text = mapents_text(ents) if isinstance(ents, dict) else ""
     added = []
+    bounds = struct.unpack_from(">6f", pgfx["header"], 0x270)
     if isinstance(ents, dict) and compat:
-        bounds = struct.unpack_from(">6f", pgfx["header"], 0x270)
         added = sc.compat_entities(base_name, bounds[0:3], bounds[3:6])
-        if added:
-            newline = "\r\n" if "\r\n" in text else "\n"
-            if text and not text.endswith(newline):
-                text += newline
-            text += sc.entity_text(added, newline)
-            ents["header"], ents["entity_string"] = mapents_bytes(ents, text)
+    compat_added = list(added)
+    # The compass needs exactly two minimap_corner entities (compass.py).
+    corners_found = [e for e in sc.parse_entities(text) if e.get("targetname") == compass.CORNER]
+    nw, se = compass.corners(bounds[0:3], bounds[3:6])
+    corner_note = "the PC map's own"
+    if not corners_found:
+        minimap = compass.corner_entities(nw, se, bounds[2])
+        added = added + minimap
+        corner_note = "added: a square around the world bounds plus 64 units"
+    elif len(corners_found) == 2:
+        pts = [tuple(float(v) for v in e["origin"].split()[:2]) for e in corners_found]
+        nw = (max(p[0] for p in pts), max(p[1] for p in pts))
+        se = (min(p[0] for p in pts), min(p[1] for p in pts))
+    else:
+        raise ConvertError(
+            f"entities: expected 0 or 2 {compass.CORNER!r} entities (maps/mp/_compass.gsc "
+            f"needs exactly two), found {len(corners_found)}"
+        )
+    if isinstance(ents, dict) and added:
+        newline = "\r\n" if "\r\n" in text else "\n"
+        if text and not text.endswith(newline):
+            text += newline
+        text += sc.entity_text(added, newline)
+        ents["header"], ents["entity_string"] = mapents_bytes(ents, text)
     entities = sc.parse_entities(text)
     ready = sc.gametype_report(entities, list(GAMETYPES))
     report["entities"] = {
-        "added_for_the_stock_script": added,
+        "added_for_the_stock_script": compat_added,
+        "minimap_corners": {"north_west": list(nw), "south_east": list(se), "source": corner_note},
         "count": len(entities),
         "classes": _count(e.get("classname") for e in entities),
     }
@@ -290,6 +317,31 @@ def convert_map(
             **names.to_dict(),
         }
 
+    # Compass: a material and image of the map's own, inside its zone (compass.py).
+    compass_node = None
+    compass_rgba = None
+    if with_compass:
+        stock_cpg = _code_post_gfx(base_path)
+        if stock_cpg is None:
+            report["notes"].append(
+                "compass: code_post_gfx_mp.ff not found beside the base or in .env; no compass"
+            )
+        else:
+            label = own if renamed else base_name
+            compass_node, compass_rgba, report["compass"] = compass.add_to_zone(
+                bx, stock_cpg, label, base_name, pgfx, nw, se
+            )
+            if renamed:
+                report["compass"]["script"] = _point_script_at(
+                    bx, own, compass.material_name(base_name), compass.material_name(own)
+                )
+            else:
+                report["compass"]["script"] = (
+                    "unchanged: the level script names compass_map_" + base_name + "; the "
+                    "zone's material of that name replaces code_post_gfx_mp's while the map is "
+                    "loaded (zone rank 10 over 1, compass.py; INFERRED until run)"
+                )
+
     # Write and remap.
     _progress(progress, "Writing and remapping")
     splice = Splice(base, foreign)
@@ -297,7 +349,7 @@ def convert_map(
     # Data kept from the stock GfxWorld now hangs under the converted node; pointers
     # elsewhere in the base to the replaced assets' names (the last rawfile is named by
     # the GfxWorld's base name string) follow the converted assets' name strings.
-    splice.moved(BASE, stock_gfx, pgfx, (*world.STOCK_KEYS, "name", "base_name"))
+    splice.moved(BASE, stock_gfx, pgfx, (*gres.stock_keys, "name", "base_name"))
     for t, node in ((AssetType.COM_MAP, pcom), (AssetType.GAME_MAP_MP, pgame)):
         splice.moved(BASE, stock_nodes[t], node, ("name",))
     splice.moved(BASE, stock_nodes[AssetType.COL_MAP_MP], pclip, ("name",))
@@ -306,6 +358,10 @@ def convert_map(
         splice.moved(BASE, stock_ents, ents, ("name",))
     for element in gres.stock_nodes:
         splice.origin(element, BASE)
+    for element in gres.new_nodes:
+        splice.origin(element, FOREIGN)
+    if compass_node is not None:
+        splice.origin(compass_node, BASE)
     result = splice.build(check=True, progress=progress)
     report["pointers"] = {
         "via_base": result.via["base"],
@@ -332,7 +388,33 @@ def convert_map(
         "signature": "no longer matches: loads only on a client with the signature check "
         "patched out",
     }
-    return ConvertResult(result.content, built.data, zone.name, report)
+    return ConvertResult(result.content, built.data, zone.name, report, compass_rgba)
+
+
+def _code_post_gfx(base_path: Path):
+    """The parsed code_post_gfx_mp (holds the stock compass materials), or None."""
+    from opent5 import env
+
+    for folder in (base_path.parent, *env.zone_dirs()):
+        path = folder / "code_post_gfx_mp.ff"
+        if path.is_file():
+            return parse(bytes(Zone.open(path).content), log=False)
+    return None
+
+
+def _point_script_at(xfile, own: str, old: str, new: str) -> str:
+    """The map's own level script calls setupMiniMap with its own material."""
+    script = f"maps/mp/{own}.gsc"
+    for a in xfile.by_type(AssetType.RAWFILE):
+        if a.data.get("name") == script:
+            text = rawfile_text(a.data)
+            call = f'setupMiniMap("{old}")'
+            if call not in text:
+                return f"{script}: no {call}; unchanged"
+            changed = text.replace(call, f'setupMiniMap("{new}")')
+            a.data["header"], a.data["buffer"] = rawfile_bytes(a.data, changed)
+            return f'{script}: setupMiniMap("{new}")'
+    return f"{script}: not found; unchanged"
 
 
 def _count(values) -> dict:

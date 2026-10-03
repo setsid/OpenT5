@@ -74,7 +74,7 @@ def test_box_converts_into_mp_nuked(converted):
     r = converted.report
     assert r["checks"]["reparse_exact"] and r["checks"]["write_identical"]
     assert r["checks"]["unresolved"] == 0
-    assert r["checks"]["assets"] == 529
+    assert r["checks"]["assets"] == 530  # 529 stock + the compass material
     assert r["zone"]["name"] == "mp_nuked"
     for g in ("tdm", "dm"):
         assert r["gametypes"][g] == "ready"
@@ -86,8 +86,34 @@ def test_box_converts_into_mp_nuked(converted):
     assert "maps\\mp\\_load::main();" in r["scripts"]["main_kept"]
     assert r["assets"]["glasses"]["action"].startswith("numGlasses 62 -> 0")
     assert r["pointers"]["via_pc"] > 0
-    assert r["lighting"]["mode"] == "flat"
-    assert len(r["lighting"]["donors"]) == 3
+    light = r["lighting"]
+    assert light["mode"] == "baked"
+    assert (light["lightmaps"], light["reflection_probes"], light["outdoor_image"]) == (1, 1, True)
+    assert [(i["name"], i["format"], i["bytes"]) for i in light["images"]] == [
+        ("*lightmap0_primary", "DXT1", 524288),
+        ("*lightmap0_secondary", "R5G6B5", 1048576),
+        ("*lightmap0_secondaryb", "Y16_X16", 1048576),
+        ("*reflection_probe0", "DXT1", 768),
+        ("$outdoor", "B8", 262144),
+    ]
+    assert light["light_grid"] == "1 colours; last 15009d x 56 -> 40059d x 56"
+    assert r["zone"]["header"][5] == "0x9dd700"  # PHYSICAL_RUNTIME: the box's own lightmaps
+    compass = r["compass"]
+    assert compass["material"] == "compass_map_mp_nuked" and compass["asset_index"] == 529
+    assert compass["image"]["bytes"] == 262144 and compass["image"]["drawn_pixels"] > 150000
+    corners = r["entities"]["minimap_corners"]
+    assert (corners["north_west"], corners["south_east"]) == ([576.0, 576.0], [-576.0, -576.0])
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_box_flat_lighting_still_converts(box):
+    from opent5.convert.mapzone import convert_map
+
+    r = convert_map(box, _ps3("mp_nuked"), lighting="flat").report
+    assert r["checks"]["unresolved"] == 0 and r["checks"]["reparse_exact"]
+    assert r["lighting"]["mode"] == "flat" and len(r["lighting"]["donors"]) == 3
+    assert "images" not in r["lighting"]
 
 
 @pytest.mark.zones
@@ -147,3 +173,24 @@ def test_pc_nuked_world_matches_ps3_nuked():
     for name in ("com_map.primary_lights", "game_map_mp.nodes", "col_map_mp.brushes"):
         assert data[name] == 0
     assert len(r["gfx_header_differing_words"]) == 6
+
+
+PC_BOX_GRID = (
+    Path(os.environ.get("OPENT5_PC_BOX_GRID", "/nonexistent")),
+    STEAM / "zone" / "English" / "mp_opent5box_grid.ff",
+)
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_box_with_a_light_grid_converts():
+    """The box rebuilt with a lightgrid_volume brush (docs/demo-box-lit.md): cod2map writes
+    the grid points, cod2rad a real light grid, the converter keeps it."""
+    from opent5.convert.mapzone import convert_map
+
+    path = _first(PC_BOX_GRID)
+    if path is None:
+        pytest.skip("mp_opent5box_grid.ff is not on this machine")
+    r = convert_map(path.read_bytes(), _ps3("mp_nuked")).report
+    assert r["checks"]["unresolved"] == 0 and r["checks"]["reparse_exact"]
+    assert r["lighting"]["light_grid"] == "2164 colours; last 15009d x 56 -> 40059d x 56"

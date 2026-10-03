@@ -309,3 +309,8 @@ def test_the_box_converts_under_its_own_name():
         if a.type == R and a.name.endswith((".gsc", ".csc")):
             text = rawfile_text(a.data)
             assert "maps\\mp\\mp_nuked" not in text and "clientscripts\\mp\\mp_nuked" not in text
+    compass = result.report["compass"]
+    assert compass["material"] == "compass_map_mp_opent5box"
+    assert compass["image"]["name"] == "compass_map_mp_opent5box"
+    assert compass["script"] == 'maps/mp/mp_opent5box.gsc: setupMiniMap("compass_map_mp_opent5box")'
+    assert "compass_map_mp_opent5box" in {a.name for a in x.assets if a.type == 6}

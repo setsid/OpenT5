@@ -386,30 +386,43 @@ def light_grid_rows(raw_le: bytes, row_start_le: bytes | None) -> bytes:
 
 # -- GfxWorld: the whole node ---------------------------------------------------------------
 
-#: PS3 header ranges kept from the target zone's GfxWorld, with what they hold. The PC
-#: images (sky, lightmaps, reflection probes, outdoor) are PC GfxImages with PC pixel
-#: data and the PC materials have D3D9 techsets: the target's PS3 ones stay.
+#: PS3 header ranges whose words stay the target zone's in every mode: pointer words to
+#: data kept from the target (and the counts that size it). Everything else in the header,
+#: including the sun flare data (+0x294 hasValidData, +0x2a0..) and the outdoorLookupMatrix
+#: (+0x2f4..+0x333), is the PC map's own (box-lighting.md 5: keeping the stock range gave the
+#: box Nuketown's matrix, stock ``37c4c4cd`` at +0x2f4 where the box has ``3a800000``).
 STOCK_HEADER_RANGES = (
     (0x24, 0x38, "PS3-only streaming words"),
     (0x40, 0x4C, "sky image, sky sampler state, sky box model"),
-    (0x100, 0x104, "sun light (GfxLight)"),
-    (0x16C, 0x208, "reflection probes, lightmaps, draw images"),
+    (0x100, 0x104, "sun light pointer (the record is the PC one, swapped)"),
+    (0x18C, 0x208, "draw images"),
     (0x22C, 0x230, "PS3-only word"),
-    (0x28C, 0x338, "material memory, sun flare, outdoor image"),
+    (0x28C, 0x294, "material memory count and pointer"),
+    (0x298, 0x2A0, "sun sprite and sun flare materials"),
 )
-#: Node keys taken from the stock GfxWorld with those ranges.
+#: Kept from the target as well when the PC map's lightmaps and probes are not converted
+#: (``baked`` off): the surfaces then index the target's lightmaps and probes.
+STOCK_LIGHT_RANGES = ((0x16C, 0x18C, "reflection probes, lightmaps"),)
+#: Kept when the PC map has no outdoor image.
+STOCK_OUTDOOR_RANGES = ((0x334, 0x338, "outdoor image"),)
+#: Node keys taken from the stock GfxWorld in every mode.
 STOCK_KEYS = (
     "sky_image",
     "sky_box_model",
     "sun_light",
-    "reflection_probes",
-    "lightmaps",
     "draw_images",
     "material_memory",
     "sun_sprite_material",
     "sun_flare_material",
-    "outdoor_image",
 )
+LIGHT_KEYS = ("reflection_probes", "lightmaps")
+#: The last light grid colour: cod2rad writes 15009d x 56, the PS3 build of every MP map
+#: examined holds 40059d x 56 there (PC 0x357599a vs PS3 0x1da2fb5 in mp_nuked; the same in
+#: mp_firingrange, mp_havoc, mp_villa, mp_cracked; box-lighting.md 3). INFERRED: the colour
+#: used outside the grid.
+PC_GRID_DEFAULT = bytes.fromhex("15009d") * 56
+PS3_GRID_DEFAULT = bytes.fromhex("40059d") * 56
+GRID_COLOUR = 0xA8
 #: PC arrays that are swapped struct by struct when present (same layout on PS3).
 _GFX_ARRAYS = {
     "aabb_trees": "GfxStreamingAabbTree",
@@ -451,6 +464,12 @@ class GfxResult:
     #: Element nodes created here whose pointer fields hold target-zone values.
     stock_nodes: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: Node keys whose data is the target's (``Splice.moved`` renames them).
+    stock_keys: tuple[str, ...] = STOCK_KEYS
+    #: Nodes built here from PC data (converted images, probe and lightmap records).
+    new_nodes: list[dict] = field(default_factory=list)
+    #: What was converted: images (name, format, size, sha1), probes, grid, sun.
+    lighting: dict = field(default_factory=dict)
 
 
 def surface_material_name(element: dict) -> str | None:
@@ -466,18 +485,28 @@ def convert_gfx(
     material_word: dict[str, bytes],
     light_bytes: list[bytes] | None = None,
     strict: bool = True,
+    baked: bool = False,
 ) -> GfxResult:
     """Turn the parsed PC GfxWorld ``pc`` into a PS3 one, in place (the dict keeps its
     identity so offset pointers into it, such as the clipMap's planes, still name it).
     ``stock`` is the target zone's GfxWorld, whose images, materials, probes and sun are
     kept. ``material_word[name]`` is the +0x40 word of a target surface using that
-    material."""
+    material. ``baked``: convert the PC map's own cod2rad lightmaps, reflection probes and
+    outdoor image (``lightmaps``) instead of keeping the target's."""
     for key in _UNSUPPORTED:
         if pc.get(key):
             raise ConvertError(f"PC GfxWorld {key}: holds data; not supported yet")
     pc_header = bytes(pc["header"])
     header = gfx_header(pc_header, bytes(stock["header"]))
-    for lo, hi, _ in STOCK_HEADER_RANGES:
+    ranges = list(STOCK_HEADER_RANGES)
+    stock_keys = list(STOCK_KEYS)
+    if not baked:
+        ranges += STOCK_LIGHT_RANGES
+        stock_keys += LIGHT_KEYS
+    if pc.get("outdoor_image") is None or not baked:
+        ranges += STOCK_OUTDOOR_RANGES
+        stock_keys.append("outdoor_image")
+    for lo, hi, _ in ranges:
         header[lo:hi] = bytes(stock["header"])[lo:hi]
 
     surfaces = [PCSurface.parse(i, e["raw"]) for i, e in enumerate(pc.get("surfaces") or [])]
@@ -528,8 +557,15 @@ def convert_gfx(
     for key, struct_name in _GFX_ARRAYS.items():
         value = old.get(key)
         pc[key] = None if value is None else swap_struct(struct_name, value)
-    for key in STOCK_KEYS:
+    for key in stock_keys:
         pc[key] = stock.get(key)
+    lighting: dict = {}
+    new_nodes: list[dict] = []
+    if baked:
+        from opent5.convert import lightmaps
+
+        lighting = lightmaps.convert_lighting(old, pc, new_nodes)
+    lighting["sun_light"] = convert_sun(old.get("sun_light"), pc.get("sun_light"))
     cells = old.get("cells") or []
     for c in cells:
         if c.get("cull_groups"):
@@ -561,6 +597,7 @@ def convert_gfx(
     ):
         if grid.get(key) is not None:
             grid[key] = swap_struct(struct_name, bytes(grid[key]))
+    lighting["light_grid"] = grid_default(grid)
     pc["light_grid"] = grid
     for e in old.get("shadow_geom") or ():
         e["_t"] = "GfxShadowGeometry"
@@ -589,10 +626,43 @@ def convert_gfx(
     return GfxResult(
         pc,
         groups,
-        [(lo, hi) for lo, hi, _ in STOCK_HEADER_RANGES],
+        [(lo, hi) for lo, hi, _ in ranges],
         surface_nodes,
         notes,
+        tuple(stock_keys),
+        new_nodes,
+        lighting,
     )
+
+
+def convert_sun(pc_sun: dict | None, stock_sun: dict | None) -> str:
+    """The sun GfxLight (0x170) from the PC map, into the target's node: every 32-bit word
+    swapped except +0 (type and flag bytes); +0x160 (the lightdef pointer) stays the
+    target's. PC mp_nuked converted this way equals PS3 mp_nuked, 0 words differ
+    (box-lighting.md 5)."""
+    if not isinstance(pc_sun, dict) or pc_sun.get("raw") is None:
+        return "kept: the PC map has no sun light"
+    if not isinstance(stock_sun, dict) or stock_sun.get("raw") is None:
+        return "not converted: the target has no sun light record"
+    raw = bytes(pc_sun["raw"])
+    out = bytearray(np.frombuffer(raw, "<u4").astype(">u4").tobytes())
+    out[0:4] = raw[0:4]
+    old = bytes(stock_sun["raw"])
+    out[0x160:0x164] = old[0x160:0x164]
+    changed = sum(1 for i in range(0, len(out), 4) if out[i : i + 4] != old[i : i + 4])
+    stock_sun["raw"] = bytes(out)
+    return f"PC sun light, swapped ({changed} words differ from the target's)"
+
+
+def grid_default(grid: dict) -> str:
+    """Replace a last light grid colour equal to the cod2rad default by the PS3 one."""
+    colours = grid.get("colors")
+    if not colours or len(colours) < GRID_COLOUR:
+        return "no colours"
+    if bytes(colours[-GRID_COLOUR:]) != PC_GRID_DEFAULT:
+        return "last colour is not the cod2rad default: kept"
+    grid["colors"] = bytes(colours[:-GRID_COLOUR]) + PS3_GRID_DEFAULT
+    return f"{len(colours) // GRID_COLOUR} colours; last 15009d x 56 -> 40059d x 56"
 
 
 def stock_material_words(stock: dict) -> dict[str, tuple[bytes, Any]]:

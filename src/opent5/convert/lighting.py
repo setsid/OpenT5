@@ -6,7 +6,7 @@ target's lightmap images stay (mp_nuked: one lightmap, ``*lightmap0_primary`` DX
 1024 x 1024, pixels deferred in the zone). The PC lightmap coordinates would sample
 those images at arbitrary places.
 
-``flat`` (the default) gives every vertex of a converted surface one lightmap
+``flat`` gives every vertex of a converted surface one lightmap
 coordinate: the vertex, among the target's own surfaces drawn with the same material,
 whose secondary lightmap texel is brightest in a uniform 5 x 5 neighbourhood (standard
 deviation of the luminance at most 6 of 255, at least 3 texels from the image border). The

@@ -147,7 +147,7 @@ def main(argv=None) -> int:
     c.add_argument("pc")
     c.add_argument("--base", required=True)
     c.add_argument("-o", "--out", required=True)
-    c.add_argument("--lighting", default="flat", choices=("flat", "sunlit", "keep"))
+    c.add_argument("--lighting", default="baked", choices=("baked", "flat", "sunlit", "keep"))
     c = sub.add_parser("compare")
     c.add_argument("pc")
     c.add_argument("ps3")
