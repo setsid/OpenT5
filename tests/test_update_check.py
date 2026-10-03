@@ -89,7 +89,7 @@ def test_ready_downloads_and_verifies(server, tmp_path):
     assert out.message == "Version 1.3.0 is ready. Restart to update."
     assert out.path.read_bytes() == EXE
     assert not list(tmp_path.glob("*.part"))
-    # Every request carried only our two headers plus urllib's three fixed ones.
+    # Every request carried only the client's two headers plus urllib's three fixed ones.
     for _path, headers in server.requests:
         assert set(headers) == {"Accept-Encoding", "Host", "User-Agent", "Connection", "Accept"}
         assert headers["User-Agent"].startswith("OpenT5/")

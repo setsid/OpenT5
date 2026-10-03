@@ -51,7 +51,7 @@ def header_for(name=ZONE_NAME):
     struct.pack_into(">I", out, 0x0C, 1)
     out[OFFSET_AUTH_MAGIC : OFFSET_AUTH_MAGIC + 8] = AUTH_MAGIC
     out[OFFSET_ZONE_NAME : OFFSET_ZONE_NAME + len(name)] = name
-    # A signature we made up: nothing here checks it.
+    # An invented signature: nothing here checks it.
     out[OFFSET_SIGNATURE : OFFSET_SIGNATURE + SIGNATURE_SIZE] = bytes(
         (i * 7) & 0xFF for i in range(SIGNATURE_SIZE)
     )
@@ -266,9 +266,9 @@ class TestOnDisk:
 
         unpack(source, tmp_path / "out")
         # derive_size off: this fixture's content is not a zone, so its first
-        # four bytes are not a length and deriving one would rewrite them.
-        # A real zone needs no such thing -- the value derived is the value
-        # already there, which TestTheZoneDeclaresItsOwnLength pins.
+        # four bytes are not a length and deriving one would rewrite them. On a
+        # real zone the derived value is the one already there
+        # (TestTheZoneDeclaresItsOwnLength).
         rebuilt = pack(tmp_path / "out", tmp_path / "rebuilt.ff", derive_size=False)
 
         assert rebuilt == source.read_bytes()
@@ -356,16 +356,11 @@ class TestTheRetailZones:
 
 
 class TestTheZoneDeclaresItsOwnLength:
-    """The decompressed zone carries a length field that pack used to carry
-    through unchanged.
-
-    Right for a byte-identical repack and wrong for every other kind: change
-    a member's length and the zone header says one size while another
-    arrives. It is derived now.
-    """
+    """The decompressed zone's length field (u32 BE at 0), derived on pack rather than
+    carried: carrying it is wrong for any repack that changes a member's length."""
 
     #: The fixed prefix the declared length excludes. Measured on fourteen
-    #: zones -- a 31KB ffotd through a 13MB patch_ui_mp -- with no exception.
+    #: zones (a 31KB ffotd through a 13MB patch_ui_mp) with no exception.
     PREFIX = 36
 
     def a_zone(self, body=b"the zone body"):
@@ -383,7 +378,6 @@ class TestTheZoneDeclaresItsOwnLength:
         assert fastfile.declared_size(content) == 500
 
     def test_deriving_it_changes_nothing_when_it_already_agrees(self):
-        """Which is why a byte-identical repack stays byte-identical."""
         content = self.a_zone(b"x" * 64)
 
         assert fastfile.with_declared_size(content) == content
@@ -417,8 +411,7 @@ class TestTheZoneDeclaresItsOwnLength:
             fastfile.with_declared_size(b"short")
 
     def test_packing_writes_the_derived_length(self, tmp_path):
-        """End to end through pack, which is the step that knows its input is
-        a zone. The field a console reads describes what was actually sent."""
+        """End to end through pack, the step that knows its input is a zone."""
         content = self.a_zone(b"y" * 300) + b"z" * 40
         (tmp_path / fastfile.HEADER_NAME).write_bytes(header_for())
         (tmp_path / fastfile.CONTENT_NAME).write_bytes(content)
@@ -430,8 +423,8 @@ class TestTheZoneDeclaresItsOwnLength:
         assert fastfile.declared_size(back.content) == len(content) - self.PREFIX
 
     def test_write_fastfile_itself_leaves_the_content_alone(self):
-        """It is a faithful primitive over arbitrary buffers. Deriving the
-        field there would corrupt anything that is not a zone."""
+        """A primitive over arbitrary buffers: deriving the field there would corrupt
+        anything that is not a zone."""
         odd = b"\x00\x00\x00\x01" + b"not a zone at all" * 4
 
         data = fastfile.write_fastfile(header_for(), [(odd, 6)])
@@ -454,9 +447,8 @@ ALL_RETAIL_ZONES = (
 class TestTheConsoleSignature:
     """The 256 bytes at 0x3c, read under the key lifted out of t5mp.elf.
 
-    Nothing here can sign: that needs the private key. What it can do is tell
-    a real signature from an invented one, which is the difference between a
-    repack the console will take and one it will not.
+    Nothing here can sign (that needs the private key); it can only tell a real
+    signature from an invented one.
     """
 
     def test_the_recovered_key_is_a_whole_rsa_2048_key(self):
@@ -489,8 +481,7 @@ class TestTheConsoleSignature:
 
     @pytest.mark.skipif(not EXACT.is_file(), reason="the retail zones are not on this machine")
     def test_flipping_one_bit_of_it_stops_it_decoding(self):
-        """Which is why a signature cannot be edited any more than the zone
-        can: the padding is what fails, long before anything is compared."""
+        """The PSS padding fails, before anything is compared."""
         header = bytearray(read_fastfile(EXACT.read_bytes()).header)
         header[OFFSET_SIGNATURE] ^= 0x01
 
@@ -498,8 +489,7 @@ class TestTheConsoleSignature:
 
     @pytest.mark.skipif(not EXACT.is_file(), reason="the retail zones are not on this machine")
     def test_a_repack_carries_the_same_signature_over_a_changed_zone(self):
-        """The whole finding in one assertion: the bytes move, the signature
-        does not, and nothing in this tool can make them agree again."""
+        """The bytes change, the signature does not, and nothing here can make them agree."""
         raw = EXACT.read_bytes()
         original = read_fastfile(raw)
         edited = bytearray(original.content)

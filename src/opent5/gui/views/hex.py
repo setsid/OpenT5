@@ -150,7 +150,6 @@ class HexArea(QAbstractScrollArea):
         a, b = sorted((self.anchor, self.cursor))
         return a, min(b + 1, len(self.model))
 
-    # painting
     def paintEvent(self, event) -> None:
         t = theme.current()
         p = QPainter(self.viewport())
@@ -166,7 +165,6 @@ class HexArea(QAbstractScrollArea):
         c_text, c_zero, c_off = QColor(t.text), QColor(t.hex_zero), QColor(t.hex_offset)
         c_sel, c_acc = QColor(t.selection), QColor(t.accent)
         cw, lh = self.cw, self.lh
-        # dividers
         p.setPen(QPen(QColor(t.border), 1))
         for x in (self.x_hex - cw, self.x_ascii - cw):
             p.drawLine(int(x), 0, int(x), vp.height())
@@ -179,14 +177,12 @@ class HexArea(QAbstractScrollArea):
             y = i * lh
             base = row * ROW
             data = self.model.row_bytes(row)
-            # selection backgrounds
             if has_sel and sel_a < base + ROW and sel_b > base:
                 for col in range(len(data)):
                     idx = base + col
                     if sel_a <= idx < sel_b:
                         p.fillRect(QRectF(self.byte_x(col) - cw / 2, y, cw * 3, lh), c_sel)
                         p.fillRect(QRectF(self.x_ascii + col * cw, y, cw, lh), c_sel)
-            # offset
             p.setPen(c_off)
             off = self.model.display_offset(base, self.relative)
             p.drawText(int(self.x_off), int(y + 1 + self.ascent), f"{off:08x}")

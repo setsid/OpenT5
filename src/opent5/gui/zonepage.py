@@ -192,7 +192,6 @@ class ZonePage(QWidget):
         self.unsaved.set_count(len(doc.edited_keys()), len(doc.changes()))
         self.unsaved.save_btn.setEnabled(doc.can_save)
 
-    # views
     def view(self, kind: str) -> AssetView:
         if kind not in self.views:
             module, cls, _label = VIEWS[kind]

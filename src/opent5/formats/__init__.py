@@ -1,1 +1,1 @@
-"""Asset payload formats: pixels, and later sound and geometry."""
+"""Asset payload formats: texture data."""

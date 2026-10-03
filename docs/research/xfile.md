@@ -5,8 +5,8 @@
 > the 16-byte XAssetList counted in TEMP).
 
 Status: complete for the stream framing (header, script strings, asset list, markers, blocks,
-enum, loader addresses). Per-asset struct contents belong to R2 (structs.md); section 5 gives
-R2 the entry points.
+enum, loader addresses). Per-asset struct contents belong to R2 (structs-map.md,
+structs-content.md); section 5 gives R2 the entry points.
 
 Conventions: every integer in the stream is big-endian, every pointer is 4 bytes. "Zone offset"
 is an offset into the decompressed XFile stream (the `.zone` plaintext produced by inflating a
@@ -15,7 +15,7 @@ is an offset into the decompressed XFile stream (the `.zone` plaintext produced 
 (from the entry OPD at 0xb461e0: `00010230 00b576e8`). The ELF has no symbols; function names
 below are descriptive, chosen by their behaviour, and marked as such.
 
-## 1. Stream header (XFile) - CONFIRMED (zone bytes + ELF)
+## 1. Stream header (XFile): CONFIRMED (zone bytes + ELF)
 
 The first 36 bytes are nine u32 BE:
 
@@ -64,7 +64,7 @@ PS3.
 | 5 | LARGE | yes, in place |
 | 6 | PHYSICAL | yes, in place |
 
-## 2. XAssetList, script strings, asset array - CONFIRMED (zone bytes + ELF)
+## 2. XAssetList, script strings, asset array: CONFIRMED (zone bytes + ELF)
 
 At zone offset 0x24 (16 bytes):
 
@@ -101,7 +101,7 @@ data starts at 0x3dfc = 0x2d74 + 529 x 8. The first entry is type 0x27 (stringta
 00003e10: 6d70 2f63 6f6e 6669 6773 7472 696e 6773            "mp/configstrings..." (name, inline)
 ```
 
-## 3. Stream mechanics: blocks, alignment, push/pop - CONFIRMED (ELF), alignment also from zones
+## 3. Stream mechanics (blocks, alignment, push/pop): CONFIRMED (ELF), alignment also from zones
 
 Stream primitives (descriptive names; globals live at 0x118a88c..0x11928bc):
 
@@ -139,7 +139,7 @@ PHYSICAL_RUNTIME (3) when the byte at +27 is non-zero.
 
 Deferred data at the end of the stream (PS3-specific as far as known): because blocks 2/3
 are queued and only read after the last asset, the final blockSize[2] + blockSize[3] bytes of
-the stream are that deferred data (image pixels). CONFIRMED in four zones - the last asset
+the stream are that deferred data (image pixels). CONFIRMED in four zones: the last asset
 ends exactly at `len - blockSize[3]`, and DXT-looking texel data starts there:
 
 | Zone | len | blockSize[3] | boundary | bytes before / after |
@@ -157,7 +157,7 @@ blockSize[3] equals the bytes on disc; it would break if a deferred chunk needed
 Confirm by a full struct walk (Phase 2) ending exactly at `len - blockSize[2] - blockSize[3]`.
 RUNTIME (block 1) data has no bytes in the file at all (mp_nuked declares 0x4a8580 of it).
 
-## 4. Pointer encoding - CONFIRMED (ELF), offset form also seen in zone bytes
+## 4. Pointer encoding: CONFIRMED (ELF), offset form also seen in zone bytes
 
 A 32-bit pointer field read from the stream means:
 
@@ -183,7 +183,7 @@ PS3 vs PC: the PC T5 constants (OpenAssetTools, src/ZoneCommon/Game/T5/ZoneConst
 `OFFSET_BLOCK_BIT_COUNT = 3`, `INSERT_BLOCK = XFILE_BLOCK_VIRTUAL`) match what the PS3 code
 does (3-bit block in the top bits, alias slots in VIRTUAL).
 
-## 5. Asset type enum and per-type loaders - CONFIRMED (ELF + zones)
+## 5. Asset type enum and per-type loaders: CONFIRMED (ELF + zones)
 
 Sources in t5mp.elf, all 46 entries long and mutually consistent:
 - Type name table at VA 0x00b5bccc (46 pointers to strings 0x8f43c0..0x8f4608), used by the

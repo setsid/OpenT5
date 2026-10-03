@@ -9,11 +9,8 @@ other in tests/test_salsa20.py.
 The reference design: a 16-word state of four constants, the key, an 8-byte
 nonce and a 64-bit block counter, put through twenty rounds and added to
 itself to make 64 bytes of keystream. Every word is little-endian, including
-on the big-endian console -- the cipher is defined that way and the fastfiles
-confirm it.
-
-Checked against the ECRYPT Set 6 vector for a 256-bit key in
-tests/test_salsa20.py.
+on the big-endian console: the cipher is defined that way and the fastfiles
+confirm it. The published vector is ECRYPT Set 6 for a 256-bit key.
 """
 
 from __future__ import annotations
