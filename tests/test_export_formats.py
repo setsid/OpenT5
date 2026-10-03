@@ -13,6 +13,7 @@ from opent5.export.jsonable import Jsonifier, NameTable, safe_name
 from opent5.export.obj import ObjGroup, ObjMesh, mtl_text, obj_text, read_obj
 from opent5.export.preview import render
 from opent5.export.zone import axes_to_angles, orthonormal, r_hash
+from opent5.xfile.structs import XStreamNTUV, XVertexPacked, cbrush_t
 
 # -- CMP normals, halves, packed positions -------------------------------------------------
 
@@ -26,63 +27,43 @@ def test_cmp_axes():
     assert np.allclose(v[3], [-1, 0, 0])
 
 
-def test_cmp_round_trip():
-    rng = np.random.default_rng(1)
-    v = vx.normalise(rng.normal(size=(200, 3)))
-    back = vx.unpack_cmp(vx.pack_cmp(v))
-    assert np.abs(back - v).max() < 2.5 / 511
-
-
-def test_halves_and_words():
-    rec = struct.pack(">I", 0xAABBCCDD) + np.array([0.5, -2.0], ">f2").tobytes()
-    data = rec * 3
-    assert np.allclose(vx.halves(data, 3, 8, 4), [[0.5, -2.0]] * 3)
-    assert vx.words(data, 3, 8, 0).tolist() == [0xAABBCCDD] * 3
-
-
 def test_packed_positions():
     surf = bytearray(0x5C)
     struct.pack_into(">3f", surf, vx.XSURF_POS_OFFSET, 1.0, 2.0, 32.0)
     surf[vx.XSURF_POS_SHIFT : vx.XSURF_POS_SHIFT + 3] = bytes([6, 6, 9])
-    q = np.array([[16384, -16384, 32767, 32767], [0, 0, 0, -32768]], ">i2").tobytes()
-    p = vx.packed_positions(q, 2, 8, bytes(surf))
+    q = np.array([[16384, -16384, 32767], [0, 0, 0]])
+    p = vx.packed_positions(q, bytes(surf))
     assert np.allclose(p[0], [1 + 32, 2 - 32, 32 + 512 * 32767 / 32768], atol=1e-3)
     assert np.allclose(p[1], [1, 2, 32])
 
 
 def test_xsurface_mesh_format5():
+    # Typed arrays in the parser's own formats for flags 5 (XVertexPacked, XStreamNTUV).
     surf = bytearray(0x5C)
     surf[vx.XSURF_POS_SHIFT : vx.XSURF_POS_SHIFT + 3] = bytes([6, 6, 6])
-    verts0 = np.array([[0, 0, 0, 32767], [512, 0, 0, 32767], [0, 512, 0, 32767]], ">i2")
-    stream = b"".join(
-        struct.pack(">II", 0x7FC00000, 0x000003FF) + np.array([u, v], ">f2").tobytes()
-        for u, v in ((0, 0), (1, 0), (0, 1))
+    verts0 = np.frombuffer(
+        np.array([[0, 0, 0, 32767], [512, 0, 0, 32767], [0, 512, 0, 32767]], ">i2").tobytes(),
+        XVertexPacked.dtype(),
     )
-    tris = struct.pack(">3H", 0, 1, 2)
-    m = vx.xsurface_mesh(5, 3, tris, 1, verts0.tobytes(), stream, bytes(surf))
+    stream = np.frombuffer(
+        b"".join(
+            struct.pack(">II", 0x7FC00000, 0x000003FF) + np.array([u, v], ">f2").tobytes()
+            for u, v in ((0, 0), (1, 0), (0, 1))
+        ),
+        XStreamNTUV.dtype(),
+    )
+    m = vx.xsurface_mesh(verts0, stream, np.array([[0, 1, 2]], ">u2"), bytes(surf))
     assert np.allclose(m.positions, [[0, 0, 0], [1, 0, 0], [0, 1, 0]])
     assert np.allclose(m.normals, [[0, 0, 1]] * 3)
     assert np.allclose(m.uvs, [[0, 0], [1, 0], [0, 1]])
     assert m.triangles.tolist() == [[0, 1, 2]]
 
 
-def test_xsurface_buffer_sizes():
-    assert vx.xsurface_buffer_sizes(5, 10) == (80, 120)
-    assert vx.xsurface_buffer_sizes(3, 10) == (160, 80)
-    assert vx.xsurface_buffer_sizes(0x87, 10) == (160, 40)
-    assert vx.xsurface_buffer_sizes(4, 10) == (160, 0)
-
-
 # -- world ---------------------------------------------------------------------------------
 
 
-def _surface(first, layer, vc, tc, base):
-    raw = bytearray(0x60)
-    struct.pack_into(">I", raw, 0xC, layer)
-    struct.pack_into(">I", raw, 0x1C, first)
-    struct.pack_into(">HH", raw, 0x24, vc, tc)
-    struct.pack_into(">I", raw, 0x28, base)
-    return bytes(raw)
+def _surface(i, first, layer, vc, tc, base):
+    return vx.WorldSurface(i, first, layer, vc, tc, base)
 
 
 def _layer_vertex(uv, normal_word, extra=0):
@@ -97,24 +78,23 @@ def _layer_vertex(uv, normal_word, extra=0):
 
 def test_world_mesh_groups_and_strides():
     # Two groups: 3 vertices with stride 28, then 4 vertices with stride 36.
-    pos = np.array([[i, 2 * i, 3 * i, 1.0] for i in range(7)], ">f4").tobytes()
+    pos = np.array([[i, 2 * i, 3 * i] for i in range(7)], np.float32)
     layer = b"".join(_layer_vertex((i, -i), 0x7FC00000) for i in range(3))
     layer += b"".join(_layer_vertex((i, i), 0x000003FF, 8) for i in range(4))
     # indices are relative to the group's first vertex
-    idx = np.array([0, 1, 2, 0, 1, 2, 1, 2, 3], ">u2").tobytes()
-    surfs = [_surface(0, 0, 3, 1, 0), _surface(3, 84, 4, 2, 3)]
-    mesh, parsed, ranges = vx.world_mesh(pos, layer, idx, surfs)
+    idx = np.array([0, 1, 2, 0, 1, 2, 1, 2, 3], ">u2")
+    surfs = [_surface(0, 0, 0, 3, 1, 0), _surface(1, 3, 84, 4, 2, 3)]
+    mesh, ranges = vx.world_mesh(pos, layer, idx, surfs)
     assert ranges == [(0, 1), (1, 2)]
     assert mesh.triangles.tolist() == [[0, 1, 2], [3, 4, 5], [4, 5, 6]]
     assert np.allclose(mesh.normals[:3], [0, 0, 1])
     assert np.allclose(mesh.normals[3:], [1, 0, 0])
     assert np.allclose(mesh.uvs[4], [1, 1])
     assert mesh.colours[0].tolist() == [255, 128, 64, 255]
-    assert parsed[1].layer_offset == 84
 
 
 def test_world_group_stride_mismatch():
-    surfs = [vx.WorldSurface.parse(0, _surface(0, 0, 3, 1, 0))]
+    surfs = [_surface(0, 0, 0, 3, 1, 0)]
     with pytest.raises(ValueError, match="whole stride"):
         vx.world_group_strides(surfs, 3, 85)
 
@@ -178,17 +158,17 @@ def test_brush_with_cut_side():
     assert (pts @ n <= 1 / np.sqrt(2) + 1e-6).all()
 
 
-def test_parse_brushes_resolves_sides_and_planes():
-    plane = struct.pack(">4f", 0, 0, 1, 0.5) + bytes(4)
-    side = struct.pack(">Iii", 0x80000101, 0, 0)
-    memory = {0x80000101: plane, 0x80000201: side}
+def test_parse_brushes_resolves_sides():
     brush = bytearray(0x60)
     struct.pack_into(">3fi3fII", brush, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0x80000201)
+    seen = []
 
-    def read(raw, size):
-        return memory[raw][:size]
+    def sides_of(raw, count):
+        seen.append((raw, count))
+        return [((0.0, 0.0, 1.0), 0.5, 0, 0)]
 
-    (b,) = col.parse_brushes(bytes(brush), read)
+    (b,) = col.parse_brushes(np.frombuffer(bytes(brush), cbrush_t.dtype()), sides_of)
+    assert seen == [(0x80000201, 1)]
     assert b.contents == 1 and len(b.planes) == 1 and b.planes[0][1] == 0.5
     pts = np.concatenate(col.brush_faces(b))
     assert pts[:, 2].max() == pytest.approx(0.5)
@@ -215,17 +195,25 @@ def test_entities():
 
 
 def test_stream_parts():
-    header = bytearray(0x70)
-    header[0x26], header[0x27] = 1, 1
-    struct.pack_into(">IHHI", header, 0x34, (0xB0 << 8) | 7, 64, 64, (1 << 24) | 0x262E)
-    struct.pack_into(">IHHI", header, 0x40, (0x2B0 << 8) | 8, 128, 128, 2)
-    header[0x64] = 2
-    parts = stream_parts(bytes(header))
+    fields = {
+        "streamingMode": 1,
+        "partCount": 2,
+        "parts": [
+            (0xB0 << 8) | 7,
+            (64 << 16) | 64,
+            (1 << 24) | 0x262E,
+            (0x2B0 << 8) | 8,
+            (128 << 16) | 128,
+            2,
+        ]
+        + [0] * 6,
+    }
+    parts = stream_parts(fields)
     assert [(p.cumulative, p.mips, p.width, p.slot, p.entry) for p in parts] == [
         (0xB00, 7, 64, 1, 0x262E),
         (0x2B00, 8, 128, 0, 2),
     ]
-    assert stream_parts(bytes(0x70)) == []
+    assert stream_parts({"streamingMode": 0}) == []
 
 
 def test_rebuild_normal_flat():

@@ -26,7 +26,6 @@ from __future__ import annotations
 import csv
 import io
 import math
-import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -38,19 +37,13 @@ from opent5.export import vertex as vx
 from opent5.export.entities import entity_text, parse_entities, vector
 from opent5.export.images import ImageError, PakSet, decode_image
 from opent5.export.jsonable import Jsonifier, NameTable, clean_float, hexs, safe_name, write_json
-from opent5.export.nodes import (
-    AliasResolver,
-    AssetIndex,
-    MemoryMap,
-    Resolver,
-    classify,
-)
+from opent5.export.nodes import AssetIndex, Resolver, classify
 from opent5.export.obj import ObjGroup, ObjMesh, mtl_text, write_obj
 from opent5.formats import texture as tx
 from opent5.xfile import parse
 from opent5.xfile.constants import AssetType as T
-from opent5.xfile.constants import decode_offset_pointer, type_name
-from opent5.xfile.stream import AssetLink
+from opent5.xfile.constants import type_name
+from opent5.xfile.schema import view
 
 #: Material texture slot names, matched by R_HashString (djb2 with XOR, each byte | 0x20,
 #: start 0; docs/extract.md 4). Names confirmed by their hash and first/last characters
@@ -93,7 +86,6 @@ MTL_SLOTS = {"colorMap": "map_Kd", "normalMap": "map_bump", "specularMap": "map_
 #: GfxImage pixels flag at +0x1b; semantic names (PC TextureSemantic order).
 SEMANTICS = {0: "2d", 1: "function", 2: "colour", 5: "normal", 8: "specular", 11: "water"}
 
-PATHNODE_SIZE = 0x80
 NODE_TYPES = (
     "badnode pathnode cover_stand cover_crouch cover_crouch_window cover_prone cover_right "
     "cover_left cover_wide_right cover_wide_left cover_pillar concealment_stand "
@@ -181,14 +173,12 @@ class ZoneExporter:
     def run(self) -> dict:
         started = time.perf_counter()
         self.out.mkdir(parents=True, exist_ok=True)
-        self.xfile = parse(self.content, log=True)
+        self.xfile = parse(self.content, log=False)
         problems = self.xfile.problems()
         if problems:
             self.manifest["parse_problems"] = problems
         self.index = AssetIndex(self.xfile)
-        self.memory = MemoryMap(self.xfile, self.content)
-        self.aliases = AliasResolver(self.memory)
-        self.resolver = Resolver(self.index, self.aliases)
+        self.resolver = Resolver(self.index, self.xfile)
         self.json = Jsonifier(self.resolver, classify)
         self.script_strings = self.xfile.script_strings
         steps = [
@@ -235,16 +225,15 @@ class ZoneExporter:
     def export_images(self) -> None:
         for name, node in sorted(self.index.of(T.IMAGE).items()):
             base = self.names.get("images", name)
-            header = bytes(node["header"])
-            gcm = tx.GcmTexture.parse(header)
+            f = view(node).fields
             info = {
-                "format": tx.format_name(gcm.format),
-                "width": gcm.width,
-                "height": gcm.height,
-                "depth": gcm.depth,
-                "mips": gcm.mipmap,
-                "cube": bool(gcm.cubemap),
-                "semantic": SEMANTICS.get(header[0x19], header[0x19]),
+                "format": tx.format_name(f["texture.format"]),
+                "width": f["texture.width"],
+                "height": f["texture.height"],
+                "depth": f["texture.depth"],
+                "mips": f["texture.mipmap"],
+                "cube": bool(f["texture.cubemap"]),
+                "semantic": SEMANTICS.get(f["semantic"], f["semantic"]),
             }
             if not self.do_images:
                 self.image_files[name] = f"images/{base}.png"
@@ -271,13 +260,8 @@ class ZoneExporter:
     # -- shaders, techsets, materials -----------------------------------------------------------
 
     def export_shaders(self) -> None:
-        """Vertex shader header (16): +0 name, +4 program, +0xe program size in words;
-        pixel shader header (12): +0 name, +4 program, +0xa words (structs-content.md 9)."""
         index = {}
-        for asset_type, ext, words_at in (
-            (T.VERTEXSHADER, ".vs.bin", 0xE),
-            (T.PIXELSHADER, ".ps.bin", 0xA),
-        ):
+        for asset_type, ext in ((T.VERTEXSHADER, ".vs.bin"), (T.PIXELSHADER, ".ps.bin")):
             for name, node in sorted(self.index.of(asset_type).items()):
                 program = node.get("program")
                 files = []
@@ -287,7 +271,7 @@ class ZoneExporter:
                     path.write_bytes(bytes(program))
                     files.append(self.rel(path))
                 index.setdefault(type_name(asset_type), {})[name] = {
-                    "program_words": struct.unpack_from(">H", node["header"], words_at)[0],
+                    "program_words": view(node).fields.programWords,
                     "file": files[0] if files else None,
                     "magic": bytes(program[:4]).decode("latin-1") if program else None,
                 }
@@ -295,63 +279,59 @@ class ZoneExporter:
         write_json(self.out / "shaders" / "index.json", index)
 
     def technique_json(self, index: int, tech: dict) -> dict:
-        """MaterialTechnique: head (8) +0 name, +4 flags u16, +6 passCount u16; passes of
-        24 bytes: +0 vertexDecl, +4 vertex shader, +8 pixel shader, +0xc three argument
-        counts (per-prim, per-object, stable); args 8 bytes: +0 type u16, +2 dest u16,
-        +4 value or literal pointer (structs-content.md 9)."""
-        head = bytes(tech["head"])
         passes = []
         for p in tech.get("passes") or []:
-            raw = bytes(p["raw"])
+            pf = view(p).fields
             args = []
             for a in p.get("args") or []:
-                ar = bytes(a["raw"])
-                kind, dest, value = struct.unpack_from(">HHI", ar, 0)
-                arg = {"type": kind, "dest": dest, "value": f"{value:#010x}"}
-                if "literal" in a and a["literal"] is not None:
-                    lit = a["literal"]
-                    arg["literal"] = (
-                        [clean_float(v) for v in struct.unpack(">4f", bytes(lit))]
-                        if isinstance(lit, bytes | bytearray | memoryview)
-                        else [clean_float(v) for v in lit]
-                    )
+                af = view(a).fields
+                arg = {"type": af.type, "dest": af.dest, "value": f"{af.u:#010x}"}
+                if a.get("literal") is not None:
+                    lit = np.frombuffer(bytes(a["literal"]), ">f4")
+                    arg["literal"] = [clean_float(float(x)) for x in lit]
                 args.append(arg)
             passes.append(
                 {
                     "vertex_decl": hexs(p.get("vertex_decl")),
                     "vertex_shader": self.resolver.name(p.get("vertex_shader")),
                     "pixel_shader": self.resolver.name(p.get("pixel_shader")),
-                    "per_prim_arg_count": raw[12],
-                    "per_obj_arg_count": raw[13],
-                    "stable_arg_count": raw[14],
+                    "per_prim_arg_count": pf.perPrimArgCount,
+                    "per_obj_arg_count": pf.perObjArgCount,
+                    "stable_arg_count": pf.stableArgCount,
                     "args": args,
                 }
             )
         return {
             "index": index,
             "name": tech.get("name"),
-            "flags": struct.unpack_from(">H", head, 4)[0],
+            "flags": view(tech).struct("head").flags,
             "passes": passes,
         }
 
     def export_techsets(self) -> None:
-        """MaterialTechniqueSet (292): +0 name, +4 worldVertFormat, +8 techniques[71]."""
         for name, node in sorted(self.index.of(T.TECHSET).items()):
-            header = bytes(node["header"])
+            v = view(node, self.xfile)
+            shared = v.target("techniques")
             techniques = []
             for i, tech in enumerate(node["techniques"]):
-                raw = struct.unpack_from(">I", header, 8 + 4 * i)[0]
                 if isinstance(tech, dict):
                     techniques.append(self.technique_json(i, tech))
-                elif raw:
-                    # An offset pointer to a technique loaded earlier (shared).
-                    techniques.append({"index": i, "shared_pointer": f"{raw:#010x}"})
+                elif shared[i] is not None:
+                    # A technique loaded earlier (shared by offset pointer).
+                    techniques.append(
+                        {
+                            "index": i,
+                            "shared": shared[i].name,
+                            "pointer": f"{v.fields.techniques[i]:#010x}",
+                        }
+                    )
             path = self.file_for("techsets", name, ".json")
+            header = bytes(node["header"])
             write_json(
                 path,
                 {
                     "name": name,
-                    "world_vert_format": header[4],
+                    "world_vert_format": v.fields.worldVertFormat,
                     "flags": header[4:8].hex(),
                     "techniques": techniques,
                 },
@@ -359,36 +339,26 @@ class ZoneExporter:
             self.record(T.TECHSET, name, [self.rel(path)])
 
     def export_materials(self) -> None:
-        """Material (0x80): +0 info (32: name, gameFlags +4, sortKey +9, ...), +0x20
-        stateBitsEntry[71], +0x67 textureCount, +0x68 constantCount, +0x69
-        stateBitsCount, +0x70 techniqueSet. Texture def (16): +0 nameHash, +4 first
-        and +5 last character of the name, +6 samplerState, +7 semantic, +0xc image
-        (or water_t for semantic 11). Constant (32): +0 nameHash, +4 name[12], +0x10
-        float4 (structs-content.md 8)."""
         for name, node in sorted(self.index.of(T.MATERIAL).items()):
-            header = bytes(node["header"])
             textures = []
             maps: dict[str, str | None] = {}
             for t in node.get("textures") or []:
-                raw = bytes(t["raw"])
-                name_hash = struct.unpack_from(">I", raw, 0)[0]
-                slot = SAMPLER_BY_HASH.get(name_hash)
+                tf = view(t).fields
+                slot = SAMPLER_BY_HASH.get(tf.nameHash)
+                semantic = tf.semantic
                 entry = {
                     "slot": slot,
-                    "name_hash": f"{name_hash:#010x}",
-                    "name_first_last": chr(raw[4]) + chr(raw[5]),
-                    "sampler_state": raw[6],
-                    "semantic": SEMANTICS.get(raw[7], raw[7]),
+                    "name_hash": f"{tf.nameHash:#010x}",
+                    "name_first_last": chr(tf.nameStart) + chr(tf.nameEnd),
+                    "sampler_state": tf["samplerState.bits_filter_mipMap_clampU_clampV_clampW"],
+                    "semantic": SEMANTICS.get(semantic, semantic),
                 }
-                if raw[7] == 11:
+                if semantic == 11:
                     w = t.get("water")
                     image = self.resolver.name(w.get("image")) if isinstance(w, dict) else None
                     if isinstance(w, dict) and w.get("raw") is not None:
-                        wr = bytes(w["raw"])
-                        entry["water"] = {
-                            "M": struct.unpack_from(">i", wr, 16)[0],
-                            "N": struct.unpack_from(">i", wr, 20)[0],
-                        }
+                        wf = view(w).fields
+                        entry["water"] = {"M": wf.M, "N": wf.N}
                 else:
                     image = self.resolver.name(t.get("image"))
                 entry["image"] = image
@@ -397,38 +367,33 @@ class ZoneExporter:
                     maps[MTL_SLOTS[slot]] = entry["file"]
                 textures.append(entry)
             self.material_maps[name] = maps
+            v = view(node)
             constants = []
-            craw = node.get("constants")
-            if isinstance(craw, bytes | bytearray | memoryview):
-                craw = bytes(craw)
-                for at in range(0, len(craw) - 31, 32):
+            if node.get("constants") is not None:
+                for c in v.array("constants"):
                     constants.append(
                         {
-                            "name": craw[at + 4 : at + 16].split(b"\0", 1)[0].decode("latin-1"),
-                            "name_hash": f"{struct.unpack_from('>I', craw, at)[0]:#010x}",
-                            "literal": [
-                                clean_float(v) for v in struct.unpack_from(">4f", craw, at + 16)
-                            ],
+                            "name": c["name"].split(b"\0", 1)[0].decode("latin-1"),
+                            "name_hash": f"{int(c['nameHash']):#010x}",
+                            "literal": [clean_float(float(x)) for x in c["literal"]],
                         }
                     )
-            state_bits = []
-            for sb in node.get("state_bits") or []:
-                if isinstance(sb, dict):
-                    state_bits.append(
-                        hexs(sb.get("bits") if sb.get("bits") is not None else sb.get("raw"))
-                    )
-                else:
-                    state_bits.append(hexs(sb) if isinstance(sb, bytes | bytearray) else sb)
+            state_bits = [
+                hexs(sb.get("bits") if sb.get("bits") is not None else sb.get("raw"))
+                for sb in node.get("state_bits") or []
+            ]
+            f = v.fields
+            header = bytes(node["header"])
             out = {
                 "name": name,
                 "technique_set": self.resolver.name(node.get("technique_set")),
-                "game_flags": header[4],
-                "sort_key": header[9],
+                "game_flags": f["info.gameFlags"],
+                "sort_key": f["info.sortKey"],
                 "info": header[0:0x20].hex(),
                 "state_bits_entry": header[0x20:0x67].hex(),
-                "texture_count": header[0x67],
-                "constant_count": header[0x68],
-                "state_bits_count": header[0x69],
+                "texture_count": f.textureCount,
+                "constant_count": f.constantCount,
+                "state_bits_count": f.stateBitsCount,
                 "textures": textures,
                 "constants": constants,
                 "state_bits": state_bits,
@@ -448,43 +413,47 @@ class ZoneExporter:
 
     # -- xmodels ------------------------------------------------------------------------------
 
-    def _resolve_blob(self, blob: Any, raw: int, size: int) -> bytes | None:
-        if blob is not None:
-            return bytes(blob)
-        if raw in (0, 0xFFFFFFFF, 0xFFFFFFFE) or size == 0:
+    def surface_array(self, s: dict, key: str, pointer: str, count: int) -> np.ndarray | None:
+        """An XSurface buffer as its schema's typed array: the surface's own, or, when
+        the pointer is an offset to another surface's buffer (shared), the bytes there
+        read with this surface's format."""
+        v = view(s)
+        if s.get(key) is not None:
+            return v.array(key)
+        spec = v.spec(key)
+        if spec is None:
             return None
-        return self.memory.read(raw, size)
+        data = self.resolver.read(v.fields[pointer], spec.element_size * count)
+        return None if data is None else np.frombuffer(data, spec.dtype(), count)
 
     def xsurface_mesh(self, s: dict) -> vx.Mesh:
-        """XSurface (0x5c): +0x2 flags, +0x4 vertCount, +0x6 triCount, +0x8 triIndices,
-        +0x1c verts0, +0x24 vertex stream (structs-map.md 9). A buffer the surface
-        shares with an earlier one is an offset pointer, read through the memory map."""
-        raw = bytes(s["raw"])
-        flags, count, tris = struct.unpack_from(">HHH", raw, 2)
-        size0, size1 = vx.xsurface_buffer_sizes(flags, count)
-        verts0 = self._resolve_blob(s.get("verts0"), struct.unpack_from(">I", raw, 0x1C)[0], size0)
-        stream = self._resolve_blob(
-            s.get("vertex_stream"), struct.unpack_from(">I", raw, 0x24)[0], size1
-        )
-        indices = self._resolve_blob(
-            s.get("tri_indices"), struct.unpack_from(">I", raw, 0x8)[0], 6 * tris
-        )
+        f = view(s).fields
+        count, tris = f.vertCount, f.triCount
+        verts0 = self.surface_array(s, "verts0", "verts0", count)
+        stream = self.surface_array(s, "vertex_stream", "vertexStream", count)
+        indices = self.surface_array(s, "tri_indices", "triIndices", tris)
         if verts0 is None or indices is None:
             raise ValueError(
-                f"surface buffers do not resolve (verts0 {raw[0x1c:0x20].hex()}, "
-                f"tris {raw[8:12].hex()})"
+                f"surface buffers do not resolve (verts0 {f.verts0:#010x}, "
+                f"tris {f.triIndices:#010x})"
             )
-        return vx.xsurface_mesh(flags, count, indices, tris, verts0, stream, raw)
+        return vx.xsurface_mesh(verts0, stream, indices, bytes(s["raw"]))
 
     @staticmethod
     def lods(node: dict) -> list[dict]:
-        h = node["header"]
+        f = view(node).fields
         out = []
         for k in range(4):
-            at = 0x28 + 0x1C * k
-            dist, n, first = struct.unpack_from(">fHH", h, at)
+            n = f[f"lodInfo[{k}].numsurfs"]
             if n:
-                out.append({"lod": k, "dist": dist, "numsurfs": n, "surf_index": first})
+                out.append(
+                    {
+                        "lod": k,
+                        "dist": f[f"lodInfo[{k}].dist"],
+                        "numsurfs": n,
+                        "surf_index": f[f"lodInfo[{k}].surfIndex"],
+                    }
+                )
         return out
 
     @staticmethod
@@ -493,20 +462,19 @@ class ZoneExporter:
         return entry.get("material") if isinstance(entry, dict) and "raw" in entry else entry
 
     def bones(self, node: dict) -> list[dict]:
-        """XModel +4 numBones, +5 numRootBones; boneNames u16 script strings; parentList
-        u8 offsets back to the parent; quats 4 x s16; trans 3 x f32 (+pad); baseMat 8 x f32
-        (quat, trans, transWeight)."""
-        h = bytes(node["header"])
-        n, roots = h[4], h[5]
-        bn = node.get("bone_names") or b""
-        names = list(struct.unpack(f">{len(bn) // 2}H", bytes(bn))) if bn else []
-        parents = bytes(node.get("parent_list") or b"")
-        quats = bytes(node.get("quats") or b"")
-        trans = bytes(node.get("trans") or b"")
-        base = bytes(node.get("base_mat") or b"")
+        """parentList holds u8 offsets back to the parent, quats s16 / 32767."""
+        v = view(node)
+        n, roots = v.fields.numBones, v.fields.numRootBones
+
+        def arr(key):
+            return v.array(key) if node.get(key) is not None else []
+
+        names, parents, quats, trans, base = (
+            arr(k) for k in ("bone_names", "parent_list", "quats", "trans", "base_mat")
+        )
         out = []
         for i in range(n):
-            si = names[i] if i < len(names) else None
+            si = int(names[i]) if i < len(names) else None
             bone: dict[str, Any] = {
                 "index": i,
                 "name": self.script_strings[si]
@@ -518,17 +486,16 @@ class ZoneExporter:
             else:
                 k = i - roots
                 if k < len(parents):
-                    bone["parent"] = i - parents[k]
-                if 8 * k + 8 <= len(quats):
-                    q = struct.unpack_from(">4h", quats, 8 * k)
-                    bone["local_quat"] = [v / 32767.0 for v in q]
-                if 16 * k + 12 <= len(trans):
-                    bone["local_trans"] = list(struct.unpack_from(">3f", trans, 16 * k))
-            if 32 * i + 32 <= len(base):
-                v = struct.unpack_from(">8f", base, 32 * i)
-                bone["base_quat"] = list(v[:4])
-                bone["base_trans"] = list(v[4:7])
-                bone["trans_weight"] = v[7]
+                    bone["parent"] = i - int(parents[k])
+                if k < len(quats):
+                    bone["local_quat"] = [int(q) / 32767.0 for q in quats[k]]
+                if k < len(trans):
+                    bone["local_trans"] = [float(t) for t in trans[k][:3]]
+            if i < len(base):
+                b = base[i]
+                bone["base_quat"] = [float(q) for q in b["quat"]]
+                bone["base_trans"] = [float(t) for t in b["trans"]]
+                bone["trans_weight"] = float(b["transWeight"])
             out.append(bone)
         return out
 
@@ -553,38 +520,39 @@ class ZoneExporter:
         for name, node in sorted(self.index.of(T.XMODEL).items()):
             folder = "xmodels/" + self.names.get("xmodels", name)
             files = []
-            h = bytes(node["header"])
+            f = view(node).fields
             mats = [self.resolver.name(self.material_ref(m)) for m in (node.get("materials") or [])]
+            surfaces = []
+            for s in node.get("surfs") or []:
+                sf = view(s).fields
+                surfaces.append(
+                    {
+                        "flags": sf.flags,
+                        "verts": sf.vertCount,
+                        "tris": sf.triCount,
+                        "skinned_vert_counts": list(sf["vertInfo.vertCount"]),
+                    }
+                )
             info = {
                 "name": name,
-                "num_bones": h[4],
-                "num_root_bones": h[5],
-                "numsurfs": h[6],
+                "num_bones": f.numBones,
+                "num_root_bones": f.numRootBones,
+                "numsurfs": f.numsurfs,
                 "lods": self.lods(node),
-                "radius": clean_float(struct.unpack_from(">f", h, 0xB0)[0]),
-                "mins": list(struct.unpack_from(">3f", h, 0xB4)),
-                "maxs": list(struct.unpack_from(">3f", h, 0xC0)),
+                "radius": clean_float(f.radius),
+                "mins": list(f.mins),
+                "maxs": list(f.maxs),
                 "materials": mats,
-                "surfaces": [
-                    {
-                        "flags": struct.unpack_from(">H", bytes(s["raw"]), 2)[0],
-                        "verts": struct.unpack_from(">H", bytes(s["raw"]), 4)[0],
-                        "tris": struct.unpack_from(">H", bytes(s["raw"]), 6)[0],
-                        "skinned_vert_counts": list(
-                            struct.unpack_from(">4h", bytes(s["raw"]), 0xC)
-                        ),
-                    }
-                    for s in (node.get("surfs") or [])
-                ],
+                "surfaces": surfaces,
                 "phys_preset": self.resolver.name(node.get("phys_preset")),
-                "coll_surf_count": struct.unpack_from(">I", h, 0xA4)[0],
-                "collmaps": h[0xEC],
+                "coll_surf_count": f.numCollSurfs,
+                "collmaps": f.numCollmaps,
             }
             try:
                 if self.do_models:
                     parts = self.model_lod0(node)
                     files += self.write_mesh_obj(folder, safe_name(name), parts, name)
-            except (ValueError, struct.error) as exc:
+            except ValueError as exc:
                 self.fail(T.XMODEL, name, f"LOD0 mesh: {exc}")
                 info["error"] = str(exc)
             bones_path = self.out / folder / "bones.json"
@@ -623,22 +591,19 @@ class ZoneExporter:
     def static_models(self, g: dict) -> list[dict]:
         out = []
         for i, d in enumerate(g["smodel_draw_insts"] or []):
-            raw = bytes(d["raw"])
-            cull = struct.unpack_from(">f", raw, 0)[0]
-            origin = struct.unpack_from(">3f", raw, 4)
-            packed = np.array(struct.unpack_from(">3I", raw, 0x10), np.uint32)
+            f = view(d).fields
+            packed = np.array(f["placement.axis"], np.uint32)
             axes = orthonormal(vx.unpack_cmp(packed).astype(np.float64))
-            scale = struct.unpack_from(">f", raw, 0x1C)[0]
             out.append(
                 {
                     "index": i,
                     "model": self.resolver.name(d["model"]),
-                    "origin": [round(v, 4) for v in origin],
+                    "origin": [round(v, 4) for v in f["placement.origin"]],
                     "angles": axes_to_angles(axes),
                     "axes": [[round(float(v), 5) for v in row] for row in axes],
-                    "scale": round(scale, 5),
-                    "cull_dist": clean_float(cull),
-                    "flags": struct.unpack_from(">I", raw, 0x24)[0],
+                    "scale": round(f["placement.scale"], 5),
+                    "cull_dist": clean_float(f.cullDist),
+                    "flags": f.flags & 0xFFFFFFFF,
                 }
             )
         return out
@@ -648,12 +613,16 @@ class ZoneExporter:
             name = g["name"] or self.zone
             stem = safe_name(g.get("base_name") or self.zone)
             files = []
+            v = view(g)
+            surfs = [
+                vx.WorldSurface.from_fields(i, view(s).fields) for i, s in enumerate(g["surfaces"])
+            ]
             try:
-                mesh, surfs, ranges = vx.world_mesh(
-                    bytes(g["vertices"]),
+                mesh, ranges = vx.world_mesh(
+                    v.array("vertices")["xyz"],
                     bytes(g["vertex_layer_data"]),
-                    bytes(g["indices"]),
-                    [bytes(s["raw"]) for s in g["surfaces"]],
+                    v.array("indices"),
+                    surfs,
                 )
             except ValueError as exc:
                 self.fail(T.GFX_MAP, name, f"world mesh: {exc}")
@@ -717,7 +686,7 @@ class ZoneExporter:
             )
 
     def gfx_summary(self, g: dict, mesh: vx.Mesh, mats: list[str]) -> dict:
-        h = bytes(g["header"])
+        f = view(g).fields
         probes = g.get("reflection_probes") or []
         lightmaps = []
         for entry in g.get("lightmaps") or []:
@@ -728,13 +697,13 @@ class ZoneExporter:
         return {
             "name": g["name"],
             "base_name": g.get("base_name"),
-            "plane_count": struct.unpack_from(">I", h, 8)[0],
-            "node_count": struct.unpack_from(">I", h, 0xC)[0],
-            "surface_count": struct.unpack_from(">I", h, 0x10)[0],
-            "cell_count": struct.unpack_from(">I", h, 0x154)[0],
+            "plane_count": f.planeCount,
+            "node_count": f.nodeCount,
+            "surface_count": f.surfaceCount,
+            "cell_count": f["dpvsPlanes.cellCount"],
             "vertex_count": len(mesh.positions),
-            "index_count": len(g["indices"]) // 2,
-            "vertex_layer_bytes": len(g["vertex_layer_data"]),
+            "index_count": f["draw.indexCount"],
+            "vertex_layer_bytes": f["draw.vertexLayerDataSize"],
             "materials": sorted(set(mats)),
             "sky_image": self.resolver.name(g.get("sky_image")),
             "sky_box_model": g.get("sky_box_model"),
@@ -742,17 +711,17 @@ class ZoneExporter:
             "lightmaps": lightmaps,
             "reflection_probes": [
                 {
-                    "origin": list(struct.unpack_from(">3f", bytes(p["raw"]), 0)),
+                    "origin": list(view(p).fields.origin),
                     "image": self.resolver.name(p.get("image")),
                 }
                 for p in probes
             ],
-            "mins": list(struct.unpack_from(">3f", h, 0x270)),
-            "maxs": list(struct.unpack_from(">3f", h, 0x27C)),
+            "mins": list(f.mins),
+            "maxs": list(f.maxs),
             "sun_light": None
             if g.get("sun_light") is None
             else {"def": self.resolver.name(g["sun_light"].get("def"))},
-            "occluders": len(g.get("occluders") or b"") // 0x44,
+            "occluders": f.numOccluders,
             "material_memory": [
                 self.resolver.name(m.get("material")) for m in (g.get("material_memory") or [])
             ],
@@ -776,7 +745,7 @@ class ZoneExporter:
                 continue
             try:
                 parts = self.model_lod0(node)
-            except (ValueError, struct.error):
+            except ValueError:
                 missing += 1
                 continue
             axes = np.array(p["axes"])
@@ -808,15 +777,50 @@ class ZoneExporter:
 
     # -- collision ----------------------------------------------------------------------------
 
+    def array_at(self, raw: int, count: int) -> np.ndarray | None:
+        """``count`` typed elements at an offset pointer, from the array that loaded them."""
+        target = self.resolver.target(raw)
+        if target is None or not isinstance(target.node, dict):
+            return None
+        holder = target.node.get(target.key)
+        if not isinstance(holder, bytes | bytearray | memoryview):
+            return None
+        arr = view(target.node).array(target.key)
+        first, rem = divmod(target.within, arr.dtype.itemsize)
+        if rem or first + count > len(arr):
+            return None
+        return arr[first : first + count]
+
+    def brush_sides(self, raw: int, count: int):
+        """(normal, dist, cflags, sflags) of each side of a brush, through the side
+        and plane pointers."""
+        sides = self.array_at(raw, count)
+        if sides is None:
+            return None
+        out = []
+        for side in sides:
+            plane = self.array_at(int(side["plane"]), 1)
+            if plane is None:
+                raise ValueError(
+                    f"brush side plane pointer {int(side['plane']):#010x} does " "not resolve"
+                )
+            out.append((plane[0]["normal"], plane[0]["dist"], side["cflags"], side["sflags"]))
+        return out
+
     def export_collision(self) -> None:
         for asset in self.xfile.assets:
             if asset.type not in (T.COL_MAP_MP, T.COL_MAP_SP):
                 continue
             c = asset.data
+            v = view(c)
             name = c["name"] or self.zone
             files = []
             try:
-                brushes = col.parse_brushes(bytes(c.get("brushes") or b""), self.memory.read)
+                brushes = (
+                    col.parse_brushes(v.array("brushes"), self.brush_sides)
+                    if c.get("brushes") is not None
+                    else []
+                )
             except ValueError as exc:
                 self.fail(asset.type, name, str(exc))
                 brushes = []
@@ -855,7 +859,10 @@ class ZoneExporter:
                     keys,
                     np.array(extents),
                 )
-            tp, tt = col.collision_triangles(c.get("verts"), c.get("tri_indices"))
+            tp, tt = col.collision_triangles(
+                v.array("verts") if c.get("verts") is not None else None,
+                v.array("tri_indices") if c.get("tri_indices") is not None else None,
+            )
             if len(tt):
                 path = self.out / "collision" / f"{stem}_triangles.obj"
                 write_obj(
@@ -872,44 +879,41 @@ class ZoneExporter:
             self.record(asset.type, name, files, brushes=len(brushes), triangles=int(len(tt)))
 
     def collision_summary(self, c: dict, brushes, by_contents, empty: int, tris: int) -> dict:
-        mats = []
-        raw = bytes(c.get("materials") or b"")
-        for at in range(0, len(raw), 0x48):
-            mname = raw[at : at + 64].split(b"\0", 1)[0].decode("latin-1")
-            sf, cf = struct.unpack_from(">II", raw, at + 64)
-            mats.append(
-                {"name": mname, "surface_flags": f"{sf:#010x}", "content_flags": f"{cf:#010x}"}
-            )
+        v = view(c)
+        f = v.fields
+
+        def arr(key):
+            return v.array(key) if c.get(key) is not None else []
+
+        mats = [
+            {
+                "name": m["material"].split(b"\0", 1)[0].decode("latin-1"),
+                "surface_flags": f"{int(m['surfaceFlags']) & 0xFFFFFFFF:#010x}",
+                "content_flags": f"{int(m['contentFlags']) & 0xFFFFFFFF:#010x}",
+            }
+            for m in arr("materials")
+        ]
         statics = []
-        sm = bytes(c.get("static_model_list") or b"")
-        for at in range(0, len(sm), 0x50):
-            model_raw = struct.unpack_from(">I", sm, at + 4)[0]
-            blk, off = decode_offset_pointer(model_raw)
-            link = AssetLink(T.XMODEL, model_raw, blk, off)
+        for s in arr("static_model_list"):
+            target = self.xfile.resolve(int(s["xmodel"]))
             statics.append(
                 {
-                    "model": self.resolver.name(link) if model_raw else None,
-                    "origin": list(struct.unpack_from(">3f", sm, at + 8)),
-                    "absmin": list(struct.unpack_from(">3f", sm, at + 0x38)),
-                    "absmax": list(struct.unpack_from(">3f", sm, at + 0x44)),
+                    "model": target.asset.get("name") if target and target.asset else None,
+                    "origin": [float(x) for x in s["origin"]],
+                    "absmin": [float(x) for x in s["absmin"]],
+                    "absmax": [float(x) for x in s["absmax"]],
                 }
             )
-        cmodels = []
-        cm = bytes(c.get("cmodels") or b"")
-        for at in range(0, len(cm), 0x48):
-            cmodels.append(
-                {
-                    "mins": list(struct.unpack_from(">3f", cm, at)),
-                    "maxs": list(struct.unpack_from(">3f", cm, at + 12)),
-                    "radius": struct.unpack_from(">f", cm, at + 24)[0],
-                }
-            )
-        dyn = []
-        lists = c.get("dyn_ent_def_list") or [
-            c.get("dyn_ent_def_list0"),
-            c.get("dyn_ent_def_list1"),
+        cmodels = [
+            {
+                "mins": [float(x) for x in m["mins"]],
+                "maxs": [float(x) for x in m["maxs"]],
+                "radius": float(m["radius"]),
+            }
+            for m in arr("cmodels")
         ]
-        for defs in lists:
+        dyn = []
+        for defs in (c.get("dyn_ent_def_list0"), c.get("dyn_ent_def_list1")):
             for d in defs or []:
                 dyn.append(
                     {
@@ -923,17 +927,17 @@ class ZoneExporter:
         return {
             "name": c["name"],
             "counts": {
-                "planes": struct.unpack_from(">I", bytes(c["header"]), 8)[0],
+                "planes": f.planeCount,
                 "brushes": len(brushes),
                 "brushes_without_faces": empty,
-                "brush_sides": len(c.get("brushsides") or b"") // 0xC,
-                "brush_verts": len(c.get("brush_verts") or b"") // 12,
-                "verts": len(c.get("verts") or b"") // 12,
+                "brush_sides": f.numBrushSides,
+                "brush_verts": f.numBrushVerts,
+                "verts": f.vertCount,
                 "triangles": tris,
-                "partitions": len(c.get("partitions") or b"") // 0x14,
-                "aabb_trees": len(c.get("aabb_trees") or b"") // 0x20,
-                "leafs": len(c.get("leafs") or b"") // 0x2C,
-                "nodes": len(c.get("nodes") or b"") // 8,
+                "partitions": f.partitionCount,
+                "aabb_trees": f.aabbTreeCount,
+                "leafs": f.numLeafs,
+                "nodes": f.numNodes,
                 "cmodels": len(cmodels),
                 "static_models": len(statics),
                 "materials": len(mats),
@@ -941,7 +945,7 @@ class ZoneExporter:
                 "constraints": len(c.get("constraints") or []),
             },
             "brushes_by_contents": {
-                f"{k & 0xFFFFFFFF:#010x}": v for k, v in sorted(by_contents.items())
+                f"{k & 0xFFFFFFFF:#010x}": n for k, n in sorted(by_contents.items())
             },
             "materials": mats,
             "cmodels": cmodels,
@@ -990,44 +994,41 @@ class ZoneExporter:
         for asset in self.xfile.assets:
             if asset.type not in (T.GAME_MAP_MP, T.GAME_MAP_SP):
                 continue
-            # GameWorld (0x2c): +4 nodeCount, +0x10 chainNodeCount, +0x1c visBytes,
-            # +0x24 nodeTreeCount; nodes are pathnode_t (0x80, the PC
-            # pathnode_constant_t layout), links 12 bytes (+0 dist, +4 node).
             data = asset.data
-            h = bytes(data["header"])
-            count = struct.unpack_from(">I", h, 4)[0]
+            f = view(data).fields
+            count = f["path.nodeCount"]
             node_list = data.get("nodes") or []
             nodes = []
             for i in range(min(count, len(node_list))):
-                raw = bytes(node_list[i]["raw"])
-                at = 0
-                (kind,) = struct.unpack_from(">i", raw, at)
-                strings = struct.unpack_from(">6H", raw, at + 4)
+                v = view(node_list[i])
+                n = v.fields
+                kind = n["constant.type"]
                 node = {
                     "index": i,
                     "type": NODE_TYPES[kind] if 0 <= kind < len(NODE_TYPES) else kind,
-                    "spawnflags": strings[0],
-                    "targetname": self.sstr(strings[1]),
-                    "script_linkname": self.sstr(strings[2]),
-                    "script_noteworthy": self.sstr(strings[3]),
-                    "target": self.sstr(strings[4]),
-                    "animscript": self.sstr(strings[5]),
-                    "origin": list(struct.unpack_from(">3f", raw, at + 0x14)),
-                    "angle": struct.unpack_from(">f", raw, at + 0x20)[0],
-                    "radius": struct.unpack_from(">f", raw, at + 0x2C)[0],
+                    "spawnflags": n["constant.spawnflags"],
+                    "targetname": self.sstr(n["constant.targetname"]),
+                    "script_linkname": self.sstr(n["constant.script_linkName"]),
+                    "script_noteworthy": self.sstr(n["constant.script_noteworthy"]),
+                    "target": self.sstr(n["constant.target"]),
+                    "animscript": self.sstr(n["constant.animscript"]),
+                    "origin": list(n["constant.vOrigin"]),
+                    "angle": n["constant.fAngle"],
+                    "radius": n["constant.fRadius"],
                     "links": [],
                 }
-                blob = bytes(node_list[i].get("links") or b"")
-                for k in range(len(blob) // 12):
-                    dist, target = struct.unpack_from(">fH", blob, 12 * k)
-                    node["links"].append({"node": target, "dist": round(dist, 3)})
+                if node_list[i].get("links") is not None:
+                    for link in v.array("links"):
+                        node["links"].append(
+                            {"node": int(link["nodeNum"]), "dist": round(float(link["fDist"]), 3)}
+                        )
                 nodes.append(node)
             out = {
                 "name": data["name"],
                 "node_count": count,
-                "chain_node_count": struct.unpack_from(">I", h, 0x10)[0],
-                "vis_bytes": struct.unpack_from(">I", h, 0x1C)[0],
-                "node_tree_count": struct.unpack_from(">I", h, 0x24)[0],
+                "chain_node_count": f["path.chainNodeCount"],
+                "vis_bytes": f["path.visBytes"],
+                "node_tree_count": f["path.nodeTreeCount"],
                 "nodes": nodes,
             }
             path = self.out / "game_map" / "paths.json"
@@ -1046,39 +1047,40 @@ class ZoneExporter:
                 continue
             lights = []
             for i, light in enumerate(asset.data.get("primary_lights") or []):
-                r = bytes(light["raw"])
-                f = struct.unpack_from(">53f", r, 0x8)
+                f = view(light).fields
                 lights.append(
                     {
                         "index": i,
-                        "type": r[0],
-                        "can_use_shadow_map": r[1],
-                        "exponent": r[2],
-                        "priority": r[3],
-                        "cull_dist": struct.unpack_from(">h", r, 4)[0],
-                        "color": [clean_float(v) for v in f[0:3]],
-                        "dir": [clean_float(v) for v in f[3:6]],
-                        "origin": [clean_float(v) for v in f[6:9]],
-                        "radius": clean_float(f[9]),
-                        "cos_half_fov_outer": clean_float(f[10]),
-                        "cos_half_fov_inner": clean_float(f[11]),
+                        "type": f.type,
+                        "can_use_shadow_map": f.canUseShadowMap,
+                        "exponent": f.exponent,
+                        "priority": f.priority,
+                        "cull_dist": f.cullDist,
+                        "color": [clean_float(x) for x in f.color],
+                        "dir": [clean_float(x) for x in f.dir],
+                        "origin": [clean_float(x) for x in f.origin],
+                        "radius": clean_float(f.radius),
+                        "cos_half_fov_outer": clean_float(f.cosHalfFovOuter),
+                        "cos_half_fov_inner": clean_float(f.cosHalfFovInner),
                         "def_name": light.get("def_name"),
-                        "raw": r.hex(),
+                        "raw": bytes(light["raw"]).hex(),
                     }
                 )
             path = self.out / "com_map" / "lights.json"
             write_json(path, {"name": asset.data["name"], "lights": lights})
             self.record(T.COM_MAP, asset.data["name"], [self.rel(path)], lights=len(lights))
         for name, node in sorted(self.index.of(T.LIGHTDEF).items()):
+            f = view(node).fields
+            image = self.resolver.name(node["image"])
             path = self.file_for("lightdefs", name, ".json")
             write_json(
                 path,
                 {
                     "name": name,
-                    "image": self.resolver.name(node["image"]),
-                    "image_file": self.image_files.get(self.resolver.name(node["image"]) or ""),
-                    "sampler_state": bytes(node["header"])[8],
-                    "lmap_lookup_start": struct.unpack_from(">i", bytes(node["header"]), 0xC)[0],
+                    "image": image,
+                    "image_file": self.image_files.get(image or ""),
+                    "sampler_state": f["attenuation.samplerState"],
+                    "lmap_lookup_start": f.lmapLookupStart,
                 },
             )
             self.record(T.LIGHTDEF, name, [self.rel(path)])
@@ -1180,25 +1182,20 @@ class ZoneExporter:
             self.record(t, name, files)
 
     def xanim_summary(self, node: dict, value: dict) -> dict:
-        """XAnimParts (104): +14 numframes u16, +0x18 bone counts (12 bytes), +35 name
-        count; names are u16 script strings; notify entries 8 bytes (+0 name u16, +4
-        time f32)."""
-        h = bytes(node["header"])
-        raw_names = node.get("names") or b""
-        if isinstance(raw_names, bytes | bytearray | memoryview):
-            names = list(struct.unpack(f">{len(raw_names) // 2}H", bytes(raw_names)))
-        else:
-            names = list(raw_names)
-        notify = bytes(node.get("notify") or b"")
+        v = view(node)
+        f = v.fields
+        names = v.array("names") if node.get("names") is not None else []
         notes = []
-        for k in range(len(notify) // 8):
-            si, time_ = struct.unpack_from(">Hxxf", notify, 8 * k)
-            notes.append({"name": self.sstr(si), "time": clean_float(time_)})
+        if node.get("notify") is not None:
+            for n in v.array("notify"):
+                notes.append(
+                    {"name": self.sstr(int(n["name"])), "time": clean_float(float(n["time"]))}
+                )
         summary = {
             "name": node.get("name"),
-            "numframes": struct.unpack_from(">H", h, 14)[0],
-            "bone_count": list(h[0x18:0x24]),
-            "bones": [self.sstr(i) for i in names],
+            "numframes": f.numframes,
+            "bone_count": list(f.boneCount),
+            "bones": [self.sstr(int(i)) for i in names],
             "notify": notes,
         }
         summary["data"] = value

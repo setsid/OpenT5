@@ -11,14 +11,10 @@ the errata block (sides at +0x20).
 
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass
 
 import numpy as np
 
-BRUSH_SIZE = 0x60
-SIDE_SIZE = 0xC
-PLANE_SIZE = 0x14
 EPS = 0.01
 WELD = 0.01
 MIN_AREA = 0.01
@@ -34,33 +30,30 @@ class Brush:
     side_flags: list[tuple[int, int]]
 
 
-def parse_brushes(brushes: bytes, read_pointer) -> list[Brush]:
-    """``read_pointer(raw, size)`` resolves an offset pointer to bytes (MemoryMap.read)."""
+def parse_brushes(brushes: np.ndarray, sides_of) -> list[Brush]:
+    """``brushes``: the schema's cbrush_t array. ``sides_of(pointer, count)`` returns the
+    brush's sides as (normal, dist, cflags, sflags) tuples, or None when the pointer
+    does not resolve."""
     out = []
-    for at in range(0, len(brushes) - BRUSH_SIZE + 1, BRUSH_SIZE):
-        mins = np.array(struct.unpack_from(">3f", brushes, at), np.float64)
-        (contents,) = struct.unpack_from(">i", brushes, at + 0xC)
-        maxs = np.array(struct.unpack_from(">3f", brushes, at + 0x10), np.float64)
-        count, sides_raw = struct.unpack_from(">II", brushes, at + 0x1C)
+    for i, b in enumerate(brushes):
+        count, sides_ptr = int(b["numsides"]), int(b["sides"])
         planes, flags = [], []
-        if count and sides_raw:
-            sides = read_pointer(sides_raw, SIDE_SIZE * count)
+        if count and sides_ptr:
+            sides = sides_of(sides_ptr, count)
             if sides is None:
-                raise ValueError(
-                    f"brush at {at:#x}: side pointer {sides_raw:#010x} does not resolve"
-                )
-            for k in range(count):
-                plane_raw, cflags, sflags = struct.unpack_from(">Iii", sides, SIDE_SIZE * k)
-                plane = read_pointer(plane_raw, PLANE_SIZE)
-                if plane is None:
-                    raise ValueError(
-                        f"brush at {at:#x} side {k}: plane pointer {plane_raw:#010x} does not "
-                        "resolve"
-                    )
-                nx, ny, nz, dist = struct.unpack_from(">4f", plane, 0)
-                planes.append((np.array([nx, ny, nz]), dist))
-                flags.append((cflags, sflags))
-        out.append(Brush(mins, maxs, contents, planes, flags))
+                raise ValueError(f"brush {i}: side pointer {sides_ptr:#010x} does not resolve")
+            for normal, dist, cflags, sflags in sides:
+                planes.append((np.asarray(normal, np.float64), float(dist)))
+                flags.append((int(cflags), int(sflags)))
+        out.append(
+            Brush(
+                np.asarray(b["mins"], np.float64),
+                np.asarray(b["maxs"], np.float64),
+                int(b["contents"]),
+                planes,
+                flags,
+            )
+        )
     return out
 
 
@@ -163,9 +156,10 @@ def triangulate(faces: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
     return np.concatenate(pos), np.array(tris, np.int64).reshape(-1, 3)
 
 
-def collision_triangles(verts: bytes | None, tri_indices: bytes | None):
-    if not verts or not tri_indices:
+def collision_triangles(verts: np.ndarray | None, tri_indices: np.ndarray | None):
+    """The clipMap's verts (vec3) and triIndices (u16[3]) arrays."""
+    if verts is None or tri_indices is None or not len(tri_indices):
         return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int64)
-    p = np.frombuffer(bytes(verts), ">f4").reshape(-1, 3).astype(np.float32)
-    t = np.frombuffer(bytes(tri_indices), ">u2").reshape(-1, 3).astype(np.int64)
-    return p, t
+    return np.asarray(verts, np.float32).reshape(-1, 3), np.asarray(tri_indices).astype(
+        np.int64
+    ).reshape(-1, 3)

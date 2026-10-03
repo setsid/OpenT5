@@ -10,7 +10,6 @@ ordinary RGB tangent-space normal maps with Z rebuilt.
 
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,6 +17,7 @@ import numpy as np
 
 from opent5.export.nodes import pixel_bytes
 from opent5.formats import texture as tx
+from opent5.xfile.schema import view
 
 #: Pak slot -> file name; slot 0 is the zone's own pak. textures.md 2.4 (slot 2 unknown).
 PAK_SLOTS = {1: "images_low.pak", 3: "common.pak", 4: "ui_mp.pak", 9: "img_patch.pak"}
@@ -35,15 +35,21 @@ class StreamPart:
     entry: int
 
 
-def stream_parts(header: bytes) -> list[StreamPart]:
-    """The part records of a streamed image (GfxImage +0x34, count at +0x64)."""
-    if len(header) < 0x68 or not header[0x27]:
+def stream_parts(fields) -> list[StreamPart]:
+    """The part records of a streamed image: GfxImage ``parts`` (four records of three
+    u32: cumulative size / 16 << 8 | mips, width << 16 | height, slot << 24 | entry)
+    and ``partCount``; empty unless ``streamingMode`` is set (textures.md 2.4)."""
+    if not fields["streamingMode"]:
         return []
-    count = header[0x64]
+    words = fields["parts"]
     parts = []
-    for k in range(min(count, 4)):
-        word, w, h, loc = struct.unpack_from(">IHHI", header, 0x34 + 12 * k)
-        parts.append(StreamPart((word >> 8) * 16, word & 0xFF, w, h, loc >> 24, loc & 0xFFFFFF))
+    for k in range(min(fields["partCount"], 4)):
+        word, size, loc = words[3 * k : 3 * k + 3]
+        parts.append(
+            StreamPart(
+                (word >> 8) * 16, word & 0xFF, size >> 16, size & 0xFFFF, loc >> 24, loc & 0xFFFFFF
+            )
+        )
     return parts
 
 
@@ -148,24 +154,28 @@ def rebuild_normal(rgba: np.ndarray) -> np.ndarray:
 
 def decode_image(node: dict, paks: PakSet | None) -> DecodedImage:
     """Decode one GfxImage node. Raises ImageError naming why it cannot be decoded."""
-    header = bytes(node["header"])
-    gcm = tx.GcmTexture.parse(header)
+    f = view(node).fields
     fmt, w, h, depth, levels, remap = (
-        gcm.format,
-        gcm.width,
-        gcm.height,
-        gcm.depth,
-        gcm.mipmap,
-        gcm.remap,
+        f["texture.format"],
+        f["texture.width"],
+        f["texture.height"],
+        f["texture.depth"],
+        f["texture.mipmap"],
+        f["texture.remap"],
     )
-    cube = bool(gcm.cubemap)
-    dimension, semantic, category, delayed = header[2], header[0x19], header[0x1A], header[0x1B]
+    cube = bool(f["texture.cubemap"])
+    dimension, semantic, category, delayed = (
+        f["texture.dimension"],
+        f["semantic"],
+        f["category"],
+        f["delayLoadPixels"],
+    )
     out = DecodedImage(width=w, height=h)
     data = pixel_bytes(node["pixels"])
     if data is not None:
         out.source = "deferred" if delayed else "inline"
     else:
-        parts = stream_parts(header)
+        parts = stream_parts(f)
         if not parts and (node.get("name") or "").startswith(","):
             raise ImageError(
                 "a reference to an image defined in another zone (the name starts with ','; "

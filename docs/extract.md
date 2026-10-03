@@ -38,7 +38,7 @@ from. Coordinates are written as the game stores them: inches, Z up.
 | `com_map/lights.json`, `lightdefs/*.json` | primary lights (type, colour, direction, origin, radius, cone, light def) |
 | `xmodels/<model>/` | `<model>.obj` + `.mtl` (LOD0), `bones.json`, `model.json` (LODs, bounds, surfaces, materials) |
 | `rawfiles/...`, `stringtables/*.csv`, `localize/localize.json` | scripts inflated, tables as CSV, strings |
-| `<type>/<name>.json` | everything else (fx, sound, xanim, physpreset, destructibledef, glasses, weapon, menus ...), generically: nested assets become `{"asset", "name"}`, alias links `{"ref", "name"}`, byte arrays over 4 KiB go to `<name>.blobs/*.bin` |
+| `<type>/<name>.json` | everything else (fx, sound, xanim, physpreset, destructibledef, glasses, weapon, menus ...), generically: every struct decoded into its schema field names (`_kind` names the struct), nested assets become `{"asset", "name"}`, alias links `{"ref", "name"}`, byte arrays over 4 KiB go to `<name>.blobs/*.bin` |
 | `previews/*.png` | renders of the world, world plus static models, brushes and collision triangles, from above and at an angle (section 8) |
 
 Names are made safe for file systems and OBJ (`/ \ : * ~` and spaces become `_`); two names
@@ -50,25 +50,24 @@ the manifest marks it `"reference": true`.
 
 A zone lists only its top-level assets (mp_nuked: 529). Most images, materials, techsets,
 shaders and models are loaded inline inside other assets, so `export.nodes.AssetIndex` walks
-the parsed data and classifies each node by its header size and keys (image 0x70, material
-0x80, xmodel 0xf8, techset 292, vertex shader 16, pixel shader 12). mp_nuked: 1036 images,
-585 materials, 293 models, 104 techsets, 234 vertex and 980 pixel shaders.
+the parsed data and collects nodes by their kind (`"_t"`: GfxImage, Material, XModel,
+MaterialTechniqueSet, MaterialVertexShader, MaterialPixelShader, ...). mp_nuked: 1036
+images, 585 materials, 293 models, 104 techsets, 234 vertex and 980 pixel shaders.
 
-Asset references by alias (`AssetLink`) name a block position that holds a pointer to the
-asset, and the parse leaves them unresolved. `AliasResolver` rebuilds the map from the event
-log: for every reference field loaded inline (-1 or -2), the log has the POINTER event of the
-field, PUSH TEMP, the INSERT of the alias slot (for -2) and the READ of the asset's header in
-TEMP; the asset's name is the first STRING after the header (or the offset-pointed string when
-the name field is not -1). The field's own block position, and the slot, then both name that
-asset. Example: GfxWorld surface 0 (zone 0x1dec3e3) has material `81307cf1` at +0x40, i.e.
-VIRTUAL + 0x1307cf0, which is the +0x0 field of a `materialMemory` entry that loaded
-`*33n_69n(wc/jun_art_stone_stucco_white01:wc/rus_art_window_metal02_trans)` inline. Result on
-mp_nuked: all 3494 surface materials and all 4209 static model references resolve
-(`tests/test_export_zones.py::test_alias_references_resolve`).
+Every field is read through the parser's schema (`opent5.xfile.schema.view`,
+`docs/research/fields.md`), and every reference through the parser's resolution
+(`opent5.xfile.refs`): an alias reference (`AssetLink`) carries its target asset, and
+`XFile.resolve` turns an offset pointer into the node, key and byte offset of the data it
+names. Example: GfxWorld surface 0 (zone 0x1dec3e3) has material `81307cf1` at +0x40, i.e.
+VIRTUAL + 0x1307cf0, the +0x0 field of a `materialMemory` entry that loaded
+`*33n_69n(wc/jun_art_stone_stucco_white01:wc/rus_art_window_metal02_trans)` inline. All 3494
+surface materials, all 4209 static model references, the shared vertex buffers of models,
+brush sides and planes, and the 638 techniques that a techset shares with another (named in
+the techset JSON) resolve this way.
 
-Offset pointers to data loaded earlier (shared vertex buffers, brush sides, planes) are read
-through `MemoryMap`, built from the READ, STRING and TAIL events: block position -> file
-offset.
+Two things the schema keeps opaque are decoded by the exporter itself: the GfxWorld vertex
+layer data (section 3.1) and the packed-position offset and exponents of an XSurface (bytes
++0x48..+0x57, section 3.2).
 
 ## 3. Vertex formats
 

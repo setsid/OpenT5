@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from opent5.xfile.constants import type_name
+from opent5.xfile.schema import Struct, view
 from opent5.xfile.stream import AssetLink, DeferredData
 
 #: Byte strings up to this length are written inline as hex; longer ones go to a .bin file.
@@ -87,10 +88,18 @@ class Jsonifier:
                 name = obj.get("name") if isinstance(obj, dict) else None
                 return {"asset": type_name(t), "name": name}
         if isinstance(obj, dict):
-            return {
-                str(k): self.convert(v, blob_dir, f"{path}.{k}" if path else str(k), False)
-                for k, v in obj.items()
-            }
+            out = {}
+            schema = view(obj) if "_t" in obj else None
+            for k, v in obj.items():
+                if k == "_t":
+                    out["_kind"] = v
+                    continue
+                spec = schema.spec(k) if schema is not None and v is not None else None
+                if isinstance(spec, Struct):
+                    # A struct with a schema: its named fields, decoded.
+                    v = schema.struct(k).to_dict()
+                out[str(k)] = self.convert(v, blob_dir, f"{path}.{k}" if path else str(k), False)
+            return out
         if isinstance(obj, list | tuple):
             return [self.convert(v, blob_dir, f"{path}.{i}", False) for i, v in enumerate(obj)]
         if dataclasses.is_dataclass(obj) and not isinstance(obj, type):

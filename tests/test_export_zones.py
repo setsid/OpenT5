@@ -13,9 +13,10 @@ import pytest
 from opent5 import env
 from opent5.container.zone import Zone
 from opent5.export import vertex as vx
-from opent5.export.nodes import AliasResolver, AssetIndex, MemoryMap, Resolver
+from opent5.export.nodes import AssetIndex, Resolver
 from opent5.export.zone import ZoneExporter
 from opent5.xfile import AssetType, parse
+from opent5.xfile.schema import view
 
 pytestmark = pytest.mark.zones
 
@@ -43,16 +44,14 @@ def nuked():
     if path is None:
         pytest.skip("mp_nuked.ff not configured in .env")
     content = Zone.open(path).content
-    xfile = parse(content, log=True)
+    xfile = parse(content, log=False)
     index = AssetIndex(xfile)
-    memory = MemoryMap(xfile, content)
-    resolver = Resolver(index, AliasResolver(memory))
+    resolver = Resolver(index, xfile)
     return {
         "path": path,
         "content": content,
         "xfile": xfile,
         "index": index,
-        "memory": memory,
         "resolver": resolver,
     }
 
@@ -85,11 +84,10 @@ def test_alias_references_resolve(nuked):
 
 def test_world_mesh(nuked):
     g = _one(nuked["xfile"], AssetType.GFX_MAP)
-    mesh, surfaces, ranges = vx.world_mesh(
-        bytes(g["vertices"]),
-        bytes(g["vertex_layer_data"]),
-        bytes(g["indices"]),
-        [bytes(s["raw"]) for s in g["surfaces"]],
+    surfaces = [vx.WorldSurface.from_fields(i, view(s).fields) for i, s in enumerate(g["surfaces"])]
+    v = view(g)
+    mesh, ranges = vx.world_mesh(
+        v.array("vertices")["xyz"], bytes(g["vertex_layer_data"]), v.array("indices"), surfaces
     )
     assert mesh.positions.shape == (176344, 3)
     assert mesh.triangles.shape == (117181, 3)
@@ -115,7 +113,7 @@ def test_model_meshes_resolve(nuked, tmp_path):
         log=lambda _m: None,
     )
     exporter.xfile = nuked["xfile"]
-    exporter.index, exporter.memory = nuked["index"], nuked["memory"]
+    exporter.index = nuked["index"]
     exporter.resolver = nuked["resolver"]
     failures = []
     for name, node in nuked["index"].of(AssetType.XMODEL).items():
