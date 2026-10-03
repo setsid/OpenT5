@@ -96,3 +96,18 @@ objectives.
 
 Please report which row matches (or none), the mode used, a screenshot from inside the room,
 and any RPCS3 log lines that mention fastfile, script, DB or RSX errors.
+
+## Result in RPCS3 (reported by the user, 2026-10-03)
+
+`e_box/mp_nuked.ff` (sha1 `d5a37f69...`), local splitscreen Team Deathmatch, signature-patched
+client, retail `mp_nuked.ff` restored afterwards.
+
+- Loads; the player spawns inside the room; the siding walls and the ceiling are textured
+  correctly; the HUD is normal.
+- Collision, bullet impacts and the `e_box_sunlit` variant: not yet reported.
+- Lighting is wrong: the floor is nearly black and the ceiling brownish, and the viewmodel has a
+  strong teal tint (the light grid and reflection probes are still Nuketown's).
+- The minimap shows a placeholder grid with garbled letters (no compass image for the box).
+
+Next steps, in the user's order: own map name, lightmaps and light grid from cod2rad, a
+compass image, own textures, static models, objective-mode entities (docs/convert.md).
