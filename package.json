@@ -2,6 +2,7 @@
   "name": "opent5",
   "version": "0.1.0",
   "private": true,
+  "license": "GPL-3.0-or-later",
   "description": "Open, browse, edit and rebuild Black Ops (T5) PS3 fastfiles",
   "scripts": {
     "setup": "python3 -m virtualenv .venv && .venv/bin/pip install -r requirements-dev.txt",

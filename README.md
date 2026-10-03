@@ -26,3 +26,9 @@ they are absent.
 
     src/opent5/container   the signed, encrypted, compressed fastfile container
     docs/research          format research; every claim carries its evidence
+
+## Licence
+
+OpenT5 is free software under the GNU General Public License, version 3 or
+later; see LICENSE. Some code is adapted from OpenAssetTools (also GPLv3);
+docs/provenance.md records what was taken from where.
