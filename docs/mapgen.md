@@ -102,32 +102,46 @@ is:
 | cobble | irregular grey stones on a darker mortar grid |
 
 DXT round-trips at a mean RGB error of about 2 of 255 (`test_texture_dxt_roundtrip`). Own art is
-handed to the converter as `overrides` keyed by the colour-map name `~-g<material>_c`
+handed to the converter as `overrides` keyed by the colour-map name `mp_opent5blocks_<tile>_c`
 (docs/convert.md 11.4, demo-box-textures.md 4), so no PC image converter is needed.
 
 ## 4. Building the `.map` with the PC tools
 
-`tools/blockmap.py build NAME --game GAME --work WORK -o OUT.ff` writes the `.map` into `--work`
-and runs the exact three command lines of tools/testmap.py / box-map.md 1.2 through
-`launcher_ldr.exe` (cod2map, cod2rad `-fast`, linker_pc), creating only new `<NAME>.*` files in
-the game folder (see that list in box-map.md 7). The map name is `mp_opent5blocks`, so every
-game-folder file is `mp_opent5*`.
+`tools/blockmap.py build NAME --game GAME --work WORK -o OUT.ff` registers the block materials
+and colour-map images (below), writes the `.map` into `--work`, and runs the exact three command
+lines of tools/testmap.py / box-map.md 1.2 through `launcher_ldr.exe` (cod2map, cod2rad `-fast`,
+linker_pc). It creates only new `mp_opent5blocks*` files in the game folder.
 
-Status: the PC Mod Tools (`bin/launcher_ldr.exe`, `cod2map.dll`, `linker_pc.dll`) are NOT present
-on this machine, so no `.map` was compiled and no `.ff` was produced here. `build` reports this
-and stops; the `.map`, textures and previews from `gen` are the offline deliverables. For the PC
-build each `mp_opent5blocks_*` material needs a stub material definition and a colour-map image
-registered in the tools' `raw/materials` and `raw/images` (all named `mp_opent5*`), as the stock
-`blockout_test_*` materials are (demo-box-textures.md); the converter then replaces the
-colour-map pixels with the generated art. This is the gap for the lead (section 6).
+Material and image registration (`register_assets`, the `blockout_test_*` mechanism of
+demo-box-textures.md): for each tile a material binary `raw/materials/mp_opent5blocks_<tile>` is
+cloned from `blockout_test_wood` (techset `l_sm_r0c0`, colour map plus identity normal; only the
+material name and the colour-map image name are changed, the string table rebuilt and the seven
+string-pointer words repatched, verified to reproduce the template byte for byte), and a
+colour-map `raw/images/mp_opent5blocks_<tile>_c.iwi` is a byte copy of a known-good 512x512 DXT1
+IWI. The copied pixels are placeholders; the converter overrides them with the generated art by
+name (`overrides`, section 5), so only the IWI's validity matters. The sky faces reuse
+`mtl_skybox_mp_nuked`, which already exists in the tools and the mp_nuked base.
 
 Lighting: worldspawn carries the sun (`sundirection`, `sunlight`, `suncolor`, ambient); a
 `lightgrid_volume` brush fills the playable band so cod2rad bakes a real light grid
-(docs/convert.md 10.3); a skybox of `sky` faces encloses the world so it is sealed and lit
-outdoors (the terrain's k=0 layer is solid in every column, sealing the base,
-`test_terrain_floor_is_sealed`). Spawns: `info_player_start`, `mp_global_intermission`, four
-`mp_tdm_spawn_*_start` per team and a spread of `mp_tdm_spawn` (TDM) and `mp_dm_spawn` (FFA) on
-flat surface cells; two `minimap_corner` origins for the compass.
+(docs/convert.md 10.3; cod2map wrote `mp_opent5blocks.grid_auto`, about 150k sample points). A
+skybox of `mtl_skybox_mp_nuked` faces plus a caulk floor slab encloses the world so it is sealed
+(the terrain's k=0 layer is solid in every column, `test_terrain_floor_is_sealed`). The sun is a
+primary light from worldspawn (box-map.md: light type 1), which lights what sees the sky.
+Spawns: `info_player_start`, `mp_global_intermission`, four `mp_tdm_spawn_*_start` per team and a
+spread of `mp_tdm_spawn` (TDM) and `mp_dm_spawn` (FFA) on flat surface cells; two `minimap_corner`
+origins for the compass.
+
+Status (verified here): `cod2map.exe` run directly on the generated `.map` loads it, resolves all
+11 block materials and the sky material, finds no leak and writes the BSP (EXITCODE 0) once the
+watertight shell was added. So the PC-side authoring (map, materials, IWIs, seal, light-grid
+volume) is correct. The full build is blocked only at the LinkerMod loader step: `launcher_ldr.exe`
+(which injects `cod2map.dll` to write the Black Ops v45 BSP, and `linker_pc.dll`) fails with
+"Access is denied." and EXITCODE 5 for every map, a trivial box included, while `cod2map.exe`
+alone works. A protected `launcher-x64.exe` (PID 12280, session 0) cannot be killed by this user.
+This is an admin/environment issue (the wedged launcher process, or a security policy blocking the
+DLL injection), not a fault of this map. Once it is cleared, `blockmap build` then `blockmap
+convert` complete the pipeline unchanged; the materials and IWIs are already registered.
 
 ## 5. Conversion and offline validation
 
@@ -137,7 +151,10 @@ ready for this map: its signature already accepts `overrides`, `name`, `image_ro
 `force_materials` and baked lighting (docs/convert.md 11, 13); new materials (none of the block
 materials exist in mp_nuked) go through `materials.py` with the techset remapped by name. The one
 thing it cannot do without the PC build is read the PC material/techset structure, which lives in
-`PC_MAP.ff`. So the conversion is blocked only by the absent PC tools, not by the converter.
+`PC_MAP.ff`. So the conversion is blocked only by the PC build (the launcher loader, section 4),
+not by the converter. `blockmap convert` wires both forms: the mp_nuked replacement
+(`out/demo/m_blocks/`) and the own-name zone (`--name`, `--copy-pak`, its own compass,
+`out/demo/m_blocks_named/`).
 
 Offline validation done here (no console, no emulator beyond the committed loader path, no
 network):
@@ -164,17 +181,24 @@ pad. Hills, trees, water and village are all clearly visible.
 
 ## 7. Files created and open items
 
-In the game folder: none (the PC tools are absent, so `build` created nothing). When run where the
-tools exist, `build` creates only `mp_opent5blocks.*` under `raw/maps/mp`, `zone/English`,
-`zone_source` and `zone_source/english/assetinfo|assetlist` (box-map.md 7).
+New files created in the Steam game folder (all `mp_opent5blocks*`): 11 materials
+`raw/materials/mp_opent5blocks_<tile>`, 11 colour maps `raw/images/mp_opent5blocks_<tile>_c.iwi`,
+`zone_source/mp_opent5blocks.csv`, and `raw/maps/mp/mp_opent5blocks.{d3dbsp,d3dprt,d3dpoly,grid_auto}`
+(the BSP is currently the v31 from `cod2map.exe` alone; the launcher v45 BSP and the linked
+`zone/English/mp_opent5blocks.ff` are not yet produced, section 4). Nothing else in the game
+folder was changed.
 
 Open items / gaps for the lead:
 
-- PC Mod Tools are not installed on this machine: the `.map` cannot be compiled and no PC `.ff`
-  can be produced, which also blocks the conversion and every device-side check.
-- The `mp_opent5blocks_*` materials and their `sky` material need stub material definitions and
-  colour-map images in the tools' `raw/materials` / `raw/images` (named `mp_opent5*`) before
-  cod2map/linker will build the map; the generated art then overrides the colour-map pixels.
+- The LinkerMod loader is wedged: `launcher_ldr.exe` + `cod2map.dll` fail with "Access is denied."
+  / EXITCODE 5 for every map (a trivial box too), while `cod2map.exe` alone works. A protected
+  `launcher-x64.exe` (PID 12280, session 0) cannot be killed by this user. Clear that process (or
+  the security policy blocking DLL injection), then re-run `blockmap build` and `blockmap convert`;
+  everything else is in place.
+- (historic) The PC Mod Tools were first thought absent; they are present at
+  `.../Call of Duty Black Ops/bin/`. The remaining blocker is the loader above, not the tools.
+- The block materials, their colour-map IWIs and the sky material are registered (section 4);
+  `cod2map.exe` resolves them all and seals the map, so this is done, pending the loader.
 - Texture scale in the `.map` (one tile per block) is set to the block size and is INFERRED; the
   exact UV wants a device render to confirm the blocky tiling.
 - Water is a plain textured slab with a water-looking material; a true engine water surface

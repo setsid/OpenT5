@@ -183,7 +183,7 @@ def test_map_has_own_materials_and_lighting(built):
 def test_material_and_colormap_names():
     assert mapwriter.material_name("grass_top") == "mp_opent5blocks_grass_top"
     assert mapwriter.material_name("caulk") == "caulk"
-    assert mapwriter.colormap_name("dirt") == "~-gmp_opent5blocks_dirt_c"
+    assert mapwriter.colormap_name("dirt") == "mp_opent5blocks_dirt_c"
 
 
 def test_spawn_classes_present_for_tdm_and_ffa(built):

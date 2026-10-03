@@ -32,6 +32,66 @@ import numpy as np  # noqa: E402
 from opent5.formats import texture as tx  # noqa: E402
 from opent5.mapgen import greedy, mapwriter, preview, terrain, textures  # noqa: E402
 
+# -- PC material / image registration (box-tex mechanism, demo-box-textures.md) -------------
+#: A material binary that compiles (techset l_sm_r0c0, colorMap + identity normalMap); we clone
+#: it per block material, changing only the material name and the colour-map image name. The
+#: pointer words into its string blob (verified to reproduce it byte for byte).
+_MAT_TEMPLATE = "blockout_test_wood"
+_MAT_PREFIX_LEN = 0x6C
+_MAT_FIELDS = {0x34: 0, 0x00: 1, 0x48: 2, 0x40: 3, 0x4C: 4, 0x54: 5, 0x58: 6}
+#: A known-good 512x512 DXT1 colour-map IWI copied under each block's own name; the converter
+#: overrides the pixels with the generated art, so only the IWI's validity (not content) matters.
+_IWI_TEMPLATE = "~-gblockout_average_test_c.iwi"
+
+
+def _material_bytes(template: bytes, name: str, colormap: str) -> bytes:
+    import struct
+
+    strings = [
+        "l_sm_r0c0",
+        name,
+        colormap,
+        "colorMap",
+        "normalMap",
+        "$identitynormalmap",
+        "dynamicFoliageSunDiffuseMinMax",
+    ]
+    blob = bytearray()
+    offs = []
+    for s in strings:
+        offs.append(_MAT_PREFIX_LEN + len(blob))
+        blob += s.encode() + b"\0"
+    out = bytearray(template[:_MAT_PREFIX_LEN])
+    for foff, idx in _MAT_FIELDS.items():
+        struct.pack_into("<I", out, foff, offs[idx])
+    return bytes(out) + bytes(blob)
+
+
+def register_assets(game_dir: Path) -> list[str]:
+    """Write the block materials and colour-map IWIs the PC linker needs, all named
+    ``mp_opent5blocks*``. Returns the game-relative paths created. Refuses to overwrite a file
+    that is not one of ours."""
+    mats = game_dir / "raw" / "materials"
+    imgs = game_dir / "raw" / "images"
+    template = (mats / _MAT_TEMPLATE).read_bytes()
+    iwi = (imgs / _IWI_TEMPLATE).read_bytes()
+    created = []
+    for tile in textures.TILE_NAMES:
+        mat_name = mapwriter.material_name(tile)  # mp_opent5blocks_<tile>
+        col_name = mapwriter.colormap_name(tile)  # mp_opent5blocks_<tile>_c
+        if not mat_name.startswith("mp_opent5blocks"):
+            raise SystemExit(f"refusing non-mp_opent5blocks material {mat_name!r}")
+        for path, data in (
+            (mats / mat_name, _material_bytes(template, mat_name, col_name)),
+            (imgs / f"{col_name}.iwi", iwi),
+        ):
+            if path.exists() and not path.name.startswith("mp_opent5blocks"):
+                raise SystemExit(f"{path}: not an mp_opent5blocks file; not overwritten")
+            path.write_bytes(data)
+            created.append(str(path.relative_to(game_dir)))
+    return created
+
+
 #: The headline engine caps this map stays well under, with their evidence. See docs/mapgen.md.
 LIMITS = {
     "collision_brushes": (
@@ -148,12 +208,16 @@ def cmd_build(args) -> int:
             f"{args.game}: bin\\launcher_ldr.exe (the PC Mod Tools) not found; cannot build. "
             "The textures and .map from `gen` are the offline deliverables."
         )
+    # Register the block materials and colour-map IWIs (new mp_opent5blocks* files only).
+    raw_files = register_assets(game_dir)
     # Write the map into --work, then run testmap's exact three steps via a shimmed write_map.
     work_dir = testmap._wsl(args.work)
     work_dir.mkdir(parents=True, exist_ok=True)
     (work_dir / f"{args.name}.map").write_text(mapwriter.map_text(t, boxes), newline="\r\n")
     testmap.map_text = lambda **kw: mapwriter.map_text(t, boxes)  # build() calls write_map()
     report = testmap.build(args.name, args.game, args.work, Path(args.out))
+    report["raw_assets"] = raw_files
+    report["game_files"] = sorted(report.get("game_files", []) + raw_files)
     print(json.dumps(report, indent=1))
     return 0
 
@@ -194,11 +258,12 @@ def cmd_convert(args) -> int:
         pc.read_bytes(),
         base,
         name=args.name,
+        lighting=args.lighting,
         image_roots=(),
         force_materials=True,
         overrides=overrides,
     )
-    target = outdir / f"{args.name or base.stem}.ff"
+    target = outdir / f"{result.zone_name}.ff"
     target.write_bytes(result.fastfile)
     out = {
         "source": str(pc),
@@ -206,8 +271,15 @@ def cmd_convert(args) -> int:
         "output": str(target),
         "zone_name": result.zone_name,
         "overrides": len(overrides),
+        "sha1": hashlib.sha1(result.fastfile).hexdigest(),
         "report": result.report,
     }
+    if args.name and args.copy_pak:
+        pak = base.with_suffix(".pak")
+        if pak.is_file():
+            pak_target = outdir / f"{result.zone_name}.pak"
+            pak_target.write_bytes(pak.read_bytes())
+            out["pak"] = str(pak_target)
     (outdir / "convert.json").write_text(json.dumps(out, indent=1, default=str))
     print(json.dumps(out, indent=1, default=str))
     return 0
@@ -249,6 +321,9 @@ def main(argv=None) -> int:
     cv.add_argument("pc_map")
     cv.add_argument("-o", "--out", required=True)
     cv.add_argument("--base", default="mp_nuked")
+    cv.add_argument("--name", default=None, help="own map name (mp_...); omit to replace the base")
+    cv.add_argument("--copy-pak", action="store_true", help="copy the base .pak next to the zone")
+    cv.add_argument("--lighting", default="baked")
     cv.add_argument("--seed", type=int, default=1)
     cv.add_argument("--px", type=int, default=64)
     cv.set_defaults(func=cmd_convert)

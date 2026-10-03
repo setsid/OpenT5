@@ -16,7 +16,10 @@ from .terrain import GRASS, SAND, Terrain
 
 LIGHTMAP = "lightmap_gray 16384 16384 0 0 0 0"
 MATERIAL_PREFIX = "mp_opent5blocks_"
-SKY = MATERIAL_PREFIX + "sky"
+#: The sky faces reuse Nuketown's skybox material: it already exists in the PC tools and in the
+#: mp_nuked base zone, so the converter reuses it by name (no new sky asset). cod2map marks these
+#: as sky surfaces and cod2rad bakes the worldspawn sun onto what sees them.
+SKY = "mtl_skybox_mp_nuked"
 LIGHT_GRID = "lightgrid_volume"
 
 #: Worldspawn keys from the PC mp_nuked entity string (box-map.md 1.1); the sun lights the
@@ -58,8 +61,10 @@ def material_name(tile: str) -> str:
 
 
 def colormap_name(tile: str) -> str:
-    """The PC colour-map image name (the converter override key) for a tile material."""
-    return f"~-g{material_name(tile)}_c"
+    """The colour-map image name of a tile material (the converter override key). Named
+    ``mp_opent5blocks_*`` so its ``.iwi`` obeys the custom-map file-naming rule, rather than
+    the tools' usual ``~-g..._c`` convention."""
+    return f"{MATERIAL_PREFIX}{tile}_c"
 
 
 def _brush(points_by_face, faces: dict, scale: int) -> list[str]:
@@ -149,31 +154,41 @@ def compass_corners(t: Terrain) -> list[dict]:
     """Two ``minimap_corner`` script_origins for the in-game compass (docs/convert.md 10.4);
     the converter also adds these, included here so the ``.map`` is self-contained."""
     (x0, y0, _), (x1, y1, _) = t.world_bounds()
-    z = t.origin[2] + t.shape[2] * t.block
+    b = t.block
+    z = t.origin[2] + t.sea_level * b  # inside the hull, not on the boundary
     return [
-        {"classname": "script_origin", "targetname": "minimap_corner", "origin": _v(x0, y0, z)},
-        {"classname": "script_origin", "targetname": "minimap_corner", "origin": _v(x1, y1, z)},
+        {
+            "classname": "script_origin",
+            "targetname": "minimap_corner",
+            "origin": _v(x0 + b, y0 + b, z),
+        },
+        {
+            "classname": "script_origin",
+            "targetname": "minimap_corner",
+            "origin": _v(x1 - b, y1 - b, z),
+        },
     ]
 
 
-def skybox_brushes(t: Terrain, thickness: int = 64, margin: int = 128) -> list[list[str]]:
-    """Four walls and a ceiling of ``sky`` enclosing the world, so the map is sealed and the
-    sun/sky light it. The terrain's solid floor (k=0 is solid in every column) seals the base."""
+def skybox_brushes(t: Terrain, thickness: int = 128, margin: int = 128) -> list[list[str]]:
+    """A watertight shell enclosing the world: ``sky`` walls and ceiling (so cod2rad bakes the
+    sun on what sees them), a ``caulk`` floor slab below the terrain. Walls span below the floor
+    and overlap the corners, so there is no seam to leak through. The play interior
+    ``[x0,y0,z0]..[x1,y1,top]`` stays open (terrain plus air)."""
     (x0, y0, z0), (x1, y1, z1) = t.world_bounds()
-    x0 -= margin
-    y0 -= margin
-    x1 += margin
-    y1 += margin
+    xl, yl = x0 - margin, y0 - margin
+    xr, yr = x1 + margin, y1 + margin
     top = z1 + margin
+    zbot = z0 - thickness
+    ztop = top + thickness
     s = t.block
-    xl, yl = x0 - thickness, y0 - thickness
-    xr, yr = x1 + thickness, y1 + thickness
     return [
-        _axis_brush((xl, yl, top), (xr, yr, top + thickness), SKY, s),  # ceiling
-        _axis_brush((xl, yl, z0), (x0, yr, top), SKY, s),  # -x wall
-        _axis_brush((x1, yl, z0), (xr, yr, top), SKY, s),  # +x wall
-        _axis_brush((x0, yl, z0), (x1, y0, top), SKY, s),  # -y wall
-        _axis_brush((x0, y1, z0), (x1, yr, top), SKY, s),  # +y wall
+        _axis_brush((xl, yl, top), (xr, yr, ztop), SKY, s),  # ceiling
+        _axis_brush((xl, yl, zbot), (xr, yr, z0), CAULK, s),  # floor slab (under the terrain)
+        _axis_brush((xl, yl, zbot), (x0, yr, ztop), SKY, s),  # -x wall (full height, corners)
+        _axis_brush((x1, yl, zbot), (xr, yr, ztop), SKY, s),  # +x wall
+        _axis_brush((x0, yl, zbot), (x1, y0, ztop), SKY, s),  # -y wall
+        _axis_brush((x0, y1, zbot), (x1, yr, ztop), SKY, s),  # +y wall
     ]
 
 
