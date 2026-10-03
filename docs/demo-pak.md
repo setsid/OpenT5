@@ -211,3 +211,16 @@ images_low.pak) the head shows the old face again, as in d_pak.
 - Garbage blocks on the head, or a pattern squashed into one half: the size in the header
   and the part records disagree in what the game uses (offline they agree).
 - Other textures wrong: another entry moved (offline none did).
+
+## Result in RPCS3 for j_pak_resize (2026-10-03)
+
+Local Team Deathmatch on Nuketown with the signature-patched client, `j_pak_resize`'s
+`mp_nuked.ff` and `mp_nuked.pak` in place of the retail files (restored afterwards):
+
+- The male mannequin face shows the OPENT5 / 256x512 pattern on magenta, mapped correctly on
+  the head, with no garbage blocks.
+- The rest of the map is normal.
+
+This confirms on RPCS3 that the game reads `<zone>.pak` from beside `<zone>.ff` (the INFERRED
+lookup in docs/research/pak.md) and that a resized streamed image with an appended pak entry
+and rewritten part records loads.
