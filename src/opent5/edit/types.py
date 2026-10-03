@@ -79,6 +79,9 @@ class Change:
     #: Where in the asset (cell "row 3, column 1", field path) and side effects (strings
     #: other assets shared and now hold inline).
     detail: str = ""
+    #: Other assets whose content the edit changed too (the keys and cells a share="all"
+    #: edit reached), as asset keys.
+    also: tuple = ()
 
     @property
     def key(self) -> AssetKey:

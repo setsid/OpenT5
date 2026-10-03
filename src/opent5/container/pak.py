@@ -21,8 +21,9 @@ read-then-write reproduces the file byte for byte even where the table is not in
 ascending order (img_patch.pak).
 
 ``Pak.open(path)`` reads the header only; entry bytes are read on demand. ``replace``
-records new bytes for an entry; ``chunks`` / ``write`` produce the file with the edits,
-laying entries out again in their original file order when a size changes.
+records new bytes for an entry and ``append`` adds an entry after the last one;
+``chunks`` / ``write`` produce the file with the edits, laying entries out again in their
+original file order when a size changes (appended entries last).
 """
 
 from __future__ import annotations
@@ -106,6 +107,8 @@ class Pak:
         self.header_tail = bytes(head[table_end : self.header_size])
         self._layout()
         self._edits: dict[int, bytes] = {}
+        #: Entries added by ``append``: index count, count + 1, ...
+        self._added: list[bytes] = []
 
     # -- opening -------------------------------------------------------------------------
 
@@ -244,9 +247,35 @@ class Pak:
     def revert(self, index: int) -> None:
         self._edits.pop(index, None)
 
+    def append(self, data: bytes) -> int:
+        """Add an entry after the last one (in the table and in the file); returns its
+        index. The table grows by one word, so the header grows by a sector whenever the
+        table crosses a sector boundary (every entry then moves by one sector)."""
+        self._added.append(bytes(data))
+        return self.count + len(self._added) - 1
+
     @property
     def edits(self) -> dict[int, bytes]:
-        return dict(self._edits)
+        out = dict(self._edits)
+        out.update({self.count + k: d for k, d in enumerate(self._added)})
+        return out
+
+    @property
+    def new_count(self) -> int:
+        return self.count + len(self._added)
+
+    def header_size_for(self, count: int) -> int:
+        """Header bytes with ``count`` entries: the source's own while the table still
+        fits it, else the rule every pak follows (round_up(0x1c + 4 * count, sector))."""
+        return max(self.header_size, header_bytes(count, self.sector))
+
+    def new_header_tail(self) -> bytes:
+        """The bytes after the start table once entries are appended: the source's own,
+        less the words the table now covers, then zeros."""
+        count = self.new_count
+        size = self.header_size_for(count) - (HEADER_FIXED + 4 * count)
+        skip = 4 * len(self._added)
+        return (self.header_tail + bytes(skip + size))[skip : skip + size]
 
     def _new_capacity(self, index: int) -> int:
         if index in self.alias:
@@ -260,8 +289,8 @@ class Pak:
 
     def new_starts(self) -> list[int]:
         """Start sector of every entry after the edits (original file order kept)."""
-        starts = list(self.starts)
-        cursor = self.header_size + self.lead
+        starts = list(self.starts) + [0] * len(self._added)
+        cursor = self.header_size_for(self.new_count) + self.lead
         for i in self.order:
             if i in self.alias:
                 continue
@@ -278,25 +307,33 @@ class Pak:
             cursor += self._new_capacity(i)
         for i, owner in self.alias.items():
             starts[i] = starts[owner]
+        for k, data in enumerate(self._added):
+            starts[self.count + k] = cursor // self.sector
+            if starts[self.count + k] >= MAX_START:
+                raise PakError(
+                    f"{self.name}: appended entry {self.count + k} would start at sector "
+                    f"{starts[self.count + k]:#x}; the loader addresses at most {MAX_START:#x}"
+                )
+            cursor += round_up(len(data), self.sector)
         return starts
 
     def header(self, starts: list[int] | None = None) -> bytes:
         starts = self.new_starts() if starts is None else starts
+        count = self.new_count
+        size = self.header_size_for(count)
         head = struct.pack(
             ">4sIIIIII",
             MAGIC,
             self.timestamp,
             self.field08,
-            self.count,
+            count,
             self.sector,
-            self.header_size,
+            size,
             self.reserved,
         )
-        head += struct.pack(f">{self.count}I", *starts) + self.header_tail
-        if len(head) != self.header_size:
-            raise PakError(
-                f"{self.name}: expected a {self.header_size:#x}-byte header, built {len(head):#x}"
-            )
+        head += struct.pack(f">{count}I", *starts) + self.new_header_tail()
+        if len(head) != size:
+            raise PakError(f"{self.name}: expected a {size:#x}-byte header, built {len(head):#x}")
         return head
 
     def chunks(self) -> Iterator[bytes]:
@@ -323,6 +360,8 @@ class Pak:
                 yield piece
                 off += n
                 left -= n
+        for data in self._added:
+            yield data + bytes(round_up(len(data), self.sector) - len(data))
 
     def to_bytes(self) -> bytes:
         return b"".join(self.chunks())
@@ -347,18 +386,40 @@ class Pak:
 def compare(original: Pak, written: Pak, edited: dict[int, bytes] | None = None) -> list[str]:
     """Problems found comparing a written pak with its source: header fields, entry count,
     every entry not edited byte-identical (its whole span), every edited entry holding the
-    new bytes followed by zero padding."""
+    new bytes followed by zero padding. Indices from the source's count up in ``edited``
+    are entries appended after the last one."""
     edited = edited or {}
     problems: list[str] = []
-    for field in ("timestamp", "field08", "count", "sector", "header_size", "reserved"):
-        a, b = getattr(original, field), getattr(written, field)
+    added = sorted(i for i in edited if i >= original.count)
+    if added != list(range(original.count, original.count + len(added))):
+        return [
+            f"{written.name}: appended entries {added} do not follow entry {original.count - 1}"
+        ]
+    count = original.count + len(added)
+    want = {
+        "timestamp": original.timestamp,
+        "field08": original.field08,
+        "count": count,
+        "sector": original.sector,
+        "header_size": original.header_size_for(count),
+        "reserved": original.reserved,
+    }
+    for field, a in want.items():
+        b = getattr(written, field)
         if a != b:
             problems.append(f"{written.name}: header {field}: expected {a:#x}, found {b:#x}")
     if problems:
         return problems
-    if written.header_tail != original.header_tail:
+    tail = written.header_tail
+    if added:
+        expected_tail = (original.header_tail + bytes(len(tail) + 4 * len(added)))[
+            4 * len(added) : 4 * len(added) + len(tail)
+        ]
+    else:
+        expected_tail = original.header_tail
+    if tail != expected_tail:
         problems.append(f"{written.name}: the bytes after the start table differ from the source")
-    for i in range(original.count):
+    for i in range(count):
         if i in edited:
             data = edited[i]
             got = written.read(i)

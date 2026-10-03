@@ -134,6 +134,8 @@ class Change:
     name: str = ""
     type_name: str = ""
     detail: str = ""
+    #: other assets the edit changed too (a share="all" edit's other keys)
+    also: tuple = ()
 
 
 @dataclass
@@ -712,13 +714,16 @@ class ZoneDoc:
         else:
             self.impl.set_localize(ref.key, value)
 
-    def replace_image(self, ref: Ref, data) -> None:
+    def replace_image(self, ref: Ref, data, resize: bool = False) -> None:
         if ref.inline and not self.native:
             raise EditError(
                 f"{ref.name}: an image loaded inside another asset; replacing it needs "
                 "opent5.edit"
             )
-        self.impl.replace_image(ref.key, data)
+        if resize:
+            self.impl.replace_image(ref.key, data, resize=True)
+        else:
+            self.impl.replace_image(ref.key, data)
 
     def can_replace_image(self, ref: Ref, info: dict | None = None) -> tuple[bool, str]:
         if ref.inline and not self.native:
@@ -750,12 +755,19 @@ class ZoneDoc:
                     name=ref.label if ref else str(key),
                     type_name=ref.type_name if ref else "",
                     detail=detail,
+                    also=tuple(getattr(c, "also", ()) or ()),
                 )
             )
         return out
 
     def edited_keys(self) -> set:
-        return {c.key for c in self.changes()}
+        """Every asset an edit changed: the one edited, and the others a share="all" edit
+        reached (whether or not a view showing them is open)."""
+        out = set()
+        for c in self.changes():
+            out.add(c.key)
+            out.update(c.also)
+        return out
 
     @property
     def can_undo(self) -> bool:

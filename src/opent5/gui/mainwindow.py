@@ -518,7 +518,11 @@ class MainWindow(QMainWindow):
     def _add_doc(self, doc: ZoneDoc, at: int | None = None, select: bool = True) -> ZonePage:
         page = ZonePage(doc)
         page.edited.connect(lambda p=page: self._edited(p))
-        page.status.connect(self.st_sel.setText)
+        page.status.connect(
+            lambda text, p=page: self.st_sel.setText(text)
+            if self.tabs.currentWidget() is p
+            else None
+        )
         page.selected.connect(lambda _r: self._update_state())
         page.save_as_requested.connect(lambda p=page: self._save_as_page(p))
         page.discard_requested.connect(lambda p=page: self.discard(p))

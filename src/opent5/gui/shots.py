@@ -17,6 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
@@ -257,6 +258,8 @@ class Shooter:
                 ref = next(r for r in nuked.doc.refs if r.type_name == "col_map_mp")
                 nuked.open_ref(ref, "text")
                 self.shot("07_map_ents_dark")
+            if self.wanted("21_image_resize") and nuked.doc.can_save:
+                self.image_resize(nuked)
 
         ui = self.page("ui_mp")
         if ui is not None and self.wanted("05_localize_ui"):
@@ -264,12 +267,14 @@ class Shooter:
             ui.open_ref(loc, "localize")
             self.shot("05_localize_ui_light" if False else "05_localize_ui_dark")
 
-        if self.wanted("16_shared") or self.wanted("17_loading"):
+        if self.wanted("16_shared") or self.wanted("17_loading") or self.wanted("22_shared"):
             self.shared_strings()
         if patch is not None and (self.wanted("18_unsaved") or self.wanted("19_saving")):
             self.unsaved(patch)
         if patch is not None and self.wanted("20_fields_edit"):
             self.fields_edit(patch)
+        if patch is not None and self.wanted("20_fields_nested"):
+            self.fields_nested(patch)
 
         if self.wanted("13_save_report"):
             self.save_report()
@@ -317,7 +322,11 @@ class Shooter:
                     self.shot("17_loading_dark")
                 captured = True
         page = win.tabs.currentWidget()
-        if not isinstance(page, ZonePage) or not self.wanted("16_shared"):
+        if not isinstance(page, ZonePage):
+            return
+        if self.wanted("22_shared"):
+            self.shared_tree(page)
+        if not self.wanted("16_shared"):
             return
         ref = page.find_ref("MPUI_PLAYER_MATCH_CAPS", "localize")
         page.open_ref(ref, "localize")
@@ -352,6 +361,96 @@ class Shooter:
         doc.discard_all()
         page.refresh()
         view.filter.clear()
+        win._update_state()
+
+    def shared_tree(self, page) -> None:
+        """A share="all" edit made while the localize view was never opened: the tree marks
+        both keys it changed."""
+        ref = page.find_ref("MPUI_PLAYER_MATCH_CAPS", "localize")
+        page.open_ref(ref, "fields")
+        page.doc.set_localize(ref, "PLAYER MATCH (ALL)", share="all")
+        page._edited()
+        page.refresh()
+        self.win._update_state()
+        page.tree.filter.setText("PLAYER_MATCH_CAPS")
+        page.tree.view.expandAll()
+        self.shot("22_shared_tree_dark")
+        page.doc.discard_all()
+        page.tree.filter.clear()
+        page._edited()
+        page.refresh()
+        self.win._update_state()
+
+    def image_resize(self, nuked) -> None:
+        """A streamed image given twice its size (the mannequin head, 128x256 to 256x512):
+        the image view and the Changes panel. Nothing is saved."""
+        from opent5.formats import texture as tx
+
+        win = self.win
+        ref, view = self.select(nuked, "~-gmp_nuked_manneq_head_male_01_c", "image", "image")
+        w, h = 256, 512
+        y, x = np.mgrid[0:h, 0:w]
+        rgba = np.zeros((h, w, 4), np.uint8)
+        rgba[..., 3] = 255
+        rgba[((x // 16) + (y // 16)) % 2 == 0] = (255, 0, 255, 255)
+        rgba[(x % 8 == 0) | (y % 8 == 0)] = (255, 255, 255, 255)
+        rgba[200:264] = (255, 220, 0, 255)
+        png = Path(self.tmp) / "resize.png"
+        png.write_bytes(tx.write_png(rgba))
+        view.ask_resize = lambda old, new: True
+        view.import_path(png)
+        nuked._edited()
+        win._edited(nuked)
+        self.shot("21_image_resize_dark")
+        win.show_changes()
+        win.changes.list.setCurrentIndex(win.changes.model.index(0, 0))
+        self.shot("21_image_resize_changes_dark")
+        win.bottom.hide()
+        nuked.doc.discard_all()
+        nuked.refresh()
+        win._update_state()
+        png.unlink(missing_ok=True)
+
+    def fields_nested(self, patch) -> None:
+        """A field of a node nested in a model (its first material's sort key) after an
+        edit, with the path in the Changes panel."""
+        win = self.win
+        win.tabs.setCurrentWidget(patch)
+        model = next(r for r in patch.doc.refs if r.type_name == "xmodel")
+        patch.open_ref(model, "fields")
+        view = patch.current_view()
+        proxy = view.proxy
+
+        def child(parent, key):
+            for r in range(proxy.rowCount(parent)):
+                idx = proxy.index(r, 0, parent)
+                if idx.data() == key:
+                    view.tree.expand(idx)
+                    return idx
+            return None
+
+        def find():
+            node = view.proxy.index(-1, -1)
+            for key in ("materials", "[0]", "material", "header", "info.sortKey"):
+                node = child(node, key) if node is not None else None
+            return node
+
+        node = find()
+        if node is None:
+            print("  skip: 20_fields_nested found no materials[0]/material/info.sortKey")
+            return
+        proxy.setData(node.siblingAtColumn(1), "7")
+        patch._edited()
+        win._edited(patch)
+        win.show_changes()
+        settle(self.app, 0.1)
+        value = find().siblingAtColumn(1)
+        view.tree.setCurrentIndex(value)
+        view.tree.scrollTo(value, view.tree.ScrollHint.PositionAtCenter)
+        self.shot("20_fields_nested_dark")
+        win.bottom.hide()
+        patch.doc.discard_all()
+        patch.refresh()
         win._update_state()
 
     def unsaved(self, patch) -> None:

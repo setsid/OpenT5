@@ -209,6 +209,8 @@ def _read(doc, xfile, key: AssetKey, kind: str) -> Any:
         return ct.localize_state(node)
     if kind == "image":
         return im.stored_pixels(node)
+    if kind == "image_header":
+        return bytes(node["header"])
     if kind.startswith("field:"):
         sv, name, _, _ = doc._struct_view(node, kind[len("field:") :])
         return sv[name]

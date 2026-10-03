@@ -196,7 +196,7 @@ def test_undo_drops_the_pak_edit(game, tmp_path):
 
 def test_dds_input_and_size_checks(game):
     doc = Document.open(game / f"{ZONE}.ff")
-    with pytest.raises(EditError, match=r"shape \(16, 16, 4\)"):
+    with pytest.raises(EditError, match="expected 16x16 pixels, found 32x32"):
         doc.replace_image(0, np.zeros((32, 32, 4), np.uint8))
     levels = [tx.encode_level(m, tx.DXT1) for m in tx.mip_chain(NEW, 5)]
     doc.replace_image(0, tx.write_dds(tx.Dds(tx.DXT1, W, W, 5, [levels])))
@@ -216,3 +216,142 @@ def test_save_refuses_to_write_a_pak_over_its_source(game):
     report = doc.save(game / f"{ZONE}_b.ff")
     assert report.verified, report.problems
     assert report.details["paks"][0]["path"].endswith(f"{ZONE}_b.pak")
+
+
+# -- another size (pak.md 9.1) ---------------------------------------------------------------
+
+
+def big_new(side: int) -> np.ndarray:
+    y, x = np.mgrid[0:side, 0:side]
+    out = np.zeros((side, side, 4), np.uint8)
+    out[..., 3] = 255
+    out[((x // 4) + (y // 4)) % 2 == 0] = (0, 255, 0, 255)
+    return out
+
+
+def test_resize_needs_the_flag(game):
+    doc = Document.open(game / f"{ZONE}.ff")
+    with pytest.raises(EditError, match="expected 16x16 pixels, found 32x32.*resize=True"):
+        doc.replace_image(0, big_new(32))
+    assert not doc.dirty
+
+
+def test_resize_doubles_and_appends_a_level_pak_entry(game, tmp_path):
+    doc = Document.open(game / f"{ZONE}.ff")
+    doc.replace_image(0, big_new(32), resize=True)
+    change = doc.changes()[-1]
+    assert "16x16 (5 mips) -> 32x32 (6 mips), 4 parts" in change.detail
+    assert "level pak entries added: 3" in change.detail
+    assert "images_low.pak entry 1 (4x4)" in change.detail  # the tail is kept
+    info = doc.image(0).info
+    assert (info["width"], info["height"], info["mips"]) == (32, 32, 6)
+    assert [(p["slot"], p["entry"], p["width"], p["mips"]) for p in info["parts"]] == [
+        (1, 1, 4, 3),
+        (0, 2, 8, 4),
+        (0, 0, 16, 5),
+        (0, 3, 32, 6),
+    ]
+    assert np.array_equal(doc.image(0).rgba[..., :3], big_new(32)[..., :3])
+    out = tmp_path / "out" / f"{ZONE}.ff"
+    report = doc.save(out)
+    assert report.verified, report.problems
+    assert not report.identical  # the GfxImage header changed
+    (pak,) = report.details["paks"]
+    assert pak["edited_entries"] == [0, 2, 3] and pak["appended_entries"] == [3]
+    assert pak["entries"] == 4 and pak["entries_identical"] == 1
+    assert report.details["streamed_images_decoded"] == 1
+    back = Document.open(out)
+    data = back.image(0)
+    assert (data.info["width"], data.info["mips"]) == (32, 6)
+    assert np.array_equal(data.rgba[..., :3], big_new(32)[..., :3])
+    hdr = bytes(back.xfile.assets[0].data["header"])
+    total = struct.unpack_from("<I", hdr, 0x30)[0]
+    assert total == sum(
+        tx.face_size(tx.DXT1, w, w, n) for w, n in ((4, 3), (8, 1), (16, 1), (32, 1))
+    )
+    assert struct.unpack_from("<I", hdr, 0x28)[0] == total // 16
+    # the other image and every other zone byte are as they were
+    assert back.image(1).info["width"] == 16
+    with Pak.open(out.parent / f"{ZONE}.pak") as written:
+        assert written.read(1, 0x900) == b"\x11" * 0x900
+
+
+def test_resize_down_leaves_an_unused_entry_and_undo_restores(game, tmp_path):
+    doc = Document.open(game / f"{ZONE}.ff")
+    before = bytes(doc.xfile.assets[0].data["header"])
+    doc.replace_image(0, big_new(8), resize=True)
+    assert "no longer read (left as they were): 0" in doc.changes()[-1].detail
+    report = doc.save(tmp_path / "a" / f"{ZONE}.ff")
+    assert report.verified, report.problems
+    assert Document.open(tmp_path / "a" / f"{ZONE}.ff").image(0).info["parts"][-1]["width"] == 8
+    doc.undo()
+    assert bytes(doc.xfile.assets[0].data["header"]) == before and not doc.pak_edits()
+    doc.redo()
+    # a second resize reuses the entry the image reads (2) and appends two more
+    doc.replace_image(0, big_new(32), resize=True)
+    assert [(p["entry"], p["width"]) for p in doc.image(0).info["parts"]] == [
+        (1, 4),
+        (2, 8),
+        (3, 16),
+        (4, 32),
+    ]
+    report = doc.save(tmp_path / "b" / f"{ZONE}.ff")
+    assert report.verified, report.problems
+
+
+def test_resize_refusals(game):
+    doc = Document.open(game / f"{ZONE}.ff")
+    with pytest.raises(EditError, match="power-of-two"):
+        doc.replace_image(0, np.zeros((24, 24, 4), np.uint8), resize=True)
+    with pytest.raises(EditError, match="4 levels above the 4x4 mip tail.*8x8 or 16x16 or 32x32"):
+        doc.replace_image(0, big_new(64), resize=True)
+    with pytest.raises(EditError, match="mip tail.*found 4x4"):
+        doc.replace_image(0, big_new(4), resize=True)
+    with pytest.raises(EditError, match="shared pak; resizing changes its size"):
+        doc.replace_image(1, big_new(32), resize=True, allow_shared=True)
+    assert not doc.dirty
+
+
+# -- the command line ------------------------------------------------------------------------
+
+
+def run_cli(capsys, *argv) -> tuple[int, str]:
+    from opent5 import cli
+
+    code = cli.main([str(a) for a in argv])
+    out, err = capsys.readouterr()
+    return code, out + err
+
+
+def test_cli_allow_shared_writes_images_low_with_the_warning(game, tmp_path, capsys):
+    png = tmp_path / "new.png"
+    png.write_bytes(tx.write_png(NEW))
+    out = tmp_path / "out" / f"{ZONE}.ff"
+    code, text = run_cli(capsys, "replace", game / f"{ZONE}.ff", "image:mixed", png, "-o", out)
+    assert code == 0, text
+    assert "kept as they were (shared pak" in text and not (out.parent / "images_low.pak").exists()
+    out2 = tmp_path / "out2" / f"{ZONE}.ff"
+    code, text = run_cli(
+        capsys, "replace", game / f"{ZONE}.ff", "image:mixed", png, "-o", out2, "--allow-shared"
+    )
+    assert code == 0, text
+    assert "warning: images_low.pak is shared" in text
+    assert Pak.open(out2.parent / "images_low.pak").read(1, 128) == parts_of(NEW)[0]
+    code, text = run_cli(
+        capsys, "replace", game / f"{ZONE}.ff", "image:shared_only", png, "-o", out2, "--json"
+    )
+    assert code == 1 and "allow_shared=True" in text
+
+
+def test_cli_resize(game, tmp_path, capsys):
+    png = tmp_path / "big.png"
+    png.write_bytes(tx.write_png(big_new(32)))
+    out = tmp_path / "out" / f"{ZONE}.ff"
+    code, text = run_cli(capsys, "replace", game / f"{ZONE}.ff", "image:mixed", png, "-o", out)
+    assert code == 1 and "--resize" in text
+    code, text = run_cli(
+        capsys, "replace", game / f"{ZONE}.ff", "image:mixed", png, "-o", out, "--resize"
+    )
+    assert code == 0, text
+    assert "16x16 (5 mips) -> 32x32 (6 mips)" in text and "1 added" in text
+    assert Document.open(out).image(0).info["width"] == 32

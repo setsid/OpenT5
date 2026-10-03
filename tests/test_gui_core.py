@@ -244,6 +244,20 @@ def test_diff_lines_marks_additions(doc):
     assert kinds.count("+") == 3 and "-" not in kinds
 
 
+def test_diff_lines_of_an_image_show_its_detail():
+    change = backend.Change(
+        5, "image", {}, {}, name="head_c", type_name="image",
+        detail="size 128x256 (9 mips) -> 256x512 (10 mips), 4 parts; pak: x.pak entry 3 (8x8)",
+    )  # fmt: skip
+    lines = panels.diff_lines(change)
+    assert lines[0] == ("image head_c: pixels replaced", "@")
+    assert [line for line, _ in lines[1:]] == [
+        "size 128x256 (9 mips) -> 256x512 (10 mips), 4 parts",
+        "pak: x.pak entry 3 (8x8)",
+    ]
+    assert panels.diff_lines(backend.Change(5, "image", {}, {}, detail="inline"))[1:] == []
+
+
 def test_zone_opens_with_tree_and_search():
     from opent5 import env
 

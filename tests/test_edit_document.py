@@ -390,6 +390,22 @@ def test_set_field(doc, tmp_path):
         doc.set_field(4, "columnCount", 3)
 
 
+def test_set_field_of_a_nested_node(doc, tmp_path):
+    """A field of a node nested in the asset (here a stringtable cell) through a
+    "child[i]/" step; read back from the saved file."""
+    info = doc.field_info(4, "cells[1]/hash")
+    assert info["type"] == "s32" and info["editable"]
+    doc.set_field(4, "cells[1]/hash", info["value"] ^ 0x55)
+    assert doc.changes()[-1].detail == "cells[1]/hash"
+    report, back = save_and_reopen(doc, tmp_path / "out.ff")
+    assert report.details["edited_read_back"] == 1
+    assert back.fields(4)["cells"][1]["raw"]["hash"] == info["value"] ^ 0x55
+    with pytest.raises(EditError, match="expected a nested node at 'nope'"):
+        doc.field_info(4, "nope/hash")
+    with pytest.raises(EditError, match=r"expected a nested node at 'cells\[99\]'"):
+        doc.set_field(4, "cells[99]/hash", 1)
+
+
 def test_several_edits_at_once(doc, tmp_path):
     doc.set_localize(8, "W" * 300)
     doc.set_text(2, "")

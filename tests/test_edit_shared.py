@@ -42,6 +42,7 @@ def test_split_is_the_default_and_unchanged(doc):
     doc.set_localize(1, "Bye")
     assert doc.localize(0)[1] == "Hello"
     assert "share=split" in doc.changes()[-1].detail
+    assert doc.changes()[-1].also == ()
     assert doc.shared_with(0) == [] and doc.shared_with(1) == []
 
 
@@ -50,6 +51,7 @@ def test_share_all_changes_every_sharing_key(doc, tmp_path):
     assert doc.localize(0)[1] == doc.localize(1)[1] == "Howdy, a longer greeting"
     change = doc.changes()[-1]
     assert change.detail.startswith("share=all") and "GREETING" in change.detail
+    assert change.also == (0,)  # the other key, for markers in the tree
     assert labels(doc.shared_with(0)) == [(1, "value", False)]  # still one stored string
     report = doc.save(tmp_path / "out.ff")
     assert report.verified, report.problems
@@ -146,6 +148,7 @@ def test_code_post_gfx_mp_player_match(tmp_path):
     assert [f.name for f in doc.shared_with(menu)] == ["MPUI_PLAYER_MATCH_CAPS"]
     doc.set_localize(mpui, "PLAYER MATCH (EDITED)", share="all")
     assert doc.localize(menu)[1] == "PLAYER MATCH (EDITED)"
+    assert doc.changes()[-1].also == (menu,)
     report = doc.save(tmp_path / "cpg.ff")
     assert report.verified, report.problems[:3]
     assert report.details["edited_read_back"] == 2  # both keys read back from the file
@@ -177,9 +180,16 @@ def test_patch_mp_weapon_fields_save_and_count_refused(tmp_path):
     i_info = doc.field_info(weapon.index, i_name)
     doc.set_field(weapon.index, f_name, f_info["value"] + 1.5)
     doc.set_field(weapon.index, i_name, i_info["value"] ^ 1)
+    # a field of a node nested in a model: its first material's third constant
+    model = next(r for r in doc.assets if r.type_name == "xmodel")
+    path = "materials[0]/material/constants[2]:nameHash"
+    n_info = doc.field_info(model.index, path)
+    doc.set_field(model.index, path, n_info["value"] ^ 0x10)
     report = doc.save(tmp_path / "patch_mp.ff")
     assert report.verified, report.problems[:3]
-    assert report.details["edited_read_back"] == 2  # both fields read back from the file
+    assert report.details["edited_read_back"] == 3  # all three fields read back from the file
+    back = Document.open(tmp_path / "patch_mp.ff")
+    assert back.field_info(model.index, path)["value"] == n_info["value"] ^ 0x10
     # a count field: field_info says why, set_field refuses
     material = next(r for r in doc.assets if r.type_name == "material")
     info = doc.field_info(material.index, "textureCount")

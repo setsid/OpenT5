@@ -464,14 +464,10 @@ class LocalizeModel(QAbstractTableModel):
     def _shared_befores(self) -> dict:
         """Keys changed through another key's share="all" edit: their text before."""
         out = {}
-        by_label = {k: r.key for k, r in zip(self.keys, self.refs, strict=True)}
         for c in self.doc.changes():
-            if c.kind == "localize" and "share=all" in (c.detail or ""):
-                tail = c.detail.split("(also ", 1)
-                if len(tail) == 2:
-                    for label in tail[1].rstrip(")").split(", "):
-                        if label in by_label:
-                            out.setdefault(by_label[label], c.before)
+            if c.kind == "localize":
+                for key in c.also:
+                    out.setdefault(key, c.before)
         return out
 
 

@@ -309,6 +309,10 @@ def diff_lines(c: Change) -> list[tuple[str, str]]:
                 out.append((line, line[:1] if line[:1] in "+-" else " "))
         return out or [("(no textual difference)", " ")]
     if c.kind == "image":
-        return [(f"{title}: pixels replaced", " ")]
+        out = [(f"{title}: pixels replaced", "@")]
+        for part in (c.detail or "").split("; "):
+            if part and part not in ("inline", "deferred"):
+                out.append((part, " "))
+        return out
     head = [(f"{title}  {c.detail}".strip(), "@")]
     return head + [(f"- {c.before}", "-"), (f"+ {c.after}", "+")]

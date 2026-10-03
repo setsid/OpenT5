@@ -26,7 +26,7 @@ are offsets in the inflated zone (`.zone`), as in textures.md.
 | Trailing data | None: the last entry ends the file; bytes after the start table are zero | 4 |
 | Lookup | `<zone>.pak` (the zone's own name plus `.pak`) through the same content-folder lookup as the zone; on the disc every map's pak sits beside its `.ff` | 5 |
 | Round trip | 54 of 54 paks on this machine (11.9 GB) rewritten byte-identical from the parsed header and entries | 8 |
-| Edits | Same-size part replacement keeps every offset; other sizes re-lay the file out in its original order. The zone does not change for a same-size image | 9 |
+| Edits | Same-size part replacement keeps every offset; other sizes re-lay the file out in its original order; new entries go after the last one. The zone does not change for a same-size image; another size changes 15 header bytes of its GfxImage | 9, 9.1 |
 
 ## 2. Header
 
@@ -205,7 +205,7 @@ zone that uses it.
 
 | Off | Field | Rule | Evidence |
 |---|---|---|---|
-| 0x28 | u32 LE | total streamed bytes / (4 x part count) | 4 549 of 4 549 streamed images (e.g. mp_nuked `~-gus_art_wall_vinylsiding_white_c`: total 0x2ab00, 4 parts, `b02a0000` = 0x2ab0) |
+| 0x28 | u32 LE | total streamed bytes // (4 x part count), rounded down | 4 549 of 4 549 streamed images (e.g. mp_nuked `~-gus_art_wall_vinylsiding_white_c`: total 0x2ab00, 4 parts, `b02a0000` = 0x2ab0); rounded down: zombietron `me_adobe_top` (zone 0x3099d05, +0x28 `f5380000` = 0x38f5, +0x30 `80ab0200` = 0x2ab80, 3 parts: 0x2ab80 / 12 = 14581.33) |
 | 0x30 | u32 LE | total streamed bytes = last part's cumulative size | 4 549 of 4 549 |
 | 0x34 | 4 x 12 | part records (textures.md 2.4) | 15 341 part sizes match section 3 |
 | 0x64 | u8 | part count | |
@@ -219,6 +219,30 @@ of the name (djb2 with XOR, case-folded, seed 0; OpenAssetTools,
 src/Common/Game/T5/CommonT5.h); for the rest it is presumably the same hash of a source
 name that the zone does not keep (INFERRED; would be confirmed by the linker). Replacing an
 image's pixels at the same size changes none of these fields, so the zone stays as it was.
+
+### 6.1 How the linker splits an image into parts
+
+Rule, for streaming mode 1: every mip level whose smaller side is at least 64 is a part of
+its own, the three largest at most; all smaller levels together are part 0, the mip tail.
+Parts are stored smallest first, so a part's mip count is the number of levels from its own
+size down to 1x1. Checked by comparing the part records of every GfxImage node
+(`stream_parts`) with `opent5.edit.images.linker_layout`. Examples from mp_nuked:
+
+| Image | Size, mips | Parts (width x height, mips) |
+|---|---|---|
+| `~-gcub_pottedplant_01_c` | 128x128, 8 | 32x32 (6) images_low, 64x64 (7), 128x128 (8) |
+| `~-gmp_nuked_manneq_head_male_01_c` | 128x256, 9 | 32x64 (7) images_low 9900, 64x128 (8) entry 1282, 128x256 (9) entry 1281 |
+| `ustruck_m35_body_c` | 256x128, 9 | 64x32 (7), 128x64 (8), 256x128 (9) |
+| `~-gmp_nuked_townsign_c` | 512x512, 10 | 64x64 (7), 128x128 (8), 256x256 (9), 512x512 (10) |
+| `~-gt5_veh_movingtruck_trailer_c` | 2048x1024, 12 | 256x128 (9), 512x256 (10), 1024x512 (11), 2048x1024 (12) |
+| `~~-gp_glo_barbwire_curvy_s-...` | 512x32, 10 | one part, 512x32 (10): no level has both sides at 64 |
+
+The rule holds for every mode-1 image in nine zones: mp_nuked 908, mp_firingrange 1 107,
+zombie_theater 1 086, zombietron 1 787, common_mp 618, frontend 285, code_post_gfx_mp 3,
+patch_mp 4 (5 798 of 5 798; ui_mp streams none). Mode-2 images (one part holding the whole
+image, 793 in those zones: load screens, scope overlays) follow no split. So the mip tail
+of a 128-, 256- or 512-wide image is the same size (32 or 64 wide) whatever the larger
+levels are, which is what lets an image change size without changing images_low.pak (9.1).
 
 ## 7. Corrections to textures.md
 
@@ -300,7 +324,9 @@ zero bytes after the table, no gap before the first entry and no shared starts.
 | update | english/img_patch.pak | 20,981,760 | 2011-07-26 01:48 | 0x11 | 256 | 0x800 | not ascending | identical | `ddb0bd5e5310` |
 | wads | img_patch.pak | 20,981,760 | 2011-07-26 01:48 | 0x11 | 256 | 0x800 | not ascending | identical | `ddb0bd5e5310` |
 
-Time: 180 s for all 54 (files already in the page cache).
+Time: 180 s for all 54 (files already in the page cache). Re-run after `Pak.append` was
+added (the writer now builds the header size and table from the entry count it writes):
+54 of 54 byte-identical again, 194 s.
 
 ## 9. Editing
 
@@ -308,20 +334,27 @@ Time: 180 s for all 54 (files already in the page cache).
 entry in the original file order, each from its span (unchanged) or the new bytes plus zero
 padding (edited). If the new bytes take the same number of sectors, the layout is unchanged;
 otherwise every later entry (in file order) moves and the start table is rewritten
-(`tests/test_pak.py`, also with img_patch's interleaved order). The entry count never changes,
-so the header size and the loader's 240 KiB header pool are not affected. `Pak.write` refuses
-to write over the file it read.
+(`tests/test_pak.py`, also with img_patch's interleaved order). `Pak.write` refuses to write
+over the file it read.
+
+`Pak.append(data)` adds an entry after the last one, both in the table (index = old count)
+and in the file (after every original entry). The table grows by one word; while it still
+fits the header (mp_nuked.pak: 0x1c + 4 x 0x806 = 0x2034, header 0x2800) no entry moves.
+When the table crosses a sector boundary the header grows by 0x800 (the section 2 rule) and
+every entry moves by one sector (`tests/test_pak.py`, 505 entries plus one). The headers of
+all open paks share the loader's 240 KiB pool (2.1); one sector more is far inside it for any
+pak here (the largest header is images_low.pak's 0xc000), but an editor that added hundreds
+of entries would have to watch it. `compare` accepts appended entries named in its `edited`
+argument and checks the header size against the same rule.
 
 Streamed images through the edit API (`opent5.edit`, docs/edit-api.md):
 
 - `doc.replace_image(key, rgba | dds)` on a streamed image encodes the full mip chain once at
   the image's own width, height, format and mip count, then splits it into each part's mip
   range (section 3 rule) and checks every part's size against its record.
-- Same size only. A different width or height would change the part records, +0x28/+0x30,
-  the CellGcmTexture, and the mip-tail part in images_low.pak, and the part count is already
-  4 (the maximum) for most images; refused with the expected size.
-- The zone does not change (the GfxImage fields are the same), so a pak-only edit saves a
-  `.ff` that is byte-identical to the source and keeps its console signature.
+- At the image's own size, the zone does not change (the GfxImage fields are the same), so a
+  pak-only edit saves a `.ff` that is byte-identical to the source and keeps its console
+  signature. Another size is section 9.1 (`resize=True`).
 - Shared paks. A mode-1 image's mip tail (64x64 or 32x32 and smaller) is in images_low.pak;
   some images have every part in common.pak or ui_mp.pak. By default only parts in the
   level's own pak are written; the shared parts are left as they were and the change's
@@ -336,12 +369,71 @@ Streamed images through the edit API (`opent5.edit`, docs/edit-api.md):
   the written files, expecting exactly the pixels the pending edit decodes to. Results are in
   `SaveReport.details["paks"]` and `["streamed_images_decoded"]`.
 
+### 9.1 Another size
+
+`doc.replace_image(key, rgba | dds, resize=True)` (command line `replace --resize`) gives a
+streamed image another power-of-two size. What changes:
+
+- The mip tail (part 0) keeps its size, its place and its record. For a mode-1 image it is in
+  images_low.pak, which every zone shares; changing its size would re-lay that file out, so
+  it never changes size. The new size must therefore have the tail as one of its levels,
+  with 1 to 3 levels above it (four part records at most): for a 128x256 image (tail 32x64)
+  that is 64x128, 128x256 or 256x512. Anything else is refused with the sizes that work.
+  The tail's pixels stay the old picture unless `allow_shared=True`, which rewrites the
+  entry at its own size (as for a same-size edit).
+- Every level above the tail is one part in the level pak, smallest first. The image's
+  level-pak entries are reused smallest first; entries it no longer needs (a smaller size)
+  are left as they were and named in the change; more entries are appended (section 9).
+  With the tail sizes of 6.1 this is the linker's own split for every doubling or halving
+  that keeps the tail; the change says when it is not.
+- The GfxImage header (section 6, textures.md 2.1): `texture.mipmap` (+0x1), `texture.width`
+  and `texture.height` (+0x8, +0xa), +0x28 (total // (4 x parts)), +0x30 (total), the part
+  records (+0x34, unused records zero, as in every image with fewer than four parts) and the
+  part count (+0x64). Nothing else in the zone depends on the size; the content keeps its
+  length, so no pointer moves. The zone no longer matches its console signature.
+- Refused: single-part images, formats other than DXT1/3/5, images without a full mip
+  chain, and images whose larger levels are in a shared pak (ui_mp.pak, common.pak), since
+  those entries would change size.
+- Verification: the zone is re-parsed and every asset but the one loading the image is
+  byte-identical; the edited header is read back; the written pak is compared entry by entry
+  (appended entries included); the image is decoded from the written files and must equal
+  the new pixels exactly.
+
+mp_nuked, `~-gmp_nuked_manneq_head_male_01_c` (DXT1 128x256, 9 mips; loaded inside the
+xmodel `p_phys_nuked_manneq_head_male_01`, GfxImage at zone 0x9dbc83) doubled to 256x512:
+
+```
+before 86090200 0001aae4 00800100 ... 20070000 00000000 80550000 | 00005807 00200040 010026ac
+       00015808 00400080 00000502 | 00055809 00800100 00000501 | 00000000 00000000 00000000 | 03000000
+after  860a0200 0001aae4 01000200 ... 58150000 00000000 80550100 | 00005807 00200040 010026ac
+       00015808 00400080 00000502 | 00055809 00800100 00000501 | 0015580a 01000200 00000805 | 04000000
+```
+
+15 bytes of the 68 848 457-byte content differ, all inside this header (0x9dbc84..0x9dbce7):
+mips 9 -> 10, 128x256 -> 256x512, +0x28 0x720 -> 0x1558, +0x30 0x5580 -> 0x15580, a fourth
+record (256x512, 10 mips, slot 0 entry 2053) and the count 3 -> 4. The tail record
+(images_low.pak entry 9900, 32x64, 7 mips) and the 64x128 and 128x256 records keep their
+values; their entries 1282 and 1281 take the new pixels. mp_nuked.pak gains entry 2053
+(0x10000 bytes) at its end; its header stays 0x2800 and no other entry moves (2 051 of 2 054
+entries byte-identical). The zone re-parses exactly (529 assets, 528 identical), and the
+game's own XFile loader, emulated (`tools/convert_map.py oracle`), consumes the 68 848 457
+bytes exactly, ends every block at the header's size and converts 109 495 pointers, each the
+same as the product parser reads. Decoded from the written files, the image is 256x512 and
+equal to the DXT1 encoding of the new pixels. Demo: docs/demo-pak.md, j_pak_resize.
+
+INFERRED: that the loader takes the new records as they are (it reads part sizes from the
+records, 3, and the RSX texture from the CellGcmTexture); the RPCS3 run of the demo
+confirms it when the doubled texture shows.
+
 ## 10. Demo
 
 docs/demo-pak.md: `~-gmp_nuked_townsign_c` (the "Welcome to NUKETOWN Population" sign and the
 fallout-shelter panels, DXT1 512x512) replaced with an "OPENT5 PAK" pattern. mp_nuked.pak
 entries 702, 703 and 704 changed (512, 256, 128 levels); the other 2 050 entries
 byte-identical; the zone byte-identical to the disc file.
+
+docs/demo-pak.md, j_pak_resize: the male mannequin head texture doubled from 128x256 to
+256x512 (9.1).
 
 ## 11. Open points
 
@@ -352,4 +444,8 @@ byte-identical; the zone byte-identical to the disc file.
   slot, 0x3caa8c) are not traced; the slot-to-file table stays the one established by sizes
   in textures.md 2.4 (slot 2 still unseen).
 - Streamed cube and volume images: none are streamed in the examined zones; refused.
+- Another size for a mode-1 image whose larger size needs a bigger mip tail (512 -> 1024
+  wants a 128-wide tail; the 64-wide one is in images_low.pak): refused. It would need a
+  new tail entry in the level pak (an appended entry and a record pointing at slot 0 for
+  part 0, which no stock image has) or a larger images_low.pak entry.
 - DLC paks (`%s/%s/%s.pak` with `.edat`): not on this machine.

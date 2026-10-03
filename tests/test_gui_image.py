@@ -35,8 +35,12 @@ class StubDoc:
             return False, str(info.get("not_replaceable", ""))
         return True, ""
 
-    def replace_image(self, ref, payload):
+    def replace_image(self, ref, payload, resize=False):
         self.replaced = payload
+        self.resize = resize
+        if resize:
+            h, w = payload.shape[:2]
+            self.data = ImageData(dict(self.data.info, width=w, height=h), payload)
 
 
 REF = Ref(3, 10, "image", "test_image", 100, ("image", "fields", "hex"), 0x100)
@@ -86,3 +90,21 @@ def test_view_without_pixels():
     assert "no part readable" in v.canvas.message
     assert "no part readable" in v.info.values["source"].text()
     assert not v.info.export_btn.isEnabled()
+
+
+def test_a_streamed_image_asks_before_taking_another_size(tmp_path):
+    info = {"format": "DXT1", "width": 48, "height": 32, "pixels": "pak"}
+    doc = StubDoc(ImageData(info, pixels()))
+    v = ImageView()
+    v.load_sync(doc, REF)
+    big = tmp_path / "big.png"
+    from opent5.formats import texture as tx
+
+    big.write_bytes(tx.write_png(np.zeros((64, 96, 4), np.uint8)))
+    asked = []
+    v.ask_resize = lambda old, new: asked.append((old, new)) or False
+    assert not v.import_path(big) and doc.replaced is None
+    assert asked == [((48, 32), (96, 64))]
+    v.ask_resize = lambda old, new: True
+    assert v.import_path(big) and doc.resize
+    assert v.data.info["width"] == 96 and v.data.rgba.shape == (64, 96, 4)

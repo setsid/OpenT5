@@ -134,7 +134,8 @@ Full export: `{"ok", "zone", "outdir", "mode": "full export", "files", "failures
 
 ## replace
 
-    opent5 replace ZONE ASSET FILE [ASSET FILE ...] -o OUT [--no-verify] [--share split|all] [--json]
+    opent5 replace ZONE ASSET FILE [ASSET FILE ...] -o OUT [--no-verify] [--share split|all]
+                   [--allow-shared] [--resize] [--json]
 
 Replaces assets with the content of files and saves a new zone. Every length is allowed:
 the zone is re-laid out and every offset pointer remapped (docs/edit-api.md, Saving).
@@ -144,7 +145,7 @@ the zone is re-laid out and every offset pointer remapped (docs/edit-api.md, Sav
 | rawfile | the new file (any bytes; a .gsc / .csc is compressed the way the game stores scripts) |
 | stringtable | CSV with the same number of columns; rows may be added or removed at the end, and every changed cell is rehashed and the index re-sorted |
 | localize | the new value (one final newline is dropped) |
-| image | PNG of the same width and height, or a DDS of the same format, size and at least the same mip count; only for images whose pixels are in the zone (inline or deferred). Streamed images (`.pak`) are refused: writing `.pak` files is not implemented |
+| image | PNG of the same width and height, or a DDS of the same format, size and at least the same mip count. Pixels in the zone (inline or deferred) or streamed from `.pak` files (below); with `--resize`, a streamed image may take another power-of-two size |
 | map_ents, col_map | the new entity string |
 
 Shared strings. The zone linker stores identical strings once, so several localize keys (or
@@ -158,6 +159,31 @@ asset's name, keep the old text). Each change's detail says which happened (`sha
 
     $ opent5 replace code_post_gfx_mp MPUI_PLAYER_MATCH_CAPS new.txt --share all -o out/cpg.ff
       change: asset 4162 localize share=all: the stored string changed for 2 field(s) (also MENU_PLAYER_MATCH_CAPS)
+
+Streamed images (docs/edit-api.md, docs/research/pak.md 9). The new parts are written to
+`.pak` files beside OUT: `<OUT stem>.pak` for the level's own pak (copy it into the game
+folder with the `.ff`; the game opens `<zone>.pak` beside `<zone>.ff`). A part in a shared
+pak (images_low, common, ui_mp, img_patch; for most images the small mip tail in
+images_low.pak) is left as it is unless `--allow-shared`, and the change's detail names it.
+`--allow-shared` writes that pak too, under its own name beside OUT, and the report prints
+`warning: images_low.pak is shared: every zone that streams from it reads it, so a changed
+copy changes this image wherever it is used`. An image whose parts are all in shared paks is
+refused without the flag. Every written pak is listed:
+
+    $ opent5 replace mp_nuked.ff 'image:~-gmp_nuked_townsign_c' sign.png -o out/d/mp_nuked.ff
+      ...
+      pak: out/d/mp_nuked.pak (172005376 bytes, sha1 cb4ac63f...); entries 702, 703, 704 written; 2050 of 2053 identical
+
+`--resize` accepts a PNG or DDS of another power-of-two size for a streamed image (pak.md
+9.1): the mip tail keeps its size, each larger level becomes one part in the level pak (new
+entries are added after its last one), and the image's header in the zone changes, so the
+zone is rebuilt and its console signature no longer matches. Without the flag another size
+is refused with a message naming it.
+
+    $ opent5 replace mp_nuked.ff 'image:~-gmp_nuked_manneq_head_male_01_c' head_256x512.png \
+          -o out/j/mp_nuked.ff --resize
+      change: asset image:~-gmp_nuked_manneq_head_male_01_c (inline) image size 128x256 (9 mips) -> 256x512 (10 mips), 4 parts; level pak entries added: 2053; ...
+      pak: out/j/mp_nuked.pak (172070912 bytes, sha1 cd2d037b...); entries 1281, 1282, 2053 written, 1 added; 2051 of 2054 identical
 
 After saving, the file is verified (unless `--no-verify`): reopened, parsed exactly, every
 asset not edited identical to the source (or identical apart from remapped pointers that
@@ -288,9 +314,15 @@ Convert a map built with the PC Mod Tools into a PS3 zone: the base zone's world
 map's, everything else is kept. The base is only read; the result goes to OUTDIR.
 Details, supported gametypes and limits: docs/convert.md.
 
-    opent5 convert PC_MAP.ff --base mp_nuked -o OUTDIR [--lighting flat|sunlit|keep]
+    opent5 convert PC_MAP.ff --base mp_nuked -o OUTDIR [--lighting baked|flat|sunlit|keep]
         [--name mp_NAME [--copy-pak]] [--register --patch-mp PATCH_MP.ff
         [--title TEXT] [--description TEXT] [--ui-slot N]] [--json]
+
+`--lighting baked` (the default) converts the PC map's own cod2rad lightmaps, reflection
+probes and outdoor image into the map's zone; `flat`, `sunlit` and `keep` light it from the
+base map's lightmaps instead (docs/convert.md 3.5, 10). Every conversion also adds the
+minimap corners and a compass material and image of the map's own inside its zone
+(docs/convert.md 10.4).
 
 `--name` gives the map its own zone name (`mp_NAME.ff`, every internal occurrence renamed;
 docs/research/map-registration.md lists them); `--copy-pak` writes `mp_NAME.pak` beside it.

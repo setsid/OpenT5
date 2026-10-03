@@ -11,12 +11,16 @@ Streamed images are split into parts by mip range (pak.md 3): part 0 is the mip 
 mode 1 usually in the shared images_low.pak), each later part one larger level (usually in
 the level's own pak). New bytes for each part are kept as pending pak edits keyed by
 (slot, entry); the zone itself does not change. ``save_paks`` writes the edited paks next
-to the saved zone and checks them.
+to the saved zone and checks them. ``resize_streamed`` gives a streamed image another
+power-of-two size (pak.md 9.1): the mip tail keeps its entry, the larger levels are laid
+out again in the level pak (appending entries when needed) and the GfxImage header changes.
 """
 
 from __future__ import annotations
 
+import copy
 import dataclasses
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -161,11 +165,14 @@ def encode(node: dict, data, what: str) -> bytes:
     return stored + bytes(size - len(stored))
 
 
-def _encode_full(node: dict, data, what: str) -> bytes:
-    """New pixels as one stored image: every face, every mip level, padded to 128."""
+def _encode_full(node: dict, data, what: str, dims: tuple[int, int, int] | None = None) -> bytes:
+    """New pixels as one stored image: every face, every mip level, padded to 128. ``dims``
+    (width, height, levels) replaces the image's own for a resize."""
     f = view(node).fields
     fmt, w, h = f["texture.format"], f["texture.width"], f["texture.height"]
     levels = max(1, f["texture.mipmap"])
+    if dims is not None:
+        w, h, levels = dims
     faces = 6 if f["texture.cubemap"] else 1
     if isinstance(data, bytes | bytearray | memoryview):
         try:
@@ -292,6 +299,176 @@ def encode_parts(node: dict, data, what: str) -> list[tuple[StreamPart, bytes]]:
     return out
 
 
+def input_size(data) -> tuple[int, int] | None:
+    """(width, height) of new pixels: an RGBA array, six of them, or DDS bytes."""
+    if isinstance(data, bytes | bytearray | memoryview):
+        try:
+            dds = tx.read_dds(bytes(data))
+        except tx.TextureError:
+            return None
+        return dds.width, dds.height
+    if isinstance(data, list | tuple) and data:
+        data = data[0]
+    shape = np.shape(data)
+    return (shape[1], shape[0]) if len(shape) >= 2 else None
+
+
+def _power_of_two(n: int) -> bool:
+    return n > 0 and n & (n - 1) == 0
+
+
+#: Largest side accepted for a new size (the RSX samples textures up to 4096 a side).
+MAX_SIDE = 4096
+
+
+def linker_layout(w: int, h: int, levels: int) -> list[tuple[int, int, int]] | None:
+    """(width, height, mips) of each part, smallest first, as the linker lays out a mode-1
+    image (pak.md 6.1): every level whose smaller side is at least 64 is its own part,
+    the three largest at most; the rest is the tail, part 0. None for a single part."""
+    dims = [(max(1, w >> k), max(1, h >> k)) for k in range(levels)]
+    own = min(3, sum(1 for d in dims if min(d) >= 64))
+    if own == 0 or own >= levels:
+        return None
+    return [(*dims[own], levels - own)] + [(*dims[k], levels - k) for k in reversed(range(own))]
+
+
+def why_not_resizable(node: dict) -> str | None:
+    """Why a streamed image cannot change size, or None."""
+    reason = _why_not_streamed(node)
+    if reason:
+        return reason
+    f = view(node).fields
+    parts = stream_parts(f)
+    w, h, levels = f["texture.width"], f["texture.height"], max(1, f["texture.mipmap"])
+    if f["streamingMode"] != 1 or len(parts) < 2:
+        return "a single-part image: resizing keeps the mip tail (part 0), which here is the image"
+    if tx.base_format(f["texture.format"]) not in tx.BLOCK_BYTES:
+        return f"format {tx.format_name(f['texture.format'])}: only DXT images change size"
+    if not (_power_of_two(w) and _power_of_two(h)) or levels != tx.full_levels(w, h):
+        return "the image is not a power-of-two size with a full mip chain"
+    tail = parts[0]
+    if tail.mips != tx.full_levels(tail.width, tail.height):
+        return "its mip tail does not run down to 1x1"
+    for p in parts[1:]:
+        if p.slot != LEVEL_SLOT:
+            return (
+                f"a level above the mip tail ({p.width}x{p.height}) streams from "
+                f"{pak_file_name('', p.slot)}, a shared pak; resizing changes its size"
+            )
+    return None
+
+
+@dataclasses.dataclass
+class Resize:
+    """A streamed image at a new size: the new GfxImage header, and the stored bytes of
+    each new part with its record (slot and entry included)."""
+
+    header: bytes
+    parts: list[tuple[StreamPart, bytes]]
+    width: int
+    height: int
+    levels: int
+    appended: list[int]  # level-pak entries added after the pak's last one
+    unused: list[int]  # level-pak entries the image no longer reads
+    linker_layout: bool  # the part split is the one the linker makes at this size
+
+
+def resize_streamed(node: dict, data, what: str, next_entry: int) -> Resize:
+    """New pixels for a streamed image at another power-of-two size (pak.md 9.1). The mip
+    tail (part 0) keeps its size, place and record; every larger level becomes one part
+    in the level pak, reusing the image's level-pak entries smallest first and adding
+    entries from ``next_entry`` when it needs more."""
+    reason = why_not_resizable(node)
+    if reason:
+        raise EditError(f"{what}: cannot change size: {reason}")
+    f = view(node).fields
+    fmt = f["texture.format"]
+    old = stream_parts(f)
+    size = input_size(data)
+    if size is None:
+        raise EditError(f"{what}: expected RGBA pixels or DDS bytes")
+    w, h = size
+    if not (_power_of_two(w) and _power_of_two(h)) or max(w, h) > MAX_SIDE:
+        raise EditError(
+            f"{what}: expected a power-of-two size up to {MAX_SIDE}x{MAX_SIDE}, found {w}x{h}"
+        )
+    levels = tx.full_levels(w, h)
+    tail = old[0]
+    above = levels - tail.mips
+    if (max(1, w >> above), max(1, h >> above)) != (tail.width, tail.height) or above < 1:
+        raise EditError(
+            f"{what}: the mip tail ({tail.width}x{tail.height}, {tail.mips} levels, "
+            f"{pak_file_name('', tail.slot) or 'slot ' + str(tail.slot)} entry {tail.entry}) is "
+            f"kept as it is, so the new size must have it as a level: expected "
+            f"{_sizes_keeping(tail, f['texture.width'], f['texture.height'])}, found {w}x{h}"
+        )
+    if above > 3:
+        raise EditError(
+            f"{what}: {w}x{h} has {above} levels above the {tail.width}x{tail.height} mip "
+            f"tail; a GfxImage holds four part records, so at most 3. Expected "
+            f"{_sizes_keeping(tail, f['texture.width'], f['texture.height'])}"
+        )
+    stored = _encode_full(node, data, what, (w, h, levels))
+    per_level = tx.split(stored, fmt, w, h, levels)[0]
+    entries = [p.entry for p in old[1:]]
+    if tail.slot == LEVEL_SLOT:
+        entries = [e for e in entries if e != tail.entry]
+    appended: list[int] = []
+    parts: list[tuple[StreamPart, bytes]] = []
+    total, prev_mips = 0, 0
+    for k in range(above, -1, -1):
+        mips = levels - k
+        n = mips - prev_mips
+        pw, ph = max(1, w >> k), max(1, h >> k)
+        first = levels - mips
+        part = tx.assemble(fmt, [per_level[first : first + n]])
+        if len(part) != tx.face_size(fmt, pw, ph, n):
+            raise EditError(f"{what}: part {pw}x{ph}: encoded {len(part)} bytes, expected "
+                            f"{tx.face_size(fmt, pw, ph, n)}")  # fmt: skip
+        total += len(part)
+        if k == above:
+            slot, entry = tail.slot, tail.entry
+        elif entries:
+            slot, entry = LEVEL_SLOT, entries.pop(0)
+        else:
+            slot, entry = LEVEL_SLOT, next_entry + len(appended)
+            appended.append(entry)
+        parts.append((StreamPart(total, mips, pw, ph, slot, entry), part))
+        prev_mips = mips
+    header = bytearray(node["header"])
+    header[0x1] = levels
+    struct.pack_into(">HH", header, 0x8, w, h)
+    struct.pack_into("<I", header, 0x28, total // (4 * len(parts)))
+    struct.pack_into("<I", header, 0x30, total)
+    words = b"".join(
+        struct.pack(">IHHI", (p.cumulative // 16) << 8 | p.mips, p.width, p.height,
+                    p.slot << 24 | p.entry)
+        for p, _ in parts
+    )  # fmt: skip
+    header[0x34:0x64] = words.ljust(48, b"\0")
+    header[0x64] = len(parts)
+    return Resize(
+        bytes(header),
+        parts,
+        w,
+        h,
+        levels,
+        appended,
+        entries,
+        linker_layout(w, h, levels) == [(p.width, p.height, p.mips) for p, _ in parts],
+    )
+
+
+def _sizes_keeping(tail: StreamPart, w: int, h: int) -> str:
+    """The sizes of the image's aspect that keep its tail, with 1 to 3 levels above it."""
+    out = []
+    for above in (1, 2, 3):
+        nw, nh = tail.width << above, tail.height << above
+        if max(nw, nh) <= MAX_SIDE and nw * h == nh * w:
+            out.append(f"{nw}x{nh}")
+    return " or ".join(out) or "none"
+
+
 class EditedPaks(PakSet):
     """PakSet that answers pending (unsaved) entry edits before reading the files."""
 
@@ -303,6 +480,15 @@ class EditedPaks(PakSet):
     ):
         super().__init__(zone_name, folders)
         self.pending = {k: v for k, v in (pending or {}).items() if v is not None}
+
+    def pak(self, slot: int):
+        """The pak, counting entries a pending edit appends after its last one."""
+        pak = super().pak(slot)
+        added = [e for (s, e) in self.pending if s == slot]
+        if pak is not None and added and max(added) >= pak.count:
+            pak = copy.copy(pak)
+            pak.count = max(added) + 1
+        return pak
 
     def read(self, slot: int, entry: int, size: int) -> bytes:
         data = self.pending.get((slot, entry))
@@ -363,8 +549,14 @@ def save_paks(
     for slot, source, target, entries in targets:
         try:
             with Pak.open(source) as pak:
-                for entry, data in entries.items():
-                    pak.replace(entry, data)
+                for entry, data in sorted(entries.items()):
+                    if entry < pak.count:
+                        pak.replace(entry, data)
+                    elif pak.append(data) != entry:
+                        raise PakError(
+                            f"{source.name}: expected appended entries from {pak.count} on, "
+                            f"found entry {entry}"
+                        )
                 size, sha1 = pak.write(target)
                 info = {
                     "slot": slot,
@@ -372,8 +564,9 @@ def save_paks(
                     "path": str(target),
                     "bytes": size,
                     "sha1": sha1,
-                    "entries": pak.count,
+                    "entries": pak.new_count,
                     "edited_entries": sorted(entries),
+                    "appended_entries": sorted(e for e in entries if e >= pak.count),
                     "shared": slot != LEVEL_SLOT,
                 }
                 if slot != LEVEL_SLOT:
@@ -381,8 +574,8 @@ def save_paks(
                 if verify:
                     with Pak.open(target) as written:
                         found = compare_pak(pak, written, entries)
-                    info["entries_checked"] = pak.count
-                    info["entries_identical"] = pak.count - len(entries)
+                    info["entries_checked"] = pak.new_count
+                    info["entries_identical"] = pak.new_count - len(entries)
                     info["verified"] = not found
                     problems += found
         except PakError as exc:

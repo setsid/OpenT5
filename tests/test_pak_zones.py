@@ -97,3 +97,40 @@ def test_replace_a_streamed_mp_nuked_texture(tmp_path):
     back = Document.open(out).image(ref.index)
     assert back.info["source"] == "pak slot 0 entry 702"
     assert np.array_equal(back.rgba, rgba)
+
+
+@pytest.mark.slow
+def test_double_a_streamed_mp_nuked_texture(tmp_path):
+    """pak.md 9.1: the male mannequin head, DXT1 128x256 -> 256x512. The tail in
+    images_low.pak stays; entries 1282 and 1281 take the new 64x128 and 128x256 levels and
+    entry 2053 is added for 256x512; only the image's header changes in the zone."""
+    ff = disc("mp_nuked.ff")
+    doc = Document.open(ff)
+    ref = doc.find("~-gmp_nuked_manneq_head_male_01_c", "image")
+    y, x = np.mgrid[0:512, 0:256]
+    rgba = np.zeros((512, 256, 4), np.uint8)
+    rgba[..., 3] = 255
+    rgba[((x // 16) + (y // 16)) % 2 == 0] = (255, 0, 255, 255)
+    doc.replace_image(ref.index, rgba, resize=True)
+    out = tmp_path / "mp_nuked.ff"
+    report = doc.save(out)
+    assert report.verified, report.problems[:3]
+    (pak,) = report.details["paks"]
+    assert pak["edited_entries"] == [1281, 1282, 2053] and pak["appended_entries"] == [2053]
+    assert pak["entries_identical"] == 2051
+    back = Document.open(out)
+    assert back.parse_problems == []
+    data = back.image(ref.index)
+    assert (data.info["width"], data.info["height"], data.info["mips"]) == (256, 512, 10)
+    assert [(p["slot"], p["entry"], p["width"]) for p in data.info["parts"]] == [
+        (1, 9900, 32),
+        (0, 1282, 64),
+        (0, 1281, 128),
+        (0, 2053, 256),
+    ]
+    assert np.array_equal(data.rgba, rgba)  # flat 16-pixel squares encode exactly
+    src, new = bytes(doc.content), bytes(back.content)
+    diff = [i for i in range(ref.file_start, ref.file_start + 0x70) if src[i] != new[i]]
+    assert len(diff) == 15 and len(src) == len(new)
+    assert src[: ref.file_start] == new[: ref.file_start]
+    assert src[ref.file_start + 0x70 :] == new[ref.file_start + 0x70 :]

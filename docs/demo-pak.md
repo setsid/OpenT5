@@ -119,3 +119,95 @@ should appear as the high mips stream in (a second or so after loading).
   byte-identical at the same offsets and the table is unchanged.
 - The game refuses the map or crashes while loading: it checks the pak in a way not found in
   the executable; put the retail files back and report what is shown.
+
+# j_pak_resize: a streamed texture at twice its size
+
+One streamed texture of mp_nuked given twice its width and height, with the command line
+(docs/research/pak.md 9.1). Outputs are in `~/opent5/out/demo/j_pak_resize/`.
+
+## What changed
+
+The image `~-gmp_nuked_manneq_head_male_01_c`, the face of the male mannequin head
+`p_phys_nuked_manneq_head_male_01` (material `mc/mtl_mp_nuked_manneq_head_male_01`): DXT1,
+128 x 256 with 9 mips before, 256 x 512 with 10 mips after. The new pixels
+(`manneq_head_256x512.png`) are three yellow bands reading "OPENT5", "256x512" and "2X" in
+black over a magenta and black checkerboard of 16-pixel squares, with a 1-pixel white grid
+every 8 pixels (detail the old size could not hold).
+
+    opent5 replace mp_nuked.ff 'image:~-gmp_nuked_manneq_head_male_01_c' \
+        manneq_head_256x512.png -o out/demo/j_pak_resize/mp_nuked.ff --resize
+
+| Part | Levels | Before | After |
+|---|---|---|---|
+| 0 | 32 x 64 down to 1 x 1 | images_low.pak entry 9900 | the same, not written (shared pak) |
+| 1 | 64 x 128 | mp_nuked.pak entry 1282 | entry 1282, new pixels |
+| 2 | 128 x 256 | mp_nuked.pak entry 1281 | entry 1281, new pixels |
+| 3 | 256 x 512 | (none) | mp_nuked.pak entry 2053, added after the last entry |
+
+In the zone, 15 bytes of the image's GfxImage header change (mips, width, height, +0x28,
++0x30, the fourth part record and the part count); nothing else. So the `.ff` is no longer
+the retail file and its console signature no longer matches: this demo needs the
+signature-patched client.
+
+## Files
+
+| File | sha1 | Bytes |
+|---|---|---|
+| disc `english/mp_nuked.ff` (source) | `6d5a4a0e5c031c0d8fcd555413730b014e9c0c5d` | 36 349 760 |
+| disc `english/mp_nuked.pak` (source) | `5930c6c683d9339d0357a7266a8d37819b95e6cf` | 172 005 376 |
+| `out/demo/j_pak_resize/mp_nuked.ff` | `4538f47b6e3ba49cfc0e5339f969ebd7d55394da` | 36 349 760 |
+| `out/demo/j_pak_resize/mp_nuked.pak` | `cd2d037bc5a57af2b4dbe073c1249f83b7084296` | 172 070 912 |
+| `out/demo/j_pak_resize/manneq_head_256x512.png` | `9feac09f67ccf4ee59b3e7d34666c98f842d8ca8` | 8 405 |
+
+Also in the folder: `replace.json` and `replace.txt` (the command's report),
+`manneq_head_original.png` (the image before, 128 x 256) and `manneq_head_extracted.png`
+(the image extracted from the output, 256 x 512). Running the command again gives the same
+two sha1s.
+
+## Offline verification
+
+- Zone: the 68 848 457 bytes of content differ from the disc zone in 15 bytes, all inside
+  the image's header (zone 0x9dbc84..0x9dbce7); it re-parses exactly; 528 of 529 assets are
+  byte-identical and the one that loads the image reads back with the new header.
+- Loader: the game's XFile loader, run in the local PowerPC interpreter
+  (`tools/convert_map.py oracle out/demo/j_pak_resize/mp_nuked.ff`), consumes the content
+  exactly, ends every block at the header's size and converts the same 109 495 pointers to
+  the same values as the product parser.
+- Pak: 2 054 entries (one more), header still 0x2800 bytes, no entry moved; 2 051 entries
+  byte-identical over their whole spans; 1281, 1282 and 2053 hold the new parts with zero
+  padding.
+- Pixels: decoded from the written files, the image is 256 x 512 and equal to the DXT1
+  encoding of the PNG (level 0, every pixel). `opent5 extract out/demo/j_pak_resize/mp_nuked.ff
+  WORK --type image --name '*manneq_head_male_01_c'` writes `manneq_head_extracted.png`
+  again (same sha1), and it shows the pattern.
+
+## Installing in RPCS3
+
+Back up `PS3_GAME/USRDIR/english/mp_nuked.ff` and `mp_nuked.pak` first (sha1s above), and
+use the signature-patched client.
+
+1. Copy `out/demo/j_pak_resize/mp_nuked.pak` over `PS3_GAME/USRDIR/english/mp_nuked.pak`.
+2. Copy `out/demo/j_pak_resize/mp_nuked.ff` over `PS3_GAME/USRDIR/english/mp_nuked.ff`. The
+   two are a pair: the zone's new part record names entry 2053, which only this pak has.
+
+Put both retail files back afterwards.
+
+## What to look for
+
+Load Nuketown. The mannequins stand in and around both houses. On the male mannequins whose
+head is `p_phys_nuked_manneq_head_male_01`, the face shows yellow bands with black "OPENT5", "256x512" and "2X" over the magenta
+checkerboard. Up close the 1-pixel white grid lines should be sharp: that is the 256 x 512
+level, which only exists in the new entry 2053. The other mannequin heads (male_02, the
+female ones) keep their own faces. From far away (the 32 x 64 mip and smaller, in
+images_low.pak) the head shows the old face again, as in d_pak.
+
+## What failure looks like
+
+- The map does not load or the game stops while loading: the signature check is not patched,
+  or the loader rejects the new header; put the retail files back and note the message.
+- The heads show the pattern but blurred (no sharp 1-pixel grid even up close): the game
+  streams the 128 x 256 part and never the new 256 x 512 one; the fourth record is read but
+  entry 2053 is not, or the streamer caps the size it allocates for this image.
+- Garbage blocks on the head, or a pattern squashed into one half: the size in the header
+  and the part records disagree in what the game uses (offline they agree).
+- Other textures wrong: another entry moved (offline none did).

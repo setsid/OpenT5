@@ -445,7 +445,14 @@ class ImageView(AssetView):
         self.info.import_note.setText(f"Not replaceable: {why}" if not ok else "")
         self.info.import_note.setVisible(not ok and bool(why))
         self.info.import_btn.setToolTip(
-            why if not ok else "Replace the pixels with a PNG or DDS of the same size and format"
+            why
+            if not ok
+            else "Replace the pixels with a PNG or DDS of the same size and format"
+            + (
+                " (a streamed image can also take another power-of-two size)"
+                if self.data is not None and self.data.info.get("pixels") == "pak"
+                else ""
+            )
         )
         for b in (*self.channel_buttons.values(), self.blend_btn, self.fit_btn, self.actual_btn):
             b.setEnabled(has)
@@ -501,32 +508,64 @@ class ImageView(AssetView):
         if path:
             self.import_path(Path(path))
 
+    def ask_resize(self, old: tuple[int, int], new: tuple[int, int]) -> bool:
+        """Asked before a streamed image takes another size (tests replace it)."""
+        answer = QMessageBox.question(
+            self,
+            "Change the image size",
+            f"The image is {old[0]} x {old[1]}; the file is {new[0]} x {new[1]}.\n\n"
+            "Change the image to the new size? Its GfxImage header and part records change "
+            "and its larger levels are laid out again in the level .pak (the zone then no "
+            "longer matches its console signature). The mip tail in a shared pak keeps its "
+            "size.",
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def import_path(self, path: Path) -> bool:
         if self.doc is None or self.ref is None or self.data is None or self.data.rgba is None:
             return False
         h, w = self.data.rgba.shape[:2]
+        w, h = self.data.info.get("width", w), self.data.info.get("height", h)
         if path.suffix.lower() == ".dds":
+            from opent5.formats import texture as tx
+
             payload = path.read_bytes()
+            try:
+                dds = tx.read_dds(payload)
+                size = (dds.width, dds.height)
+            except tx.TextureError:
+                size = (w, h)  # the backend says what is wrong with it
         else:
             img = QImage(str(path))
             if img.isNull():
                 QMessageBox.warning(self, "Import image", f"{path.name}: not a readable image.")
                 return False
-            if (img.width(), img.height()) != (w, h):
+            size = (img.width(), img.height())
+            payload = from_qimage(img)
+        resize = False
+        if size != (w, h):
+            if self.data.info.get("pixels") != "pak":
                 QMessageBox.warning(
                     self,
                     "Import image",
-                    f"{path.name}: expected {w} x {h}, found {img.width()} x {img.height()}.",
+                    f"{path.name}: expected {w} x {h}, found {size[0]} x {size[1]}.",
                 )
                 return False
-            payload = from_qimage(img)
+            if not self.ask_resize((w, h), size):
+                return False
+            resize = True
         try:
-            self.doc.replace_image(self.ref, payload)
+            if resize:
+                self.doc.replace_image(self.ref, payload, resize=True)
+            else:
+                self.doc.replace_image(self.ref, payload)
         except EditError as exc:
             QMessageBox.warning(self, "Import image", str(exc))
             return False
         self.edited.emit()
-        if isinstance(payload, np.ndarray):
+        if resize:
+            self.show_data(self.doc.image(self.ref), keep_view=False)
+        elif isinstance(payload, np.ndarray):
             self.show_data(ImageData(self.data.info, payload, None), keep_view=True)
         return True
 

@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 from PySide6.QtCore import QSettings, Qt  # noqa: E402
+from PySide6.QtGui import QColor  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from opent5.edit.types import SharedField  # noqa: E402
@@ -18,7 +19,7 @@ from opent5.xfile.constants import AssetType as T  # noqa: E402
 
 APP = QApplication.instance() or QApplication([])
 
-from opent5.gui import backend, strips  # noqa: E402
+from opent5.gui import backend, strips, theme  # noqa: E402
 from opent5.gui.views import code, fields, table  # noqa: E402
 from test_gui_core import FakeImpl  # noqa: E402
 
@@ -41,7 +42,10 @@ class SharingImpl(FakeImpl):
         self.values[4] = "Accuracy"
         self.split: set[int] = set()
         self.cells_split = False
-        self.field_values = {"fireTime": 0.25, "damage": 50, "count": 3}
+        self.field_values = {
+            "fireTime": 0.25, "damage": 50, "count": 3,
+            "nested/flags": 3, "surfs[0]/tileMode": 1, "surfs[0]/verts[1]/w": 0.5,
+        }  # fmt: skip
         self.calls: list = []
 
     def localize(self, i):
@@ -61,10 +65,10 @@ class SharingImpl(FakeImpl):
     def set_localize(self, i, value, share="split"):
         self.calls.append(("localize", i, share))
         if share == "all" and not self.split:
-            for k in (3, 4):
-                self._op(k, "localize", self.values[k], value, "share=all" if k == i else "")
-                self.values[k] = value
-            self.ops = self.ops[:-2] + [self.ops[-1] if self.ops[-1].index == i else self.ops[-2]]
+            other = 4 if i == 3 else 3
+            self._op(i, "localize", self.values[i], value, "share=all (also the other key)")
+            self.ops[-1].also = (other,)
+            self.values[3] = self.values[4] = value
             return
         self.split.add(i)
         super().set_localize(i, value)
@@ -80,16 +84,23 @@ class SharingImpl(FakeImpl):
         super().set_cell(i, r, c, text)
 
     def fields(self, i):
+        v = self.field_values
         return {
             "_kind": "WeaponDef",
-            "header": dict(self.field_values),
-            "nested": {"_kind": "Material", "x": 1},
-        }
+            "header": {k: x for k, x in v.items() if "/" not in k},
+            "nested": {"_kind": "Material", "x": 1, "header": {"flags": v["nested/flags"]}},
+            "surfs": [
+                {"_kind": "XSurface", "header": {"tileMode": v["surfs[0]/tileMode"]},
+                 "verts": [{"_kind": "XVert", "raw": {"w": v["surfs[0]/verts[1]/w"]}}] * 2},
+            ],
+        }  # fmt: skip
 
     def field_info(self, i, path):
         if path not in self.field_values:
             raise backend.EditError(f"no field {path}")
-        kinds = {"fireTime": ("f32", None), "damage": ("s32", None), "count": ("u16", "count")}
+        kinds = {"fireTime": ("f32", None), "damage": ("s32", None), "count": ("u16", "count"),
+                 "nested/flags": ("u8", "flags"), "surfs[0]/tileMode": ("u8", None),
+                 "surfs[0]/verts[1]/w": ("f32", None)}  # fmt: skip
         t, role = kinds[path]
         reason = "a count: it sizes the array" if role == "count" else None
         return {"type": t, "role": role, "names": None, "value": self.field_values[path],
@@ -132,6 +143,28 @@ def test_localize_marks_shared_values_and_asks(doc):
     assert asked and asked[0][1] == ["MENU_ACCURACY"]
     assert doc.impl.calls[-1] == ("localize", 3, "all")
     assert m.values == ["Hit rate", "Hit rate"]  # both keys re-read
+
+
+def test_share_all_marks_the_other_key_without_the_localize_view(doc):
+    """The tree marks every key a share="all" edit changed, whether or not the localize
+    view was ever opened; the localize view, loaded afterwards, colours both."""
+    from opent5.gui.tree import AssetTreeModel
+
+    tree = AssetTreeModel()
+    tree.set_doc(doc)
+    doc.set_localize(doc.ref(3), "Hit rate", share="all")
+    assert doc.edited_keys() == {3, 4}
+    tree.set_edited(doc.edited_keys())
+    for key in (3, 4):
+        assert tree.index_of(key).data().startswith("* ")
+    m = table.LocalizeModel()
+    m.load(doc)
+    modified = theme.current().modified
+    for row in (0, 1):
+        assert m.data(m.index(row, 1), Qt.ItemDataRole.ForegroundRole) == QColor(modified)
+    assert "was: Accuracy" in m.data(m.index(1, 1), Qt.ItemDataRole.ToolTipRole)
+    doc.undo()
+    assert doc.edited_keys() == set()
 
 
 def test_localize_cancel_and_split(doc):
@@ -279,4 +312,36 @@ def test_fields_edit_lock_and_refusal(doc):
     assert not m.setData(dmg, "lots")
     assert "expected an integer" in m.error
     nested = m.index(2, 0)
-    assert fields.field_path(m.index(0, 1, nested).internalPointer()) is None
+    assert fields.field_path(m.index(0, 1, nested).internalPointer()) is None  # not a struct
+
+
+def test_fields_of_nested_nodes_are_editable(doc):
+    """A field of a node nested in the asset (a material inside a model, a vertex inside a
+    surface) is edited through "child/" and "child[i]/" steps."""
+    view = fields.FieldsView()
+    ref = doc.ref(0)
+    view.load(doc, ref)
+    m = view.model
+
+    def child(parent, key):
+        for r in range(m.rowCount(parent)):
+            idx = m.index(r, 0, parent)
+            if idx.data() == key:
+                return idx
+        raise AssertionError(key)
+
+    flags = child(child(child(m.index(-1, -1), "nested"), "header"), "flags")
+    assert fields.field_path(flags.internalPointer()) == "nested/flags"
+    surf = child(child(m.index(-1, -1), "surfs"), "[0]")
+    tile = child(child(surf, "header"), "tileMode")
+    assert fields.field_path(tile.internalPointer()) == "surfs[0]/tileMode"
+    w = child(child(child(child(surf, "verts"), "[1]"), "raw"), "w")
+    assert fields.field_path(w.internalPointer()) == "surfs[0]/verts[1]/w"
+    tile_value = tile.siblingAtColumn(1)
+    assert m.flags(tile_value) & Qt.ItemFlag.ItemIsEditable
+    assert m.setData(tile_value, "2")
+    assert doc.impl.field_values["surfs[0]/tileMode"] == 2
+    assert doc.changes()[-1].detail == "surfs[0]/tileMode"
+    assert m.data(tile_value, Qt.ItemDataRole.ForegroundRole) == QColor(theme.current().modified)
+    assert m.setData(w.siblingAtColumn(1), "0.75")
+    assert doc.impl.field_values["surfs[0]/verts[1]/w"] == 0.75

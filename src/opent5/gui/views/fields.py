@@ -7,7 +7,8 @@ Scalar fields of the asset's own struct and of its sub-structs (``"key:field"``,
 ``"key[i]:field"``) are editable through ``set_field``: integers (decimal or 0x hex, range
 checked for the field's type), floats, vectors as space-separated components, enums by
 name or number, flags as numbers. Pointers and counts change layout and stay read-only;
-they carry a lock and say why. Fields of nested nodes are shown but not edited here.
+they carry a lock and say why. Fields of nodes nested in the asset (a material inside a
+model, a pass inside a technique) are edited the same way, through ``"child/"`` steps.
 """
 
 from __future__ import annotations
@@ -185,31 +186,45 @@ class _Node:
 
 
 def field_path(n: _Node) -> str | None:
-    """The ``set_field`` path of a leaf: "name" in the asset's own struct (under "header" or
-    "raw"), "key:name" or "key[i]:name" in a sub-struct; None for anything else."""
+    """The ``set_field`` path of a leaf: "name" in a node's own struct (under "header" or
+    "raw"), "key:name" or "key[i]:name" in a sub-struct, after one "child/" or
+    "child[i]/" step for each nested node on the way (a material inside a model); None
+    for anything else."""
     chain = []
     while n is not None and n.parent is not None:
         chain.append(n)
         n = n.parent
     chain.reverse()
-    if len(chain) < 2 or isinstance(chain[-1].value, dict):
+    if not chain or isinstance(chain[-1].value, dict):
         return None
     if isinstance(chain[-1].value, list) and _expandable(chain[-1].value):
         return None
-    first = chain[0]
-    if isinstance(first.value, dict) and "_kind" in first.value:
-        return None  # a nested node, not a struct of this asset
-    if len(chain) == 2:
-        return chain[1].key if first.key in ("header", "raw") else f"{first.key}:{chain[1].key}"
-    if (
-        len(chain) == 3
+    steps: list[str] = []
+    rest: list[_Node] = []
+    for c in chain[:-1]:
+        rest.append(c)
+        if isinstance(c.value, dict) and "_kind" in c.value:
+            if len(rest) == 1:
+                steps.append(rest[0].key)
+            elif len(rest) == 2 and isinstance(rest[0].value, list) and rest[1].key.startswith("["):
+                steps.append(rest[0].key + rest[1].key)
+            else:
+                return None
+            rest = []
+    rest.append(chain[-1])
+    first = rest[0]
+    if len(rest) == 2 and not rest[1].key.startswith("["):
+        field = rest[1].key if first.key in ("header", "raw") else f"{first.key}:{rest[1].key}"
+    elif (
+        len(rest) == 3
         and isinstance(first.value, list)
-        and chain[1].key.startswith("[")
-        and isinstance(chain[1].value, dict)
-        and "_kind" not in chain[1].value
+        and rest[1].key.startswith("[")
+        and isinstance(rest[1].value, dict)
     ):
-        return f"{first.key}{chain[1].key}:{chain[2].key}"
-    return None
+        field = f"{first.key}{rest[1].key}:{rest[2].key}"
+    else:
+        return None
+    return "/".join([*steps, field])
 
 
 class FieldsModel(QAbstractItemModel):

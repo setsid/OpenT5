@@ -149,3 +149,21 @@ def test_errors_name_what_was_expected():
     struct.pack_into(">I", bad_head, 0x14, 0x7FF)
     with pytest.raises(PakError, match="multiple of the sector size"):
         Pak.from_bytes(bytes(bad_head))
+
+
+@pytest.mark.parametrize("count", [len(ENTRIES), (SECTOR - 0x1C) // 4])
+def test_append_adds_entries_after_the_last(count):
+    """An appended entry goes last in the table and the file; at 505 entries the table
+    fills the first sector, so one more grows the header and moves every entry."""
+    entries = (ENTRIES * (count // len(ENTRIES) + 1))[:count]
+    src = Pak.from_bytes(build_pak(entries))
+    added = [b"\xaa" * 0x10, b"\xbb" * 0x1801]
+    assert [src.append(a) for a in added] == [count, count + 1]
+    out = Pak.from_bytes(src.to_bytes())
+    assert out.count == count + 2
+    assert out.header_size == header_bytes(count + 2)
+    assert out.header_size == (2 * SECTOR if count == (SECTOR - 0x1C) // 4 else src.header_size)
+    assert out.read(count, 0x10) == added[0] and out.read(count + 1) == added[1] + bytes(0x7FF)
+    assert [out.read(i) for i in range(count)] == [src.read(i) for i in range(count)]
+    assert compare(src, out, {count: added[0], count + 1: added[1]}) == []
+    assert compare(src, out, {}) != []  # the extra entries must be named

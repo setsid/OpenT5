@@ -32,6 +32,7 @@ import numpy as np
 
 from opent5 import env
 from opent5.container.fastfile import FastFileError, carries_console_signature
+from opent5.container.pak import Pak
 from opent5.container.zone import Zone
 from opent5.edit import content as ct
 from opent5.edit import geometry as geo
@@ -89,6 +90,8 @@ class _Op:
     token: int = 0
     #: Further (asset key, kind) pairs that must read back as edited (share="all").
     extra: list[tuple[AssetKey, str]] = field(default_factory=list)
+    #: Other assets whose content changed (Change.also).
+    also: tuple = ()
 
     def apply(self) -> None:
         for obj, key, _old, new in self.sets:
@@ -554,6 +557,7 @@ class Document:
             detail = f"row {row}, column {col}; {note}"
             op = _Op(index, "cell", before, text, detail, sets, {top} | touched, side)
             op.extra = extra
+            op.also = _also(index, top, extra, touched - side)
             self._push(op)
             return
         others, copies = self._own_string(sets, element, "string", top)
@@ -645,6 +649,7 @@ class Document:
             touched, side, note, extra = self._set_all(sets, group, value)
             op = _Op(index, "localize", before, value, note, sets, {top} | touched, side)
             op.extra = extra
+            op.also = _also(index, top, extra, touched - side)
             self._push(op)
             return
         others, copies = self._own_string(sets, node, "value", top)
@@ -803,18 +808,42 @@ class Document:
             )
         return tops | split, split - tops, note, extra
 
-    def replace_image(self, index: AssetKey, data, allow_shared: bool = False) -> None:
+    def replace_image(
+        self, index: AssetKey, data, allow_shared: bool = False, resize: bool = False
+    ) -> None:
         """New pixels (RGBA array, six for a cube map, or DDS bytes); same width, height,
         format and mip count. A streamed image's parts go to its .pak files (written by
         ``save`` beside the zone); parts in a shared pak (images_low, common, ui_mp, ...)
-        are left as they are unless ``allow_shared``."""
+        are left as they are unless ``allow_shared``. ``resize`` lets a streamed image
+        take another power-of-two size: its records and GfxImage header change and its
+        larger levels are laid out again in the level pak (``images.resize_streamed``)."""
         node, _, top = self._node(index, T.IMAGE)
         reason = im.why_not_replaceable(node, self.zone_name)
         if reason:
             raise EditError(f"image {node.get('name')}: cannot replace: {reason}")
         if im.where(node) == "pak":
+            f = view(node).fields
+            size = im.input_size(data)
+            if size is not None and size != (f["texture.width"], f["texture.height"]):
+                if resize:
+                    self._resize_streamed(index, node, top, data, allow_shared)
+                    return
+                hint = (
+                    "; pass resize=True (command line: --resize) to change its size"
+                    if im.why_not_resizable(node) is None
+                    else ""
+                )
+                raise EditError(
+                    f"image {node.get('name')}: expected {f['texture.width']}x"
+                    f"{f['texture.height']} pixels, found {size[0]}x{size[1]}{hint}"
+                )
             self._replace_streamed(index, node, data, allow_shared)
             return
+        if resize:
+            raise EditError(
+                f"image {node.get('name')}: only streamed (.pak) images change size; this "
+                f"one's pixels are {im.where(node)} in the zone"
+            )
         self._no_sharers(node, "pixels", "pixel data", index)
         stored = im.encode(node, data, f"image {node.get('name')}")
         old = im.stored_pixels(node) or b""
@@ -826,6 +855,46 @@ class Document:
     def _replace_streamed(self, index: AssetKey, node: dict, data, allow_shared: bool) -> None:
         what = f"image {node.get('name')}"
         parts = im.encode_parts(node, data, what)
+        self._push_streamed(index, node, parts, allow_shared, [], set(), "")
+
+    def _resize_streamed(self, index: AssetKey, node: dict, top: int, data, allow_shared) -> None:
+        what = f"image {node.get('name')}"
+        f = view(node).fields
+        plan = im.resize_streamed(node, data, what, self._next_level_entry())
+        sets = [(node, "header", node["header"], plan.header)]
+        note = (
+            f"size {f['texture.width']}x{f['texture.height']} ({f['texture.mipmap']} mips) -> "
+            f"{plan.width}x{plan.height} ({plan.levels} mips), {len(plan.parts)} parts"
+        )
+        if plan.appended:
+            note += f"; level pak entries added: {', '.join(map(str, plan.appended))}"
+        if plan.unused:
+            note += (
+                f"; level pak entries no longer read (left as they were): "
+                f"{', '.join(map(str, plan.unused))}"
+            )
+        if not plan.linker_layout:
+            note += "; the parts are not split the way the linker splits an image of this size"
+        self._push_streamed(index, node, plan.parts, allow_shared, sets, {top}, note)
+
+    def _next_level_entry(self) -> int:
+        """The index the next appended level-pak entry takes: after the pak's last entry
+        and after any appended by edits still applied."""
+        source = im.find_pak(self.zone_name, self.pak_dirs(), im.LEVEL_SLOT)
+        if source is None:
+            raise EditError(
+                f"{self.zone_name}: expected {self.zone_name}.pak in "
+                f"{', '.join(str(d) for d in self.pak_dirs()) or 'no folder'}, found none"
+            )
+        with Pak.open(source) as pak:
+            count = pak.count
+        used = [e for (slot, e), v in self._pak_parts.items() if slot == im.LEVEL_SLOT and v]
+        return max([count - 1, *used]) + 1
+
+    def _push_streamed(
+        self, index, node, parts, allow_shared: bool, sets: list, touched: set, note: str
+    ) -> None:
+        what = f"image {node.get('name')}"
         level = [(p, b) for p, b in parts if p.slot == im.LEVEL_SLOT]
         shared = [(p, b) for p, b in parts if p.slot != im.LEVEL_SLOT]
         if not level and not allow_shared:
@@ -833,10 +902,10 @@ class Document:
             raise EditError(
                 f"{what}: every part streams from a shared pak ({', '.join(names)}); "
                 "changing it changes every zone that uses this image: pass allow_shared=True "
-                "to write it"
+                "(command line: --allow-shared) to write it"
             )
         chosen = parts if allow_shared else level
-        sets = []
+        sets = list(sets)
         for p, b in chosen:
             key = (p.slot, p.entry)
             sets.append((self._pak_parts, key, self._pak_parts.get(key), b))
@@ -846,11 +915,12 @@ class Document:
                 f"{im.pak_file_name(self.zone_name, p.slot)} entry {p.entry} ({p.width}x{p.height})"
             )
 
-        detail = "pak: " + ", ".join(label(p) for p, _ in chosen)
+        detail = (note + "; " if note else "") + "pak: " + ", ".join(label(p) for p, _ in chosen)
         kept = [p for p, _ in shared if not allow_shared]
         if kept:
             detail += (
-                "; kept as they were (shared pak, pass allow_shared=True to write): "
+                "; kept as they were (shared pak, pass allow_shared=True, command line "
+                "--allow-shared, to write): "
                 + ", ".join(label(p) for p in kept)
                 + ". Those smaller mips still show the old picture at a distance"
             )
@@ -869,8 +939,9 @@ class Document:
         new = b"".join(b for _, b in chosen)
         before = {"pak_parts": len(chosen), "sha1": hashlib.sha1(old).hexdigest() if old else None}
         after = {"pak_parts": len(chosen), "bytes": len(new), "sha1": hashlib.sha1(new).hexdigest()}
-        # The zone does not change (no top-level asset touched); the paks do.
-        self._push(_Op(index, "image", before, after, detail, sets, set()))
+        # Same size: the zone does not change (no top-level asset touched), the paks do.
+        # Another size: the GfxImage header changes too, in the asset that loads it.
+        self._push(_Op(index, "image", before, after, detail, sets, set(touched)))
 
     def pak_edits(self) -> dict[tuple[int, int], bytes]:
         """Pending .pak entry bytes, (slot, entry) -> bytes (undone edits left out)."""
@@ -878,7 +949,9 @@ class Document:
 
     def _struct_view(self, node: dict, path: str) -> tuple[StructView, str, Any, dict]:
         """(view over a scratch copy, field name, node key, scratch) for a field path:
-        "name" on the node's own struct, or "key:name" / "key[i]:name" on a sub-struct."""
+        "name" on the node's own struct, or "key:name" / "key[i]:name" on a sub-struct;
+        any number of "child/" or "child[i]/" steps first reach a nested node."""
+        node, path = _nested_node(node, path)
         v = view(node)
         if ":" in path:
             where, name = path.split(":", 1)
@@ -932,10 +1005,13 @@ class Document:
 
     def set_field(self, index: AssetKey, path: str, value: Any) -> None:
         """A schema field by name (``"lodInfo[0].dist"``) on the asset's own struct, or on
-        a sub-struct as ``"key:field"`` / ``"key[i]:field"``. Pointer and count fields are
-        refused (they change layout); the asset is test-written before the edit is kept."""
+        a sub-struct as ``"key:field"`` / ``"key[i]:field"``; ``"child/"`` and
+        ``"child[i]/"`` steps first reach a node nested in the asset (``"materials[0]/
+        material/flags"``). Pointer and count fields are refused (they change layout); the
+        asset is test-written before the edit is kept."""
         node, _, top = self._node(index)
         sv, name, key, scratch = self._struct_view(node, path)
+        node = _nested_node(node, path)[0]
         try:
             before = sv[name]
             sv[name] = value
@@ -1072,9 +1148,11 @@ class Document:
         decoded = 0
         if verify and not problems:
             for op in self._undo:
-                if op.kind != "image" or op.touched:
+                if op.kind != "image":
                     continue
                 node, _, _ = self._node(op.index, T.IMAGE)
+                if im.where(node) != "pak":
+                    continue
                 found = im.check_streamed(
                     node, self.zone_name, self.pak_dirs(), paks, target.parent, target.stem
                 )
@@ -1117,7 +1195,12 @@ class Document:
                 out.append((op.index, kind, self.localize(op.index)))
             elif kind == "image":
                 node, _, _ = self._node(op.index, T.IMAGE)
-                out.append((op.index, kind, im.stored_pixels(node)))
+                if im.where(node) == "pak":
+                    # the pixels are in the paks (checked by decoding); the zone holds
+                    # the header, which a resize changes
+                    out.append((op.index, "image_header", bytes(node["header"])))
+                else:
+                    out.append((op.index, kind, im.stored_pixels(node)))
             elif kind == "field":
                 node, _, _ = self._resolve(op.index)
                 sv, name, _, _ = self._struct_view(node, op.detail)
@@ -1236,6 +1319,31 @@ class _ShareIndex:
         return SharedField(index, tname, name, label, owner, suffix)
 
 
+def _nested_node(node: dict, path: str) -> tuple[dict, str]:
+    """(node, rest of the path) after the "child/" and "child[i]/" steps at the start of a
+    field path; a step may name an integer key ("0/" for GfxLightmapArray)."""
+    steps = path.split("/")
+    for step in steps[:-1]:
+        key, element = step, None
+        if step.endswith("]") and "[" in step:
+            key, _, num = step[:-1].partition("[")
+            if not num.isdigit():
+                raise EditError(f"field path {path!r}: expected an element number in {step!r}")
+            element = int(num)
+        if key not in node and key.isdigit() and int(key) in node:
+            key = int(key)
+        child = node.get(key) if isinstance(node, dict) else None
+        if element is not None:
+            child = child[element] if isinstance(child, list) and element < len(child) else None
+        if not isinstance(child, dict) or "_t" not in child:
+            raise EditError(
+                f"field path {path!r}: expected a nested node at {step!r} of "
+                f"{node.get('_t') if isinstance(node, dict) else node!r}, found none"
+            )
+        node = child
+    return node, steps[-1]
+
+
 def _is_name(node: Any, key: Any) -> bool:
     """True for the name field of an asset node (renaming an asset is not a text edit)."""
     return key == "name" and isinstance(node, dict) and "header" in node
@@ -1263,7 +1371,15 @@ def _copies_note(copies: int, others: set[int]) -> str:
 
 
 def _change(op: _Op) -> Change:
-    return Change(op.index, op.kind, op.before, op.after, op.detail)
+    return Change(op.index, op.kind, op.before, op.after, op.detail, op.also)
+
+
+def _also(index: AssetKey, top: int, extra: list, tops: set[int]) -> tuple:
+    """The other assets a share="all" edit changed: the keys read back, then any other
+    top-level asset holding a changed field."""
+    keys = [k for k, _ in extra if k != index]
+    keys += sorted(t for t in tops if t != top and t != index)
+    return tuple(dict.fromkeys(keys))
 
 
 def _type_of(value: int | str | None) -> int | None:

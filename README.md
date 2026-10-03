@@ -30,7 +30,8 @@ By setsid.
   that moves is remapped, the block sizes and headers are recomputed, and the
   zone is re-chunked and re-encrypted.
 - **Images in and out**, including the ones streamed from `.pak` files: DXT and
-  the uncompressed GCM formats, swizzled and unswizzled.
+  the uncompressed GCM formats, swizzled and unswizzled. A streamed texture can
+  also change size (for example twice as wide and tall).
 - **Exports** whole zones to PNG, OBJ, JSON, CSV and plain text.
 - **Converts maps** built with the PC Mod Tools into a PS3 map zone. A sealed
   test room built this way already loads and plays in RPCS3.

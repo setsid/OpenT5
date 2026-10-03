@@ -200,7 +200,11 @@ class ZonePage(QWidget):
             except (ImportError, AttributeError) as exc:
                 view = _Missing(kind, str(exc))
             view.edited.connect(self._edited)
-            view.status.connect(self.status)
+            # a hidden view (a mesh view settling its camera) must not overwrite the
+            # status of the one shown
+            view.status.connect(
+                lambda text, k=kind: self.status.emit(text) if k == self.kind else None
+            )
             self.views[kind] = view
             self.stack.addWidget(view)
         return self.views[kind]

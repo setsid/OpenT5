@@ -102,7 +102,13 @@ Text: a col_map asset's `text` / `set_text` is its entity string (the MapEnts it
 the clipMap is the natural handle for "the map's entities".
 
 `set_field(index, path, value)`: `path` is a field of the asset's own struct
-(`"lodInfo[0].dist"`), or of a sub-struct as `"key:field"` / `"key[i]:field"`.
+(`"lodInfo[0].dist"`), or of a sub-struct as `"key:field"` / `"key[i]:field"`. Steps
+`"child/"` and `"child[i]/"` first reach a node nested in the asset, any number deep:
+`"materials[0]/material/constants[2]:nameHash"` on an xmodel (its first material's third
+constant), `"cells[1]/hash"` on a stringtable, `"techniques[4]/passes[0]/args[2]/type"` on a
+techset; a step may be an integer key (`"0/"`, GfxLightmapArray). `field_info` takes the same
+paths. A step that names no nested node raises `EditError`. The edit is recorded on the
+asset given (the Change's `detail` is the whole path) and read back from the saved file.
 
 Shared strings. The zone linker stores identical strings once and points later fields at
 them: in code_post_gfx_mp, `MENU_PLAYER_MATCH_CAPS` and `MPUI_PLAYER_MATCH_CAPS` read the
@@ -173,8 +179,10 @@ ships with one more opening brace than closing ones (its last function, `menuRes
 is never closed); the formatter shows it and saves it exactly all the same.
 
 `Change` has `index` (and `key`, the same), `kind` ("text", "cell", "row_added",
-"row_removed", "localize", "image", "field"), `before`, `after`, `detail`. `undo()` /
-`redo()` return the Change they undid or redid.
+"row_removed", "localize", "image", "field"), `before`, `after`, `detail`, and `also`: the
+other assets the edit changed too (the keys and tables a `share="all"` edit reached, then
+any other top-level asset holding a changed field; empty otherwise), so a front end can mark
+them without parsing `detail`. `undo()` / `redo()` return the Change they undid or redid.
 
 `SaveReport` additionally has `sha1`, `identical` (byte-identical to the source) and
 `details` (counts: identical assets, assets identical apart from remapped pointers, pointers
@@ -192,7 +200,7 @@ from the DDS. Streamed (.pak) images are replaced too (below).
 Streamed images (.pak; docs/research/pak.md). The signature gains one keyword argument, the
 two-argument call is unchanged:
 
-    doc.replace_image(index, rgba | dds_bytes, allow_shared=False)
+    doc.replace_image(index, rgba | dds_bytes, allow_shared=False, resize=False)
     doc.pak_edits() -> {(slot, entry): bytes}   # pending pak entries (undone ones left out)
 
 For a streamed image `replace_image` encodes the full mip chain at the image's own size,
@@ -208,6 +216,21 @@ lists each part with `slot`, `entry`, `width`, `height`, `mips`, `cumulative`, `
 name) and `shared`; `doc.image(index)` shows pending edits before saving. Undo and redo
 apply to the pak edits like any other.
 
+`resize=True` lets a streamed image take another power-of-two size (docs/research/pak.md
+9.1): the mip tail (part 0) keeps its size, place and record, so the new size must have it
+as a level with 1 to 3 levels above it; each larger level becomes one part in the level pak,
+reusing the image's entries smallest first and appending entries after the pak's last one
+when it needs more (`(0, entry)` keys at or above the pak's count in `pak_edits()`). The
+GfxImage header (mips, width, height, +0x28, +0x30, part records, part count) changes, so
+the zone is rebuilt and no longer matches its console signature. The Change's `detail`
+gives the old and new size, the entries added and any no longer read, and says when the
+split is not the one the linker makes at that size. Without `resize=True`, pixels of another
+size raise `EditError` naming the flag. Refused (`EditError`): non-streamed images, single-
+part images, formats other than DXT, images without a full mip chain, sizes that do not
+keep the tail or need more than four parts, and images with a level above the tail in a
+shared pak. `opent5.edit.images.linker_layout(w, h, levels)` is the linker's split
+(pak.md 6.1); `why_not_resizable(node)` says why an image cannot change size.
+
 `save(path)` then also writes each edited pak beside the zone, `<stem of path>.pak` for the
 level pak (the game opens `<zone>.pak` from the folder of `<zone>.ff`, so the two must be
 copied together) and a shared pak under its own name. It never writes over a source pak
@@ -216,13 +239,15 @@ fields as in the source, every entry not edited byte-identical over its whole sp
 edited entry holding the new bytes with zero padding; and every edited streamed image is
 decoded from the written files and must equal the new pixels exactly. `SaveReport.details`
 gains `paks` (per pak: `slot`, `source`, `path`, `bytes`, `sha1`, `entries`,
-`edited_entries`, `shared`, `note` for a shared pak, `entries_checked`,
+`edited_entries`, `appended_entries`, `shared`, `note` for a shared pak, `entries_checked`,
 `entries_identical`, `verified`), `streamed_images_decoded` and `pak_note`. A save whose only
 edits are streamed images writes a `.ff` byte-identical to the source (its signature still
-matches).
+matches). For a streamed image the verification reads its GfxImage header back from the saved
+zone (`image_header`), since a resize changes it.
 
 The pak container on its own: `opent5.container.pak.Pak` (`open`, `from_bytes`, `entries`,
-`read`, `replace`, `write`, `chunks`) and `compare(original, written, edited)`.
+`read`, `replace`, `append`, `write`, `chunks`) and `compare(original, written, edited)`
+(indices from the source's count up in `edited` are appended entries).
 
 `mesh(kind, index)` returns `opent5.edit.Mesh` (positions, triangles, normals, uvs, groups
 per triangle, notes).

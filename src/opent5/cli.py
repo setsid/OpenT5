@@ -293,17 +293,24 @@ def _extract_one(doc, r, out: Path) -> list[str]:
     return [str(path)]
 
 
-def _apply_replacement(doc, ref, file: Path, share: str = "split") -> str:
+def _apply_replacement(
+    doc, ref, file: Path, share: str = "split", allow_shared: bool = False, resize: bool = False
+) -> str:
     from opent5.xfile.constants import AssetType as T
 
     data = file.read_bytes()
     if ref.type == T.IMAGE:
         from opent5.formats import texture as tx
 
+        options = {}
+        if allow_shared:
+            options["allow_shared"] = True
+        if resize:
+            options["resize"] = True
         if data[:4] == b"DDS ":
-            doc.replace_image(ref.index, data)
+            doc.replace_image(ref.index, data, **options)
             return "image from DDS"
-        doc.replace_image(ref.index, tx.read_png(data))
+        doc.replace_image(ref.index, tx.read_png(data), **options)
         return "image from PNG"
     if ref.type == T.STRINGTABLE:
         rows = list(csv.reader(io.StringIO(data.decode("latin-1"), newline="")))
@@ -350,7 +357,7 @@ def cmd_replace(args) -> dict:
             if not path.is_file():
                 raise Failure(f"{file}: expected a file to read, found none")
             ref = resolve_asset(doc, spec)
-            how = _apply_replacement(doc, ref, path, args.share)
+            how = _apply_replacement(doc, ref, path, args.share, args.allow_shared, args.resize)
             done.append({"asset": ref_json(ref), "file": str(path), "as": how})
         report = doc.save(target, verify=not args.no_verify)
     except EditError as exc:
@@ -364,7 +371,9 @@ def cmd_replace(args) -> dict:
         "replaced": done,
         "changes": [
             {
-                "index": c.index if isinstance(c.index, int) else list(c.index),
+                "index": c.index
+                if isinstance(c.index, int)
+                else [c.index[0], int(c.index[1]), c.index[2]],
                 "kind": c.kind,
                 "detail": c.detail,
             }  # fmt: skip
@@ -387,7 +396,12 @@ def text_replace(d: dict) -> str:
             f"  replaced {r['asset']['type']} {r['asset']['name']} from {r['file']} ({r['as']})"
         )
     for c in d["changes"]:
-        lines.append(f"  change: asset {c['index']} {c['kind']} {c['detail']}".rstrip())
+        where = c["index"]
+        if isinstance(where, list):
+            from opent5.xfile.constants import type_name
+
+            where = f"{type_name(where[1])}:{where[2]} (inline)"
+        lines.append(f"  change: asset {where} {c['kind']} {c['detail']}".rstrip())
     v = d["verification"]
     if v:
         lines.append(
@@ -395,6 +409,22 @@ def text_replace(d: dict) -> str:
             f"{v['identical_after_pointer_remap']} identical apart from {v['pointers_checked']} "
             f"remapped pointers, {v['edited']} edited and read back"
         )
+    for p in (v or {}).get("paks", []):
+        added = p.get("appended_entries") or []
+        lines.append(
+            f"  pak: {p['path']} ({p['bytes']} bytes, sha1 {p['sha1']}); entries "
+            f"{', '.join(map(str, p['edited_entries']))} written"
+            + (f", {len(added)} added" if added else "")
+            + (
+                f"; {p['entries_identical']} of {p['entries_checked']} identical"
+                if "entries_identical" in p
+                else ""
+            )
+        )
+        if p.get("note"):
+            lines.append(f"  warning: {p['note']}")
+    if (v or {}).get("pak_note"):
+        lines.append(f"  note: {v['pak_note']}")
     if d["signature_note"]:
         lines.append(f"  note: {d['signature_note']}")
     return "\n".join(lines)
@@ -757,6 +787,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="localize values and stringtable cells whose string other fields share: split "
         "(default, only the named asset changes) or all (every field sharing it changes)",
     )
+    p.add_argument(
+        "--allow-shared",
+        action="store_true",
+        help="streamed images: also write the parts that live in a shared pak (images_low, "
+        "common, ui_mp, img_patch); that changes the image in every zone using the pak",
+    )
+    p.add_argument(
+        "--resize",
+        action="store_true",
+        help="streamed images: accept another power-of-two size (the GfxImage header, its "
+        "part records and the level pak are laid out again)",
+    )
 
     p = sub.add_parser("unpack", parents=[common], help="decrypt and inflate a fastfile")
     p.add_argument("zone")
@@ -788,11 +830,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--lighting",
-        choices=("flat", "sunlit", "keep"),
-        default="flat",
-        help="flat (default): light each surface evenly from the brightest even patch of the "
-        "base map's lightmap on the same material; sunlit: the same among sunlit patches; "
-        "keep: the PC lightmap coordinates",
+        choices=("baked", "flat", "sunlit", "keep"),
+        default="baked",
+        help="baked (default): the PC map's own cod2rad lightmaps, reflection probes and "
+        "outdoor image, converted into the map's zone; flat: light each surface evenly from "
+        "the brightest even patch of the base map's lightmap on the same material; sunlit: "
+        "the same among sunlit patches; keep: the PC lightmap coordinates on the base's "
+        "lightmaps",
     )
     p.add_argument(
         "--name",
