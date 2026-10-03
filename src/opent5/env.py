@@ -44,5 +44,18 @@ def zone_dirs() -> list[Path]:
     return out
 
 
+#: Folders searched recursively rather than at the top level only: the DLC
+#: arrives as dlc1/english, dlc1/french, dlc2/... under one root.
+RECURSIVE = ("OPENT5_DLC_ZONES",)
+
+
 def all_zones() -> list[Path]:
-    return [p for d in zone_dirs() for p in sorted(d.glob("*.ff"))]
+    """Every zone in every configured folder, base first, sorted within each."""
+    out: list[Path] = []
+    for key in ("OPENT5_ZONES", "OPENT5_PATCH_ZONES", "OPENT5_DLC_ZONES"):
+        found = path_of(key)
+        if not found or not found.is_dir():
+            continue
+        pattern = "**/*.ff" if key in RECURSIVE else "*.ff"
+        out.extend(sorted(p for p in found.glob(pattern) if p.is_file()))
+    return out
