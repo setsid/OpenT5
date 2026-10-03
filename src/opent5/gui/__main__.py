@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18,6 +19,11 @@ def main(argv: list[str] | None = None) -> int:
     # QT_QPA_PLATFORM=offscreen so nothing appears on screen.
     parser.add_argument("--screenshot", metavar="PATH", help=argparse.SUPPRESS)
     parser.add_argument("--after", type=float, default=8.0, help=argparse.SUPPRESS)
+    # Packaged-build checks (run with QT_QPA_PLATFORM=offscreen): exercise every view and
+    # write a JSON report, or render the screenshot set.
+    parser.add_argument("--selftest", metavar="REPORT", help=argparse.SUPPRESS)
+    parser.add_argument("--screenshots", metavar="DIR", help=argparse.SUPPRESS)
+    parser.add_argument("--only", nargs="*", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     from PySide6.QtWidgets import QApplication
@@ -34,6 +40,14 @@ def main(argv: list[str] | None = None) -> int:
     font.setFamily(theme.ui_family())
     font.setPointSize(theme.UI_POINT_SIZE)
     app.setFont(font)
+    if args.selftest:
+        from opent5.gui import selftest
+
+        return selftest.run(args.zones, args.selftest)
+    if args.screenshots:
+        from opent5.gui import shots
+
+        return shots.run(Path(args.screenshots), args.only)
     window = MainWindow()
     if args.theme:
         window._apply_theme(args.theme)
