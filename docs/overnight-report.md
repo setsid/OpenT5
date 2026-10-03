@@ -50,8 +50,15 @@ Order to run them, newest work first:
 
 - A: whether the primary-light grid is bright enough (dim vs wrong).
 - Named-map compass dvars reaching the client.
-- C and D (Search and Destroy objectives, Domination hang): see the C/D section
-  once that investigation lands.
+- C and D (Search and Destroy objectives, Domination hang): investigated offline
+  (docs/research/box-objectives-cd.md). The earlier config-string theory is
+  withdrawn with evidence (that error is a drop to menu, not a hang, and Search
+  and Destroy passed that machinery). Best offline candidates: C is the Search
+  and Destroy bomb/site brush-model triggers not spawning (so the script's
+  getEnt finds nothing); D is the Domination flag influencers needing path-node
+  connectivity the box lacks. Two discriminating test builds (fixC: radius
+  triggers; fixD: path nodes) are being built so the morning run isolates each.
+  Each needs one device log line to finalise.
 
 ## Decisions I made (see docs/decisions.md)
 
