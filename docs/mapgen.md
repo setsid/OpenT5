@@ -18,7 +18,7 @@ Package layout (owned by this track):
 | `mapgen/terrain.py` | Seeded voxel grid: hills, caves, trees, water, village; deterministic |
 | `mapgen/greedy.py` | Greedy box meshing of same-material cells; per-face texture or caulk |
 | `mapgen/textures.py` | Original 16x16 pixel-art tiles, nearest-neighbour upscaled, DXT encoded |
-| `mapgen/mapwriter.py` | Radiant `.map` from brushes + spawns + sun + light grid + skybox |
+| `mapgen/mapwriter.py` | Radiant `.map` from brushes + spawns + primary lights + light grid + caulk shell + path nodes |
 | `mapgen/preview.py` | Top-down and isometric PNG previews (inspection only) |
 | `tools/blockmap.py` | CLI: `gen`, `textures`, `build`, `convert` |
 
@@ -102,46 +102,44 @@ is:
 | cobble | irregular grey stones on a darker mortar grid |
 
 DXT round-trips at a mean RGB error of about 2 of 255 (`test_texture_dxt_roundtrip`). Own art is
-handed to the converter as `overrides` keyed by the colour-map name `mp_opent5blocks_<tile>_c`
-(docs/convert.md 11.4, demo-box-textures.md 4), so no PC image converter is needed.
+handed to the converter as `overrides` keyed by each tile's stock colour-map image name
+(`mapwriter.STOCK_COLORMAP`, e.g. `~-gblockout_rock_test_c`), so no PC image converter is needed.
 
 ## 4. Building the `.map` with the PC tools
 
-`tools/blockmap.py build NAME --game GAME --work WORK -o OUT.ff` registers the block materials
-and colour-map images (below), writes the `.map` into `--work`, and runs the exact three command
-lines of tools/testmap.py / box-map.md 1.2 through `launcher_ldr.exe` (cod2map, cod2rad `-fast`,
-linker_pc). It creates only new `mp_opent5blocks*` files in the game folder.
+`tools/blockmap.py build NAME --game GAME --work WORK -o OUT.ff` checks the stock block materials
+are present (below), writes the `.map` into `--work`, and runs the exact three command lines of
+tools/testmap.py / box-map.md 1.2 through `launcher_ldr.exe` (cod2map, cod2rad `-fast`, linker_pc).
+It writes no new material or image into the game folder.
 
-Material and image registration (`register_assets`, the `blockout_test_*` mechanism of
-demo-box-textures.md): for each tile a material binary `raw/materials/mp_opent5blocks_<tile>` is
-cloned from `blockout_test_wood` (techset `l_sm_r0c0`, colour map plus identity normal; only the
-material name and the colour-map image name are changed, the string table rebuilt and the seven
-string-pointer words repatched, verified to reproduce the template byte for byte), and a
-colour-map `raw/images/mp_opent5blocks_<tile>_c.iwi` is a byte copy of a known-good 512x512 DXT1
-IWI. The copied pixels are placeholders; the converter overrides them with the generated art by
-name (`overrides`, section 5), so only the IWI's validity matters. The sky faces reuse
-`mtl_skybox_mp_nuked`, which already exists in the tools and the mp_nuked base.
+Materials: each block face uses a stock material (`mapwriter.STOCK_MATERIAL`) rather than a clone.
+Eight are `blockout_test_*` placeholder materials and three are mp_nuked art materials (floor,
+wall, ceiling), chosen so that all eleven have a colour-map IWI loose in `raw/images` and all bake
+through cod2rad. `require_stock_assets` checks they are present. The clones used earlier (one
+material per tile copied from `blockout_test_wood`, with a byte-copied IWI) crashed cod2rad, so
+they were dropped. The converter force-builds each block material from the PC zone and overrides
+its colour map with the generated art (`overrides`, section 5), so the block textures are the
+map's own while the material structure stays stock.
 
-Lighting: worldspawn carries the sun (`sundirection`, `sunlight`, `suncolor`, ambient); a
-`lightgrid_volume` brush fills the playable band so cod2rad bakes a real light grid
-(docs/convert.md 10.3; cod2map wrote `mp_opent5blocks.grid_auto`, about 150k sample points). A
-skybox of `mtl_skybox_mp_nuked` faces plus a caulk floor slab encloses the world so it is sealed
-(the terrain's k=0 layer is solid in every column, `test_terrain_floor_is_sealed`). The sun is a
-primary light from worldspawn (box-map.md: light type 1), which lights what sees the sky.
+Lighting and sealing: a caulk shell (ceiling, four walls, floor slab) encloses the world so it is
+sealed (`seal_brushes`; the terrain's k=0 layer is solid in every column,
+`test_terrain_floor_is_sealed`). A `lightgrid_volume` brush fills the playable band so cod2rad
+bakes a light grid, and a 3x3 grid of primary spot lights (`primary_lights`, each with an
+`info_null` target) lights the sealed world. There is no outdoor sun: this Mod Tools install has
+no sky techset (the sky materials' techsets, e.g. `sky_cubemap_hdr`, are absent from
+`raw/techsets`), so a sky material makes the linker assert `missing techset`. The shell is caulk
+instead, and the primary lights stand in for the sun; lighting is even rather than directional.
 Spawns: `info_player_start`, `mp_global_intermission`, four `mp_tdm_spawn_*_start` per team and a
 spread of `mp_tdm_spawn` (TDM) and `mp_dm_spawn` (FFA) on flat surface cells; two `minimap_corner`
-origins for the compass.
+origins for the compass; and a `node_pathnode` grid on walkable cells by default, so Domination
+and the other team-based modes do not stall at load.
 
-Status (verified here): `cod2map.exe` run directly on the generated `.map` loads it, resolves all
-11 block materials and the sky material, finds no leak and writes the BSP (EXITCODE 0) once the
-watertight shell was added. So the PC-side authoring (map, materials, IWIs, seal, light-grid
-volume) is correct. The full build is blocked only at the LinkerMod loader step: `launcher_ldr.exe`
-(which injects `cod2map.dll` to write the Black Ops v45 BSP, and `linker_pc.dll`) fails with
-"Access is denied." and EXITCODE 5 for every map, a trivial box included, while `cod2map.exe`
-alone works. A protected `launcher-x64.exe` (PID 12280, session 0) cannot be killed by this user.
-This is an admin/environment issue (the wedged launcher process, or a security policy blocking the
-DLL injection), not a fault of this map. Once it is cleared, `blockmap build` then `blockmap
-convert` complete the pipeline unchanged; the materials and IWIs are already registered.
+Status (verified here): the full pipeline runs. cod2map, cod2rad and linker_pc all return 0 for
+the generated map, and `blockmap convert` parses the PC zone exactly, converts onto mp_nuked with
+0 pointers unresolved, verifies, and passes the emulated loader (same_values 63240/63240, 0 targets
+outside their block). The first map with ropes also surfaced a PC-only `rope_t` stride in the
+clipMap RUNTIME parse (0xCB0, not the PS3 0xC74; see the clipMap handler). The device check is
+whether the primary-light grid lights the world acceptably without a sun.
 
 ## 5. Conversion and offline validation
 
