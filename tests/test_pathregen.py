@@ -17,6 +17,7 @@ map is asserted and documented.
 from __future__ import annotations
 
 import struct
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -185,6 +186,83 @@ def test_moved_prop_blocks_new_link_and_frees_old():
     assert pr.segment_blocked(new_pos, *link_through_b)
 
 
+# -- edit-relative (local) regeneration ------------------------------------------------------
+
+
+def _bake(pts):
+    """A game with baseline links baked by distance (no collision), the starting point for an
+    edit-relative regen: the map already carries links the editor then perturbs."""
+    g = game_of(pts)
+    pr.regenerate_links(g, clipmap=None)
+    return g
+
+
+# left/right corridor: two nodes each side, joined across the middle; a wall box at x~150
+# represents a newly placed prop clip that blocks every cross link.
+CORRIDOR = [(0.0, 0.0, 0.0), (0.0, 120.0, 0.0), (300.0, 0.0, 0.0), (300.0, 120.0, 0.0)]
+WALL_BOX = ((140.0, -80.0, -50.0), (160.0, 260.0, 100.0))
+
+
+def test_regenerate_local_new_split_raises():
+    """An edit whose clip blocks the only links bridging two sides splits a once-joined
+    graph: ``regenerate_local_or_raise`` raises and names the cut-off nodes."""
+    g = _bake(CORRIDOR)
+    assert pr.component_report(g)["count"] == 1  # the baked baseline is one component
+    wall = clipmap_of([(WALL_BOX[0], WALL_BOX[1], pr.CONTENTS_SOLID)])
+
+    report = pr.regenerate_local(g, wall, None, [WALL_BOX])
+    assert report["removed"] >= 1  # the cross links were dropped
+    assert report["new_split"] is True
+    assert report["before_components"] == 1 and report["after_components"] == 2
+    assert report["preexisting_fragmentation"] is False
+    assert report["offending_nodes"]  # the side cut off is named
+
+    g2 = _bake(CORRIDOR)
+    with pytest.raises(pr.PathRegenError) as err:
+        pr.regenerate_local_or_raise(g2, wall, None, [WALL_BOX])
+    assert "walled off" in str(err.value)
+
+
+def test_regenerate_local_passes_when_another_path_keeps_sides_joined():
+    """The same wall, but a node above it bridges the two sides by links that do not cross
+    the edited box: the cross links drop, no new split, so the save is allowed."""
+    pts = CORRIDOR + [(150.0, 400.0, 0.0)]  # a bridge node clear of the wall's Y span
+    g = _bake(pts)
+    assert pr.component_report(g)["count"] == 1
+    wall = clipmap_of([(WALL_BOX[0], WALL_BOX[1], pr.CONTENTS_SOLID)])
+
+    report = pr.regenerate_local_or_raise(g, wall, None, [WALL_BOX])
+    assert report["removed"] >= 1  # the direct cross links still drop
+    assert report["new_split"] is False
+    assert report["after_components"] == 1  # the bridge node keeps it one component
+
+
+def test_regenerate_local_preexisting_fragmentation_is_warned_not_raised():
+    """A map already in two components before the edit (under our stricter-than-engine LOS
+    model): an edit that re-tests a clear link changes nothing and must not raise, only flag
+    the pre-existing fragmentation."""
+    # cluster A near the origin, cluster B far away: no baseline link bridges them.
+    pts = [(0.0, 0.0, 0.0), (0.0, 120.0, 0.0), (5000.0, 0.0, 0.0), (5000.0, 120.0, 0.0)]
+    g = _bake(pts)
+    assert pr.component_report(g)["count"] == 2  # already fragmented before any edit
+
+    # an edit box over the A1-A2 link, but no collision there, so the link is re-tested clear.
+    box = ((-20.0, 40.0, -50.0), (20.0, 80.0, 100.0))
+    report = pr.regenerate_local_or_raise(g, clipmap_of([]), None, [box])
+    assert report["removed"] == 0  # the re-tested link was clear, nothing dropped
+    assert report["new_split"] is False
+    assert report["preexisting_fragmentation"] is True
+    assert report["before_components"] == 2 and report["after_components"] == 2
+
+
+def test_regenerate_local_no_edit_or_no_nodes_does_nothing():
+    g = _bake(CORRIDOR)
+    empty = pr.regenerate_local(g, clipmap_of([]), None, [])  # no edited boxes
+    assert empty["removed"] == 0 and empty["new_split"] is False
+    none_nodes = pr.regenerate_local(game_of([]), clipmap_of([]), None, [WALL_BOX])
+    assert none_nodes["nodes"] == 0 and none_nodes["new_split"] is False
+
+
 # -- zones -----------------------------------------------------------------------------------
 
 
@@ -234,25 +312,37 @@ def baked_edges(game) -> set[tuple[int, int]]:
     return edges
 
 
+def _raised(pos, i, j):
+    pa, pb = pos[i], pos[j]
+    return (
+        (pa[0], pa[1], pa[2] + pr.LOS_HEIGHT),
+        (pb[0], pb[1], pb[2] + pr.LOS_HEIGHT),
+    )
+
+
 @pytest.mark.zones
 @pytest.mark.slow
-def test_retail_los_rejects_solid_and_keeps_single_component():
-    """Retail mp_nuked: the LOS rejects a segment that crosses a stock solid brush
-    and passes one in open air, and a whole-map relink stays one connected component
-    (retail ships a baked, connected graph, and LOS keeps almost all of it)."""
+def test_retail_los_rejects_solid_and_fragmentation_is_preexisting():
+    """Pristine retail mp_nuked (the sha1-pinned backup, 296 path nodes): the LOS rejects a
+    segment crossing a stock solid brush and passes one in open air; and the whole-map LOS
+    relink FRAGMENTS the graph (far more than one component), yet this map loads and plays on
+    the device. That fragmentation is a property of the map under our stricter-than-engine LOS
+    model, not something an edit caused, which is exactly why the save gate is edit-relative:
+    ``regenerate_local`` reports the fragmentation as a warning and does not raise when the
+    edit itself splits nothing."""
     path = find_zone("mp_nuked")
     if path is None:
         pytest.skip("mp_nuked.ff is not on this machine")
     x, game, cm, loc = load_map(path)
     assert game is not None and cm is not None
 
-    # a segment straight through a mid-sized stock solid brush is blocked.
+    # a segment straight through a mid-sized stock solid brush is blocked (any shape: the slab
+    # test reads its axis-aligned bounds). Pristine retail has hundreds of such brushes.
     solid = next(
         i
         for i in range(cm.num_brushes)
-        if cm.brush(i).numsides == 0
-        and cm.brush(i).contents & pr.CONTENTS_SOLID
-        and all(25.0 < cm.brush(i).maxs[k] - cm.brush(i).mins[k] < 200.0 for k in range(3))
+        if cm.brush(i).contents & pr.CONTENTS_SOLID
+        and all(16.0 < cm.brush(i).maxs[k] - cm.brush(i).mins[k] < 1000.0 for k in range(3))
     )
     b = cm.brush(solid)
     c = tuple((b.mins[k] + b.maxs[k]) / 2 for k in range(3))
@@ -263,13 +353,68 @@ def test_retail_los_rejects_solid_and_keeps_single_component():
     # high in open air, nothing to cross.
     assert not pr.segment_blocked(cm, (0.0, 0.0, 2000.0), (300.0, 0.0, 2000.0), locator=loc)
 
-    before = baked_edges(game)
-    report = pr.regenerate_or_raise(game, cm, loc)
-    assert report["components"] == 1 and report["linked"]
-    assert report["rejected"] >= 1  # LOS turned at least one baked-through link away
-    after = baked_edges(game)
-    # LOS keeps almost every baked edge (it does not invent a disconnected graph).
-    assert len(after & before) >= len(before) - 5
+    # the pre-existing fragmentation: the baked graph is already more than one component, and a
+    # whole-map LOS relink fragments it further. A whole-map single-component gate would reject
+    # this engine-happy map, so it is the wrong model for the save path.
+    baked = pr.connected_components(game)
+    assert len(baked) > 1
+    whole = pr.regenerate_links(deepcopy(game), cm, loc)
+    assert whole["components"] > 1 and not whole["linked"]
+    assert whole["rejected"] >= 100  # strict LOS turns many baked-through links away
+
+    # the edit-relative gate on the same map, with an edit far out in empty air that crosses no
+    # link: nothing is dropped, the pre-existing fragmentation is flagged, and it does not raise.
+    far = ((9000.0, 9000.0, 9000.0), (9050.0, 9050.0, 9050.0))
+    report = pr.regenerate_local_or_raise(deepcopy(game), cm, loc, [far])
+    assert report["removed"] == 0
+    assert report["new_split"] is False
+    assert report["preexisting_fragmentation"] is True
+    assert report["before_components"] == len(baked)
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_retail_local_regen_drops_only_crossing_links_no_shatter():
+    """Pristine retail: an edit whose box lies on a baked link that the stock collision blocks
+    drops that link (and the few others crossing the box), but NOT the whole-map graph. Only
+    links crossing the edited box are re-tested, so the drop count is a handful, far below the
+    thousands a whole-map LOS relink rejects, and connectivity holds (no new split)."""
+    path = find_zone("mp_nuked")
+    if path is None:
+        pytest.skip("mp_nuked.ff is not on this machine")
+    x, game, cm, loc = load_map(path)
+    assert game is not None and cm is not None
+
+    real = pathlinks._real_nodes(game["nodes"])
+    pos = {i: p for i, _, p in real}
+    edges = baked_edges(game)
+    whole_rejected = pr.regenerate_links(deepcopy(game), cm, loc)["rejected"]
+
+    def box_of(i, j):
+        la, lb = _raised(pos, i, j)
+        return (
+            tuple(min(la[k], lb[k]) - 8 for k in range(3)),
+            tuple(max(la[k], lb[k]) + 8 for k in range(3)),
+        )
+
+    # a baked link the stock collision already blocks at body height, boxed tightly: the "edit"
+    # is a clip arriving on that link. Take the first such link whose drop keeps the graph
+    # connected (so this test isolates the locality claim, not the split path tested elsewhere).
+    target = report = None
+    for i, j in sorted(e for e in edges if e[0] in pos and e[1] in pos):
+        if not pr.segment_blocked(cm, *_raised(pos, i, j), locator=loc):
+            continue
+        g = deepcopy(game)
+        r = pr.regenerate_local(g, cm, loc, [box_of(i, j)])
+        if (i, j) not in baked_edges(g) and not r["new_split"]:
+            target, report = (i, j), r
+            break
+    assert target is not None, "no blocked baked link found whose drop keeps the graph connected"
+
+    assert report["removed"] >= 1  # the targeted link (and any others crossing the box) dropped
+    # locality: only a handful of links went, nowhere near the whole-map shatter.
+    assert report["removed"] < whole_rejected / 10
+    assert report["new_split"] is False  # the dense component stays connected
 
 
 @pytest.mark.zones

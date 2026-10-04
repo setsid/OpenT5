@@ -11,11 +11,16 @@ without a zone in ``test_propclip``.
 
 from __future__ import annotations
 
+import struct
+
 import pytest
 
+from opent5.convert import pathlinks
 from opent5.convert import propclip as pc
+from opent5.edit import pathregen as pr
 from opent5.edit.document import Document
 from opent5.edit.mapedit import EditSession
+from opent5.edit.types import EditError
 from opent5.xfile import AssetType, parse
 from test_propclip import find_zone
 
@@ -345,3 +350,90 @@ def test_rotate_prop_non_axial_keeps_axial_clip_and_warns(nuked_bytes):
     result = s.rotate_prop_clip(bus.index, 45.0, footprint=bus.footprint)
     assert result["found"]
     assert any("not a quarter turn" in w for w in result["warnings"])
+
+
+# -- save-time path-link regeneration (phase 3 wired into save) -------------------------------
+
+
+def _node_linkcount(session: EditSession, index: int) -> int:
+    raw = bytes(session._game_node["nodes"][index]["raw"])
+    return struct.unpack_from(">H", raw, pathlinks.TOTAL_LINK_COUNT_OFF)[0]
+
+
+def _pendant_real_node(session: EditSession):
+    """A standard path node whose single real-node link is currently clear: adding a clip over
+    that link isolates the node, the cleanest way to force a genuine new split on a real map."""
+    game = session._game_node
+    real = pathlinks._real_nodes(game["nodes"])
+    pos = {i: p for i, _, p in real}
+    present = set(pos)
+    adj: dict[int, set[int]] = {i: set() for i in present}
+    for i, el, _ in real:
+        count = struct.unpack_from(">H", bytes(el["raw"]), pathlinks.TOTAL_LINK_COUNT_OFF)[0]
+        links = bytes(el.get("links") or b"")
+        for o in range(count):
+            t = struct.unpack_from(">H", links, o * pathlinks.PATHLINK_SIZE + 4)[0]
+            if t in present:
+                adj[i].add(t)
+                adj[t].add(i)
+    cm, loc = session._clip_engine()
+    for i in present:
+        if len(adj[i]) != 1:
+            continue
+        j = next(iter(adj[i]))
+        pa, pb = pos[i], pos[j]
+        la = (pa[0], pa[1], pa[2] + pr.LOS_HEIGHT)
+        lb = (pb[0], pb[1], pb[2] + pr.LOS_HEIGHT)
+        if not pr.segment_blocked(cm, la, lb, locator=loc):
+            return i, j, pos
+    raise AssertionError("no pendant node with a clear link found on this map")
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_save_refuses_when_an_added_clip_walls_off_a_path_node(nuked_bytes, tmp_path):
+    """A clip placed across a path node's only link walls it off: the save is refused with the
+    new-split message, nothing is written, and the game node's links are restored exactly (the
+    regen is a reversible part of the save)."""
+    s = _session(nuked_bytes)
+    i, j, pos = _pendant_real_node(s)
+    before = _node_linkcount(s, i)
+
+    la, lb = pos[i], pos[j]
+    mid = tuple((la[k] + lb[k]) / 2 for k in range(3))
+    box = (
+        (mid[0] - 30, mid[1] - 30, la[2] - 10),
+        (mid[0] + 30, mid[1] + 30, la[2] + 90),
+    )
+    s.add_prop_clip(("wall", i), box[0], box[1])
+
+    out = tmp_path / "walled" / "mp_nuked.edited.ff"
+    with pytest.raises(EditError) as err:
+        s.save(out, verify=False)
+    assert "walled off" in str(err.value)
+    assert not out.exists()  # nothing written
+    assert _node_linkcount(s, i) == before  # the game node's links restored on the refusal
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_save_regenerates_links_on_a_normal_move_and_reports_it(nuked_bytes, tmp_path):
+    """A normal prop move saves and verifies, and the save report carries the edit-relative
+    regen summary: the links crossing the move were re-tested, a few dropped, and the edit
+    caused no new split (the map's pre-existing fragmentation is a warning, not a failure)."""
+    s = _session(nuked_bytes)
+    bus = _bus(s)
+    s.move_prop_clip(bus.index, (40.0, 0.0, 0.0), footprint=bus.footprint)
+
+    out = tmp_path / "moved" / "mp_nuked.edited.ff"
+    report = s.save(out)
+    assert report.verified, report.problems
+    assert report.problems == []  # a warning never pollutes problems
+    regen = report.details["path_regen"]
+    assert regen["new_split"] is False
+    assert regen["removed"] >= 1  # the move dropped at least one link crossing its footprint
+    assert regen["preexisting_fragmentation"] is True
+    assert regen["warnings"]  # the pre-existing fragmentation is surfaced as a warning
+    # the saved file still reparses exactly.
+    saved = parse(bytes(_zone_content(out)))
+    assert saved.problems() == []

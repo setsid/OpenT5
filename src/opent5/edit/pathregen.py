@@ -418,3 +418,152 @@ def regenerate_or_raise(game, clipmap=None, locator=None, **kwargs) -> dict:
     report["components"] = 1
     report["linked"] = True
     return report
+
+
+# -- edit-relative (local) regeneration ------------------------------------------------------
+#
+# The whole-map ``regenerate_or_raise`` gate above is wrong for the editor's save path.
+# Pristine retail mp_nuked ships a sparse 296-node graph that our strict segment-LOS model
+# reads as 4 components (and fragments to 42 under a whole-map relink), yet the engine loads
+# and plays it: the engine's path connectivity is looser than ours (see
+# docs/research/pathlink-los-recipe.md). A whole-map gate would therefore reject maps the
+# engine is happy with on every save. So the save gate is edit-relative: keep the map's
+# existing links untouched, re-test only the links whose segment crosses an edited clip
+# volume, and fail only when the edit itself splits a pair of nodes that were connected
+# before. Pre-existing fragmentation under our model is a warning, never a failure.
+
+
+def _node_link_records(el) -> list[tuple[int, bytes]]:
+    """The ``(target, record)`` pairs of a node's inline pathlink array, each record the
+    exact stock 12 bytes as stored (so a kept link is preserved byte-for-byte, including any
+    retail flag bytes ``_write_links`` would zero)."""
+    raw = bytes(el["raw"])
+    count = struct.unpack_from(">H", raw, pathlinks.TOTAL_LINK_COUNT_OFF)[0]
+    links = bytes(el.get("links") or b"")
+    out = []
+    for o in range(count):
+        rec = links[o * pathlinks.PATHLINK_SIZE : (o + 1) * pathlinks.PATHLINK_SIZE]
+        out.append((struct.unpack_from(">H", rec, 4)[0], rec))
+    return out
+
+
+def _drop_links(el, drop_targets: set[int]) -> None:
+    """Remove the records naming any target in ``drop_targets`` from a node's inline link
+    array, keeping the other records unchanged, and update ``totalLinkCount``."""
+    kept = [rec for target, rec in _node_link_records(el) if target not in drop_targets]
+    el["links"] = b"".join(kept)
+    raw = bytearray(el["raw"])
+    struct.pack_into(">H", raw, pathlinks.TOTAL_LINK_COUNT_OFF, len(kept))
+    el["raw"] = bytes(raw)
+
+
+def regenerate_local(
+    game,
+    clipmap,
+    locator,
+    edited_boxes,
+    *,
+    block_mask: int = DEFAULT_BLOCK_MASK,
+    radius: Vec3 = _ZERO3,
+    height: float = LOS_HEIGHT,
+    sample_step: float = SAMPLE_STEP,
+) -> dict:
+    """Edit-relative path-link regeneration for the editor's save path.
+
+    Keeps the map's existing links. For each existing link whose body-height segment crosses
+    ANY box in ``edited_boxes`` (the old and new footprints of moved, added, rotated or
+    deleted prop clips, each an ``(mins, maxs)`` AABB), re-test line of sight against
+    ``clipmap`` and drop the link when it is now blocked. A link that crosses no edited box is
+    left untouched, so the whole-map graph is never re-derived (that is the "local" part).
+
+    Returns a report ``{removed, before_components, after_components, new_split,
+    offending_nodes, preexisting_fragmentation, nodes}``. It does not raise;
+    ``regenerate_local_or_raise`` is the gate. A new split is a pair of nodes that shared a
+    component before the drops but no longer do (the edit walled them off). Pre-existing
+    fragmentation (the graph already had more than one component before any drop, under our
+    stricter-than-engine model) is recorded as a warning, never a split."""
+    nodes = _nodes_of(game)
+    real = pathlinks._real_nodes(nodes)
+    empty = {
+        "removed": 0,
+        "before_components": 0,
+        "after_components": 0,
+        "new_split": False,
+        "offending_nodes": [],
+        "preexisting_fragmentation": False,
+        "nodes": len(real),
+    }
+    if not real or not edited_boxes:
+        return empty
+
+    pos = {i: p for i, _, p in real}
+    present = set(pos)
+    by_index = {i: el for i, el, _ in real}
+
+    # Baseline connectivity from the CURRENT links, before any drop.
+    baseline = connected_components(game)
+    boxes = [(tuple(mn), tuple(mx)) for mn, mx in edited_boxes]
+    tester = LosTester(clipmap, locator, block_mask, radius, sample_step)
+
+    # The undirected edges whose segment crosses an edited box and are now LOS-blocked.
+    dropped: set[tuple[int, int]] = set()
+    for i, el, _ in real:
+        pa = pos[i]
+        la = (pa[0], pa[1], pa[2] + height)
+        for target, _rec in _node_link_records(el):
+            if target <= i or target not in present:
+                continue  # dedupe the bidirectional pair; skip links to spare nodes
+            pb = pos[target]
+            lb = (pb[0], pb[1], pb[2] + height)
+            if not any(_segment_hits_box(la, lb, mn, mx, radius) for mn, mx in boxes):
+                continue  # not near the edit: leave this link exactly as it is
+            if tester.blocked(la, lb):
+                dropped.add((i, target))
+
+    for i, j in dropped:
+        _drop_links(by_index[i], {j})
+        _drop_links(by_index[j], {i})
+
+    # Recompute connectivity from the written bytes and look for a pair the edit split.
+    after = connected_components(game)
+    comp_id: dict[int, int] = {n: cid for cid, comp in enumerate(after) for n in comp}
+    offending: set[int] = set()
+    for comp in baseline:
+        fragments: dict[int, set[int]] = {}
+        for n in comp:
+            fragments.setdefault(comp_id[n], set()).add(n)
+        if len(fragments) > 1:
+            # the edit split this once-joined component; every node outside its largest
+            # surviving fragment is now cut off.
+            largest = max(fragments.values(), key=len)
+            offending |= {n for n in comp if n not in largest}
+
+    return {
+        "removed": len(dropped),
+        "before_components": len(baseline),
+        "after_components": len(after),
+        "new_split": bool(offending),
+        "offending_nodes": sorted(offending),
+        "preexisting_fragmentation": len(baseline) > 1,
+        "nodes": len(real),
+    }
+
+
+def regenerate_local_or_raise(game, clipmap, locator, edited_boxes, **kwargs) -> dict:
+    """Run ``regenerate_local`` and gate on a NEW split only: raise ``PathRegenError`` when
+    the edit has cut a pair of nodes that were connected before apart, naming the offending
+    nodes. Pre-existing fragmentation is left in the report as a warning and never raised, so
+    a save fails only when the edit itself broke connectivity."""
+    report = regenerate_local(game, clipmap, locator, edited_boxes, **kwargs)
+    if report["new_split"]:
+        offending = report["offending_nodes"]
+        shown = offending[:12]
+        tail = " and more" if len(offending) > len(shown) else ""
+        raise PathRegenError(
+            "the edit has walled off part of the path graph: "
+            f"{report['before_components']} connected region(s) before the edit became "
+            f"{report['after_components']} after, so path nodes that could reach each other "
+            f"no longer can. A moved, added or deleted prop blocks the only link(s) that "
+            f"bridged them. Offending path nodes: {shown}{tail}."
+        )
+    return report

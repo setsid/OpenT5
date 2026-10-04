@@ -31,6 +31,7 @@ import numpy as np
 from opent5.convert import entities as ent
 from opent5.convert import propclip as pc
 from opent5.convert.scripts import entity_text, parse_entities
+from opent5.edit import pathregen
 from opent5.edit.document import Document
 from opent5.edit.types import AssetKey, EditError, SaveReport
 from opent5.xfile.constants import AssetType as T
@@ -369,6 +370,8 @@ class EditSession:
         self._clip_index: AssetKey | None = None
         self._gfx_index: int | None = None
         self._gfx_node: dict | None = None
+        self._game_index: AssetKey | None = None
+        self._game_node: dict | None = None
         for a in self.doc.assets:
             if a.type in (T.COL_MAP_MP, T.COL_MAP_SP):
                 node = self.doc.xfile.assets[a.index].data
@@ -384,6 +387,13 @@ class EditSession:
             elif a.type == T.GFX_MAP and self._gfx_index is None:
                 self._gfx_index = a.index
                 self._gfx_node = self.doc.xfile.assets[a.index].data
+            elif a.type in (T.GAME_MAP_MP, T.GAME_MAP_SP) and self._game_index is None:
+                # the GameWorld* asset holds the path nodes (PathData) the save-time
+                # line-of-sight regen re-tests against the edited collision.
+                node = self.doc.xfile.assets[a.index].data
+                if isinstance(node, dict):
+                    self._game_index = a.index
+                    self._game_node = node
         if self._ent_key is None:
             raise EditError(
                 f"{self.doc.zone_name}: expected a map_ents entity string (in a col_map or on "
@@ -398,6 +408,10 @@ class EditSession:
         self._clip: tuple | None = None
         #: prop key -> the clip brush indices the editor manages for it (editor-added or moved).
         self._prop_clips: dict[Any, list[int]] = {}
+        #: AABBs of the clip volumes clip edits have touched (old and new footprints), so the
+        #: save-time regen re-tests only the path links crossing an edit. Monotonic: a region
+        #: that was ever edited stays worth re-testing, and re-testing a clear link is a no-op.
+        self._edited_boxes: list[tuple[tuple, tuple]] = []
         self._objects: list[MapObject] = []
         for keys in parse_entities(self._orig_text):
             self._objects.append(MapObject(self._next_id, dict(keys)))
@@ -654,6 +668,11 @@ class EditSession:
             return []
         return self.clip_cluster_in_footprint(footprint[0], footprint[1])
 
+    def _note_edited_box(self, mins, maxs) -> None:
+        """Record a clip volume a clip edit touched (old or new footprint) for the save-time
+        path-link regen. The box is an ``(mins, maxs)`` AABB."""
+        self._edited_boxes.append((tuple(float(v) for v in mins), tuple(float(v) for v in maxs)))
+
     def add_prop_clip(self, key, mins, maxs) -> int:
         """Add a solid clip sized to a newly placed prop's footprint (the contiguous BSP
         path, so a trace hits it) and associate it with the prop. Reversible. This adds
@@ -663,6 +682,7 @@ class EditSession:
             lambda idx: self._prop_clips.__setitem__(key, [idx]),
             "add prop clip",
         )
+        self._note_edited_box(mins, maxs)
         return new
 
     def add_prop(self, model: str, mins, maxs) -> dict:
@@ -695,6 +715,7 @@ class EditSession:
             "add prop",
             touch_gfx=True,
         )
+        self._note_edited_box(mins, maxs)
         return {"prop": index, "brush": brush, "warnings": warnings}
 
     def move_prop_clip(self, key, delta, footprint=None) -> dict:
@@ -710,6 +731,8 @@ class EditSession:
             return {"moved": [], "found": False, "warnings": [_COLLISION_STAYS]}
         warnings = [] if key in self._prop_clips else [_baked_shadow_notice("Moving")]
         d = tuple(float(v) for v in delta)
+        cm, _ = self._clip_engine()
+        old_bounds = pc.cluster_bounds(cm, cluster)
 
         def op(cm, loc):
             pc.move_cluster_bsp(cm, loc, cluster, d)
@@ -722,6 +745,12 @@ class EditSession:
             "move prop clip",
             touch_gfx=True,
         )
+        # the old footprint (now vacated) and the new one both bound links to re-test.
+        if old_bounds is not None:
+            self._note_edited_box(*old_bounds)
+            new_min = tuple(old_bounds[0][k] + d[k] for k in range(3))
+            new_max = tuple(old_bounds[1][k] + d[k] for k in range(3))
+            self._note_edited_box(new_min, new_max)
         return {"moved": list(cluster), "found": True, "warnings": warnings}
 
     def rotate_prop_clip(self, key, degrees, footprint=None) -> dict:
@@ -763,6 +792,9 @@ class EditSession:
             "rotate prop clip",
             touch_gfx=True,
         )
+        # the footprint before the turn and the rotated footprint after it.
+        self._note_edited_box(bounds[0], bounds[1])
+        self._note_edited_box(new_min, new_max)
         return {"rotated": list(cluster), "found": True, "warnings": warnings}
 
     def remove_prop_clip(self, key, footprint=None) -> dict:
@@ -774,11 +806,16 @@ class EditSession:
         if not cluster:
             return {"removed": [], "found": False, "warnings": [_COLLISION_STAYS]}
         warnings = [] if key in self._prop_clips else [_baked_shadow_notice("Deleting")]
+        cm, _ = self._clip_engine()
+        old_bounds = pc.cluster_bounds(cm, cluster)
         self._commit_clip(
             lambda cm, loc: pc.remove_cluster(cm, cluster),
             lambda _r: self._prop_clips.pop(key, None),
             "remove prop clip",
         )
+        # the footprint the collision used to fill: links that ran through it may now be clear.
+        if old_bounds is not None:
+            self._note_edited_box(*old_bounds)
         return {"removed": list(cluster), "found": True, "warnings": warnings}
 
     # -- static-model render (cStaticModel + GfxWorld draw inst + smodel inst) ----------------
@@ -1157,6 +1194,43 @@ class EditSession:
 
     # -- building and saving -----------------------------------------------------------------
 
+    def _regen_paths(self) -> dict | None:
+        """Edit-relative path-link regeneration, run at save once clip edits exist. Keeps the
+        map's existing links, re-tests only the links crossing an edited clip volume against
+        the current collision, and drops those now blocked. Raises ``EditError`` (writing
+        nothing) when the edit itself has walled off a region that was connected before;
+        pre-existing fragmentation under our stricter-than-engine model is returned as a
+        warning, not a failure. Returns the regen report, or ``None`` when there is nothing to
+        do (no path nodes, no clipMap, or no clip edit). The game node's link bytes are a
+        reversible edit: snapshotted here so a refused save restores them exactly, and the
+        asset is marked touched only when a link was actually dropped."""
+        if self._game_node is None or not self._edited_boxes:
+            return None
+        engine = self._clip_engine()
+        if engine is None:
+            return None
+        cm, loc = engine
+        # snapshot every node's (raw, links) so a refused save leaves the graph untouched.
+        nodes = self._game_node.get("nodes") or []
+        snapshot = [(el["raw"], el.get("links")) for el in nodes]
+        try:
+            report = pathregen.regenerate_local_or_raise(
+                self._game_node, cm, loc, self._edited_boxes
+            )
+        except pathregen.PathRegenError as exc:
+            for el, (raw, links) in zip(nodes, snapshot, strict=True):
+                el["raw"] = raw
+                el["links"] = links
+            raise EditError(
+                f"refusing to write: {exc} Nothing was written; move or remove the prop so a "
+                "clear path link still bridges the two sides, or add a path node."
+            ) from None
+        if report["removed"] and self._game_index is not None:
+            # the regen changed link bytes in place, so the game asset must be re-laid out
+            # and verified on this save (the clip edits touch their own assets separately).
+            self.doc.touch_asset(self._game_index)
+        return report
+
     def build(self, progress=None) -> bytes:
         return self.doc.build(progress=progress)
 
@@ -1185,4 +1259,21 @@ class EditSession:
                 "refusing to write: the edited entities break a gametype that worked before "
                 "(nothing written): " + "; ".join(problems)
             )
-        return self.doc.save(new_path, verify=verify, progress=progress)
+        # edit-relative path-link regen: a new split refuses the save, pre-existing
+        # fragmentation is a warning only. Runs before the build so the written file carries
+        # the dropped links.
+        regen = self._regen_paths()
+        report = self.doc.save(new_path, verify=verify, progress=progress)
+        if regen is not None:
+            # a warning lives in details, never in report.problems (which signals a verify
+            # failure and drives report.verified), so a benign warning never looks like one.
+            warnings: list[str] = []
+            if regen["preexisting_fragmentation"]:
+                warnings.append(
+                    "the map already read as "
+                    f"{regen['before_components']} disconnected path region(s) before this "
+                    "edit (our line-of-sight model is stricter than the engine's, which loads "
+                    "it anyway). The edit did not make it worse, so the save was allowed."
+                )
+            report.details["path_regen"] = {**regen, "warnings": warnings}
+        return report
