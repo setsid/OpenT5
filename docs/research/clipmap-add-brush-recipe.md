@@ -1,10 +1,27 @@
 # Recipe: what cod2map does to the clipMap when a clip brush is added
 
-Status: RESOLVED. The root cause is the brushVerts contiguity invariant (see "Root
-cause" below). Device confirmed p_clip_move (an existing clip re-leafed to the test
-spot, numBrushes unchanged) is SOLID, and p_clip_a (an appended clip) walked through.
-The fix is in `opent5.convert.propclip.add_clip_bsp` (contiguous brushVerts append) and
-is staged as p_clip_add for device confirmation.
+Status: OFFLINE ROOT CAUSE FOUND; DEVICE PROOF PENDING A CACHE-CLEARED RETEST.
+
+CAVEAT (RPCS3 FIOS disc cache): BO1 under RPCS3 caches the decrypted disc in
+`dev_hdd1\caches\BLES01031_BLES01031\cache.dat` (~1.68 GB). Copy-Item preserves a file's
+mtime, so staging an older-dated build never invalidated the cache and RPCS3 served a
+STALE mp_nuked. This was proven by o_blocks5: its staged file is a correct blocky map
+(verified offline, `tools/verify_staged_map.py`), yet it rendered as Nuketown until the
+cache was cleared. Therefore every earlier device result on a Nuketown-based build is
+UNRELIABLE, including p_clip_a's "walked through" and p_propclip2's "no crash": a stale
+cache is indistinguishable from the build under test. Do NOT treat "append past numBrushes
+breaks collision" as proven. It is a HYPOTHESIS supported only by the offline evidence
+below (which is cache-independent). Staging protocol from now on: close RPCS3, clear or
+rename the BLES01031 cache folder, copy, set the file's LastWriteTime to now, and include
+a visible in-map marker so a stale load is obvious.
+
+What is cache-independent and still holds: the brushVerts running-count contiguity fact
+(retail and p_clip_move: 0 mismatches; p_clip_a: exactly 1 mismatch at the appended
+brush). The converter's padded pool append violated that invariant; the fix in
+`opent5.convert.propclip.add_clip_bsp` (contiguous brushVerts append) makes our output
+match retail's invariant and is a correctness improvement regardless of the device result.
+It is staged as p_clip_add. The user is retesting p_clip_a with the cache cleared to
+establish whether an appended clip genuinely fails before p_clip_add is read as the fix.
 
 Goal (original): read off what the real compiler changes in the clipMap when a clip
 brush is added, compare it to `add_clip_bsp`, and find why a converter-added clip was
