@@ -341,8 +341,12 @@ class PCGfxWorldHandler(Handler):
         draws = items(io, h, 0x3A4, 3, 76, smodels, node, "smodel_draw_insts", owned=True)
         for d, element in draws or ():
             asset_ref(io, d, 0x38, AssetType.XMODEL, element, "model")
-        runtime(io, h, 0x3A8, 3, 8 * static_surfaces)
-        runtime(io, h, 0x3AC, 127, 4 * surface_vis)
+        runtime(io, h, 0x3A8, 3, 8 * static_surfaces)  # surfaceMaterials
+        # surfaceCastsSunShadow: one flag per static surface, so 4 * static_surfaces, not
+        # 4 * surface_vis. The box's surface_vis (4) happened to equal its static_surfaces (3)
+        # closely enough that 128-byte alignment hid the difference; a terrain map with many
+        # more surfaces than visibility bytes exposes it (box-objectives-cd / mapgen notes).
+        runtime(io, h, 0x3AC, 127, 4 * static_surfaces)
         words = (h.u32(0x3B4), h.u32(0x3B8))
         runtime(io, h, 0x3C4, 3, 4 * words[0] * cells)
         runtime(io, h, 0x3C8, 3, 4 * words[1] * cells)
