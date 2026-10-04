@@ -278,12 +278,12 @@ def main(argv=None) -> int:
 
     def gen_opts(c):
         c.add_argument("--seed", type=int, default=1)
-        c.add_argument("--nx", type=int, default=40)
-        c.add_argument("--ny", type=int, default=40)
-        c.add_argument("--nz", type=int, default=32)
-        c.add_argument("--block", type=int, default=64)
+        c.add_argument("--nx", type=int, default=56)
+        c.add_argument("--ny", type=int, default=56)
+        c.add_argument("--nz", type=int, default=18)
+        c.add_argument("--block", type=int, default=36)
         c.add_argument("--px", type=int, default=64, help="texture size (multiple of 16)")
-        c.add_argument("--light-grid", type=int, default=3, help="N x N primary light grid")
+        c.add_argument("--light-grid", type=int, default=4, help="N x N primary light grid")
         c.add_argument("--name", default="mp_opent5blocks")
         c.add_argument("--no-water", action="store_true", help="omit the water plane")
         c.add_argument("--no-caves", action="store_true", help="omit the carved caves")
@@ -325,11 +325,11 @@ def main(argv=None) -> int:
     # convert reuses the gen defaults for grid/name it does not define
     defaults = (
         ("name", "mp_opent5blocks"),
-        ("block", 64),
-        ("nx", 40),
-        ("ny", 40),
-        ("nz", 32),
-        ("light_grid", 3),
+        ("block", 36),
+        ("nx", 56),
+        ("ny", 56),
+        ("nz", 18),
+        ("light_grid", 4),
     )
     for attr, default in defaults:
         if not hasattr(args, attr):
