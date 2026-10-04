@@ -134,37 +134,38 @@ def plan_scripts(base: str, texts: dict[str, str], own_map: bool = False) -> Scr
 #: script is INFERRED not to run. These entities let the stock script run without a script
 #: error in a map that is not Nuketown: the doomsday clock hands and population sign
 #: counters (rotated by script, unchecked GetEnt), and the end-game camera structs and bomb
-#: (nuked_bomb_drop_think: unchecked GetStruct / GetEnt). Models as in the stock entity
-#: string; the bomb, a brush model (*40) there, is a tag_origin script_model here (the box
-#: has no brush model 40). Positions: above the box's ceiling (out of sight), the camera
-#: structs inside it. ``{z}`` is the ceiling height plus 256.
+#: (nuked_bomb_drop_think: unchecked GetStruct / GetEnt). The decorative models (clock hands
+#: and sign counters) use ``tag_origin``, not their Nuketown xmodels: the patch script still
+#: finds and rotates the entities (unchecked GetEnt), but nothing renders, so they do not
+#: float as Nuketown scenery once the converted map has a visible sky. Positions: above the
+#: play area; the camera structs inside it. ``{z}`` is the ceiling height plus 256.
 COMPAT_ENTITIES = {
     "mp_nuked": (
         {
             "classname": "script_model",
             "targetname": "clock_min_hand",
-            "model": "mp_nuked_doomsday_clock_min_hand",
+            "model": "tag_origin",
             "origin": "-256 0 {z}",
             "angles": "0 0 0",
         },
         {
             "classname": "script_model",
             "targetname": "clock_sec_hand",
-            "model": "mp_nuked_doomsday_clock_sec_hand",
+            "model": "tag_origin",
             "origin": "-256 0 {z}",
             "angles": "0 0 0",
         },
         {
             "classname": "script_model",
             "targetname": "counter_ones",
-            "model": "mp_nuked_townsign_counter",
+            "model": "tag_origin",
             "origin": "256 0 {z}",
             "angles": "0 0 0",
         },
         {
             "classname": "script_model",
             "targetname": "counter_tens",
-            "model": "mp_nuked_townsign_counter",
+            "model": "tag_origin",
             "origin": "248 0 {z}",
             "angles": "0 0 0",
         },
