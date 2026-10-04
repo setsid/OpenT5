@@ -70,9 +70,28 @@ bus-cluster brush) and finds the bus's old footprint clear of the bus clip (the 
 so no bus brush blocks a link there). This is the enforcement of "a moved prop must not leave links
 passing through it".
 
-A whole-map relink of that build does *not* hold one connected component, so the gate raises. That is
-a property of the converted base map, not of the bus: its path nodes are sparse (296 nodes, links
-spanning 400 to 600 units that cross interior walls), so LOS fragments the graph however the radius
-widens. Retail mp_nuked, with its dense ~144-unit node grid, stays one component. The bus's own
-effect is the local segment test above, which is deterministic and independent of the map-wide
-outcome.
+A whole-map relink of that build does *not* hold one connected component, so a whole-map gate would
+raise. That is a property of the base map, not of the bus. Measured (big-endian, body-height LOS):
+
+| zone | real path nodes | components as shipped | under whole-map LOS |
+|---|---|---|---|
+| pristine retail mp_nuked (`d_pak`, sha1 6d5a4a0e) | 296 | 4 | 42 (5415 links rejected) |
+| `q_editor_busmove` (d_pak + bus +300 X) | 296 | 4 | 42 (5421 rejected) |
+| the live `.env` mp_nuked (a deployed build, e.g. o_blocks5) | 1021 | 1 | 1 (1 rejected) |
+
+Two conclusions, both important:
+
+1. **The bus move does not split the graph.** `d_pak` and `q_editor_busmove` are component-identical
+   (4 as shipped, 42 under whole-map LOS). The move rejects six more links locally (5415 -> 5421) with
+   no change in component count. Any earlier claim that "retail is dense and one component" was reading
+   the live `.env` file, which is whatever build was last staged (1021 nodes), not pristine retail.
+
+2. **Our connectivity model is not the engine's.** Pristine retail mp_nuked ships with path links that
+   our reader sees as **4 components**, yet the map loads and plays correctly on the device. So the
+   engine's path connectivity is looser than a strict segment-LOS graph (it connects paths at load by
+   its own rules). A whole-map single-component gate built on our model would therefore reject maps the
+   engine is happy with. This is exactly why the save gate is **edit-relative**: keep the map's existing
+   links, re-test only links crossing an edited clip volume, and fail only when the edit itself turns a
+   pair that was connected before into one that is not. Pre-existing fragmentation under our model is a
+   warning, never a failure. The bus's own effect is the local segment test above, which is
+   deterministic and independent of the whole-map outcome.

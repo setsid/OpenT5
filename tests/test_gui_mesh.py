@@ -55,9 +55,11 @@ def test_render_cube_not_blank():
 
 
 def nuked() -> Path | None:
-    folder = env.path_of("OPENT5_ZONES")
-    path = folder / "mp_nuked.ff" if folder else None
-    return path if path and path.is_file() else None
+    # Pin to the sha1-checked retail backup, not the live .env mp_nuked (the RPCS3 file
+    # overwritten by every device test): these assertions are retail geometry counts.
+    from retail_fixtures import retail_zone
+
+    return retail_zone("mp_nuked")
 
 
 @pytest.mark.zones

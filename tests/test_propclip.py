@@ -259,6 +259,12 @@ def test_clips_in_footprint():
 
 
 def find_zone(name: str) -> Path | None:
+    # Pinned zones resolve to a sha1-checked retail backup, never the live .env file:
+    # OPENT5_ZONES mp_nuked is the RPCS3 file overwritten by every device test.
+    from retail_fixtures import RETAIL_SHA1, retail_zone
+
+    if name in RETAIL_SHA1:
+        return retail_zone(name)
     for key in ("OPENT5_ZONES", "OPENT5_PATCH_ZONES"):
         folder = env.path_of(key)
         if folder and (folder / f"{name}.ff").is_file():

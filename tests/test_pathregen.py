@@ -193,6 +193,12 @@ BASE_BUILD = Path("/mnt/c/Users/bolst/Desktop/opent5-hwtest/nuked/d_pak/mp_nuked
 
 
 def find_zone(name: str) -> Path | None:
+    # Pin to a sha1-checked retail backup, never the live .env mp_nuked (the RPCS3 file
+    # overwritten by every device test, e.g. whatever build was last staged).
+    from retail_fixtures import RETAIL_SHA1, retail_zone
+
+    if name in RETAIL_SHA1:
+        return retail_zone(name)
     for key in ("OPENT5_ZONES", "OPENT5_PATCH_ZONES"):
         folder = env.path_of(key)
         if folder and (folder / f"{name}.ff").is_file():

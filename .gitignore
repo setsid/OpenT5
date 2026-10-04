@@ -22,3 +22,6 @@ out/
 *.dds
 extracted/
 .oracle/
+
+# large retail zone backups for pinned tests (not committed; ~36MB each)
+tests/fixtures/*.retail
