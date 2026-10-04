@@ -1,6 +1,8 @@
 """Seeded procedural voxel terrain for a blocky map.
 
-A grid of cubes (``block`` units each, default 64) carrying a material per cell: rolling
+A grid of cubes (``block`` units each, default 36: a T5 player is ~72 units tall, so two
+blocks high, and the ~18-unit step height is half a block, so a full block needs a jump like
+Minecraft) carrying a material per cell: rolling
 hills from 2D fractal value-noise, one or two caves carved from 3D noise, scattered trees
 (log trunk, leaf cuboid), a water plane at a sea level and a small flat village of plank hut
 shells. Everything is deterministic from the seed. The terrain is the input to greedy
@@ -74,11 +76,15 @@ class Terrain:
 def _heightmap(nx: int, ny: int, seed: int, floor_k: int, ceil_k: int) -> np.ndarray:
     xs = np.arange(nx)[:, None].astype(np.float64)
     ys = np.arange(ny)[None, :].astype(np.float64)
-    # Two scales of hills: broad rolling shape plus finer bumps.
-    broad = noise.fbm2(xs / 18.0, ys / 18.0, seed, octaves=4, persistence=0.55)
-    fine = noise.fbm2(xs / 6.0, ys / 6.0, seed + 7, octaves=3, persistence=0.5)
-    h = 0.78 * broad + 0.22 * fine
+    # Broad, gentle relief only: a playable arena wants low rolling ground, not spires. One
+    # block is a full player step up (block ~= half the player height, step ~= half a block),
+    # so the whole relief is kept to a few blocks and most of the map reads as flat.
+    broad = noise.fbm2(xs / 22.0, ys / 22.0, seed, octaves=3, persistence=0.5)
+    fine = noise.fbm2(xs / 9.0, ys / 9.0, seed + 7, octaves=2, persistence=0.45)
+    h = 0.82 * broad + 0.18 * fine
     h = (h - h.min()) / max(1e-9, (h.max() - h.min()))
+    # Bias towards the floor so the bulk of columns sit at base level (broad flats, a few rises).
+    h = h**1.6
     return np.rint(floor_k + h * (ceil_k - floor_k)).astype(np.int32)
 
 
@@ -187,11 +193,55 @@ def _build_village(grid: np.ndarray, heights: np.ndarray, seed: int, village, fl
     return huts
 
 
+#: Cover pieces as fractions of the map (fx, fy, length, thickness, axis, height cells,
+#: material), mirrored and symmetric so the lanes play fair: low cobble walls break sightlines
+#: and plank crate stacks give step-up cover, leaving open ground between them for routes.
+_COVER = (
+    (0.26, 0.30, 6, 1, "y", 2, COBBLE),
+    (0.26, 0.70, 6, 1, "y", 2, COBBLE),
+    (0.74, 0.30, 6, 1, "y", 2, COBBLE),
+    (0.74, 0.70, 6, 1, "y", 2, COBBLE),
+    (0.50, 0.22, 5, 1, "x", 1, PLANK),
+    (0.50, 0.78, 5, 1, "x", 1, PLANK),
+    (0.18, 0.50, 2, 2, "x", 2, PLANK),
+    (0.82, 0.50, 2, 2, "x", 2, PLANK),
+    (0.40, 0.50, 1, 1, "x", 1, PLANK),
+    (0.60, 0.50, 1, 1, "x", 1, PLANK),
+)
+
+
+def _place_cover(grid: np.ndarray, heights: np.ndarray, village) -> int:
+    """Low walls and crate stacks on the dry ground, clear of the village and water, as cover
+    and sightline breaks. Each sits on its column's surface, so those columns stop being
+    walkable and spawns / path nodes route around them (``_COVER`` is symmetric for fair lanes)."""
+    nx, ny, nz = grid.shape
+    vx0, vy0, vx1, vy1 = village
+    placed = 0
+    for fx, fy, length, thick, axis, hc, mat in _COVER:
+        cx, cy = int(fx * nx), int(fy * ny)
+        for a in range(length):
+            for b in range(thick):
+                i = cx + (a if axis == "x" else b)
+                j = cy + (b if axis == "x" else a)
+                if not (1 <= i < nx - 1 and 1 <= j < ny - 1):
+                    continue
+                if vx0 - 1 <= i <= vx1 and vy0 - 1 <= j <= vy1:
+                    continue  # keep the village clear
+                base = int(heights[i, j])
+                if base <= 0 or base + hc >= nz:
+                    continue
+                if int(grid[i, j, base - 1]) in (WATER, SAND, AIR):
+                    continue  # not on open dry ground
+                grid[i, j, base : base + hc] = mat
+                placed += 1
+    return placed
+
+
 def generate(
-    nx: int = 40,
-    ny: int = 40,
-    nz: int = 32,
-    block: int = 64,
+    nx: int = 56,
+    ny: int = 56,
+    nz: int = 18,
+    block: int = 36,
     seed: int = 1,
     water: bool = True,
     caves: bool = True,
@@ -205,44 +255,56 @@ def generate(
     cave-free map is the simplest geometry the compiler has to handle.
     """
     grid = np.zeros((nx, ny, nz), np.uint8)
-    floor_k = 4
-    ceil_k = nz - 8
-    sea = floor_k + max(2, (ceil_k - floor_k) // 4)
+    # A playable arena sits on a near-flat base (floor_k), with only a few blocks of relief, so
+    # the ground reads as flat with the odd one-block rise to jump. The sea sits below the base
+    # ground, so open ground is dry and walkable; water comes from a single dug pond (below).
+    floor_k = 5
+    relief = max(3, (nz - floor_k) // 5)
+    ceil_k = floor_k + relief
+    sea = 3  # pond surface, below the base ground top cell (floor_k - 1)
     if flat:
-        heights = np.full((nx, ny), floor_k + 3, np.int64)
+        heights = np.full((nx, ny), floor_k, np.int64)
     else:
         heights = _heightmap(nx, ny, seed, floor_k, ceil_k)
     k = np.arange(nz)[None, None, :]
     surf = heights[:, :, None]
-    # Columns: stone below, 3 dirt, grass (or sand near water) on top.
+    # Columns: stone below, 3 dirt, grass on top (sand only where a column sits at/below sea).
     solid = k < surf
-    grid[solid.repeat(1, 0) & (k < surf - 3)] = STONE
-    band = solid & (k >= surf - 3)
-    grid[band] = DIRT
+    grid[solid & (k < surf - 3)] = STONE
+    grid[solid & (k >= surf - 3)] = DIRT
     top_cell = k == surf - 1
     grid[top_cell] = GRASS
-    # Beaches: top cells at or just above the sea become sand.
-    beach = top_cell & (surf - 1 <= sea + 1)
-    grid[beach] = SAND
-    # Sand floor under the sea.
-    underwater_top = top_cell & (surf - 1 < sea)
-    grid[underwater_top] = SAND
-    # Water fills empty cells up to the sea level.
-    if water:
-        water_cells = (grid == AIR) & (k <= sea)
-        grid[water_cells] = WATER
+    grid[top_cell & (surf - 1 <= sea)] = SAND
 
     village_box = (nx // 2 - 9, ny // 2 - 7, nx // 2 + 9, ny // 2 + 7)
     huts = _build_village(grid, heights, seed, village_box, floor_k) if village else 0
     cave_cells = _carve_caves(grid, heights, seed) if caves else 0
     tree_count = _place_trees(grid, heights, seed, village_box, sea) if trees else 0
+    cover_count = _place_cover(grid, heights, village_box)
+
+    # Pond: a shallow rectangular depression near the -y edge, clear of the village. Dug and
+    # flooded last so nothing overwrites it; guarantees one water feature without wetting the
+    # playable ground.
+    pond_cells = 0
+    if water:
+        pw, pd = max(4, nx // 7), max(4, ny // 9)
+        px0, py0 = nx // 2 - pw // 2, 1
+        for i in range(px0, min(px0 + pw, nx)):
+            for j in range(py0, min(py0 + pd, ny)):
+                grid[i, j, :] = AIR
+                grid[i, j, 0] = STONE
+                grid[i, j, 1] = SAND  # pond bed
+                grid[i, j, 2 : sea + 1] = WATER
+                heights[i, j] = 2
+        pond_cells = int((grid == WATER).sum())
 
     counts = {
         "caves_cells": cave_cells,
         "trees": tree_count,
         "huts": huts,
+        "cover": cover_count,
         "solid_cells": int(np.isin(grid, list(OPAQUE)).sum()),
-        "water_cells": int((grid == WATER).sum()),
+        "water_cells": pond_cells,
     }
     return Terrain(
         grid=grid,

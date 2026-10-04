@@ -324,12 +324,17 @@ class PCGfxWorldHandler(Handler):
                 array(io, hull, 0x4C, 3, 20 * hull.u32(0x48), hel, "axis", owned=True)
         smodels, static_surfaces = h.u32(0x344), h.u32(0x34C)
         smodel_vis, surface_vis = h.u32(0x368), h.u32(0x36C)
+        # dpvs-static visibility arrays. The smodel vis arrays stay keyed to smodel_vis (0 on
+        # terrain, which has no static models). The surface vis arrays hold no RUNTIME bytes
+        # here: on PC the surface visibility reservation is made once, 128-aligned, as
+        # surfaceCastsSunShadow (0x3AC) below. Calibrated against 11 built PC zones spanning 1 to
+        # 9 shadow lights and 1 to 670 static surfaces (all parse exactly; see docs/mapgen.md).
         for k in range(3):
-            runtime(io, h, 0x370 + 4 * k, 0, smodel_vis)
+            runtime(io, h, 0x370 + 4 * k, 0, smodel_vis)  # smodelVisData[3]
         for k in range(3):
-            runtime(io, h, 0x37C + 4 * k, 0, surface_vis)
-        runtime(io, h, 0x388, 0, smodel_vis)
-        runtime(io, h, 0x38C, 0, surface_vis)
+            runtime(io, h, 0x37C + 4 * k, 0, 0)  # surfaceVisData[3]
+        runtime(io, h, 0x388, 0, smodel_vis)  # smodelVisDataCameraSaved
+        runtime(io, h, 0x38C, 0, 0)  # surfaceVisDataCameraSaved
         # lodData: align 4 (with 128 the box with 8 static models, mp_opent5box_props,
         # ends RUNTIME 0x80 past its header size; the box without models cannot tell).
         runtime(io, h, 0x390, 3, 32 * smodel_vis)
@@ -341,12 +346,15 @@ class PCGfxWorldHandler(Handler):
         draws = items(io, h, 0x3A4, 3, 76, smodels, node, "smodel_draw_insts", owned=True)
         for d, element in draws or ():
             asset_ref(io, d, 0x38, AssetType.XMODEL, element, "model")
-        runtime(io, h, 0x3A8, 3, 8 * static_surfaces)  # surfaceMaterials
-        # surfaceCastsSunShadow: one flag per static surface, so 4 * static_surfaces, not
-        # 4 * surface_vis. The box's surface_vis (4) happened to equal its static_surfaces (3)
-        # closely enough that 128-byte alignment hid the difference; a terrain map with many
-        # more surfaces than visibility bytes exposes it (box-objectives-cd / mapgen notes).
-        runtime(io, h, 0x3AC, 127, 4 * static_surfaces)
+        # Per-static-surface RUNTIME: surfaceMaterials plus the per-surface draw/sun-shadow words
+        # that the PC loader lays down contiguously here, 12 bytes per static surface (align 4).
+        runtime(io, h, 0x3A8, 3, 12 * static_surfaces)
+        # surfaceCastsSunShadow: the surface visibility reservation, 4 * surface_vis bytes,
+        # 128-aligned (as on PS3, src/opent5/xfile/handlers/gfxworld.py 0x3C4). This single
+        # 128-aligned block is where PC accounts for surface_vis, not the per-array reserves
+        # at 0x37C..0x38C above; earlier builds used 4 * static_surfaces, which only matched
+        # maps where surface_vis tracked static_surfaces (box, one-light terrain).
+        runtime(io, h, 0x3AC, 127, 4 * surface_vis)
         words = (h.u32(0x3B4), h.u32(0x3B8))
         runtime(io, h, 0x3C4, 3, 4 * words[0] * cells)
         runtime(io, h, 0x3C8, 3, 4 * words[1] * cells)
