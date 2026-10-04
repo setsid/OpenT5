@@ -94,3 +94,19 @@ process or restart, then run the blockmap build/convert and the fixC/fixD builds
 **Landed:** GUI panels for cross-zone search and mod patches (0d575cd, self-test
 109/0), blocky-map material/image registration and conversion wiring (1389817).
 Full lint clean.
+
+**Final feature round.** Added a texture-pack workflow (b11cc90, CLI 5fb995a) and
+a GUI polish pass (5026281: structured error dialogs, empty states, Quit
+shortcut, theme checks). Stopped adding features after these: zone diff and GSC
+definition-finding from the wishlist are left as future work, to keep the surface
+area stable for the morning review rather than ship half-finished extras.
+
+**Two exe-only bugs caught by the smoke test and fixed (fa6f23a):** the global
+search index could not build in the frozen exe (a PyInstaller exe cannot spawn a
+process pool), now builds serially when frozen; and the OpenGL modules are
+bundled for the shaded viewer. The shaded viewer still cannot be screenshot-tested
+headless, so it is flagged for an interactive check (it falls back to wireframe).
+
+**Final exe:** rebuilt from HEAD after all features, sha1 3b329952, both smoke
+tests green, delivered to opent5-hwtest/OpenT5-0.2.0-preview/ (your 0.1.0 install
+untouched).
