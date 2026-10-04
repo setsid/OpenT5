@@ -127,22 +127,29 @@ So the structural oracle **reports p_clip_a's clip as a valid, reachable, solid 
 does **not** reproduce the device walk-through. The device failure is therefore **not in the
 clipMap brush / leaf / pool structures the converter edits**: those are correct and match stock.
 
-Decisive corroboration: p_clip_a (add_clip_bsp, clip reachable from the trace leaf) and p_clip_c
-(the old `add_clip`, clip attached only to empty leaves, **not** reachable from the trace leaf)
-**both** walked through on device. If reachability decided solidity, a and c would differ. They
-did not, so the cause is **common to any converter-added cbrush and independent of leaf
-assignment**.
+**CORRECTION (device ground truth): leaf assignment is NOT ruled out.** Only **p_clip_a** was
+tested on device (it walked through). **p_clip_c was never tested.** An earlier draft of this
+section claimed both a and c walked through and concluded the cause was "independent of leaf
+assignment" — that was wrong: the p_clip_c result was never observed. Do not build on that
+conclusion. What device testing actually establishes so far is only that **p_clip_a (add_clip_bsp,
+clip reachable from its trace leaf) walked through**. Leaf assignment, the brush-array append, and
+the leafBrushes/leafBrushNode append all remain live suspects. `p_clip_move` (move an existing
+clip, no `numBrushes` growth) is the next test and will separate the append hypothesis from the
+rest; p_clip_c would separately retest the leaf-assignment hypothesis if staged.
 
 ## What is still missing (the gap, not closed)
 
-The cause lies outside the clipMap arrays examined. Remaining unproven suspects, in order of
-suspicion:
+The offline oracle reports p_clip_a solid while the device shows walk-through, so the gap is not
+captured by the structural checks. Unproven suspects, none yet eliminated by device results:
 
 1. **Load-time collision structures sized from the original brush count.** `CM_LoadMap` allocates
    per-brush runtime state (checkcount / box-brush / broadphase). If any of these is sized or
    indexed from a count that the appended brush exceeds, or from an array the converter did not
-   grow, a brush appended past the original `numBrushes` would never be tested. This fits a and c
-   both failing regardless of leaf. It cannot be confirmed from the stripped ELF here.
+   grow, a brush appended past the original `numBrushes` would never be tested. `p_clip_move`
+   (no `numBrushes` growth) tests this directly. It cannot be confirmed from the stripped ELF here.
+1a. **Leaf assignment / the engine descending to a different leaf than `BspLocator`.** Still open:
+   p_clip_c (clip attached only to empty leaves) was never device-tested, so we have no evidence
+   that attaching to the reachable trace leaf is sufficient or that attaching to empty leaves fails.
 2. **The engine's point->leaf descent differing from `BspLocator`.** `reachable_brushes` and
    `locate` were validated only against stock reachability, which is self-consistent but not a
    direct check that the engine descends 204,-47 to leaf 596.
@@ -198,13 +205,15 @@ Staged at `/mnt/c/Users/bolst/Desktop/opent5-hwtest/nuked/p_clip_move/mp_nuked.f
 - **File sha1:** `9488a3fee09dd9653497892d07985d6fdfa16b2e` (content sha1
   `34e9df4a4040ba369201b818dc1479898754293b`).
 
-**Diagnostic reading on device:**
-- if p_clip_move is **solid** -> the cbrush-array append (the `numBrushes` growth in p_clip_a /
-  p_clip_c) is the cause, and the fix is to rebuild the clipMap the cod2map way: re-sort the
-  whole brush array, rebuild the leafBrushNode forest and update the cLeaf mins/maxs, rather
-  than appending past the original brush count;
-- if it still **walks through** -> the `numBrushes` growth is not it; the gap is in the
-  leafBrushes / leafBrushNode append or the leaf descent, and the next step needs a faithful
+**Diagnostic reading on device** (p_clip_move moves an existing clip, so `numBrushes` does not
+grow, unlike the appended p_clip_a):
+- if p_clip_move is **solid** -> moving an existing clip works where appending one (p_clip_a) did
+  not, implicating the cbrush-array append / `numBrushes` growth. The fix is to rebuild the clipMap
+  the cod2map way: re-sort the whole brush array, rebuild the leafBrushNode forest and update the
+  cLeaf mins/maxs, rather than appending past the original brush count;
+- if it still **walks through** -> the `numBrushes` growth is not the (only) cause. The gap is then
+  in the leafBrushes / leafBrushNode append or the engine's leaf descent, and leaf assignment
+  itself is still unproven (p_clip_c was never device-tested). The next step needs a faithful
   CM_BoxTrace from a symbolised t5mp.
 
 ## Tools (scratch, this branch)
