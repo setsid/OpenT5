@@ -24,8 +24,15 @@ from PySide6.QtCore import QObject, QPointF, QRunnable, Qt, QThreadPool, QTimer,
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import (
     QComboBox,
+    QFileDialog,
+    QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
+    QPushButton,
+    QScrollArea,
+    QSplitter,
     QStackedLayout,
     QToolButton,
     QVBoxLayout,
@@ -303,6 +310,202 @@ def ray_mesh_hit(origin, direction, points, triangles):
     return o + d * float(t[nearest])
 
 
+# -- in-place editing (v0.3.0) ---------------------------------------------------------------
+
+#: World axes a translate or rotate drag is constrained to.
+EDIT_AXES = (
+    np.array([1.0, 0.0, 0.0]),
+    np.array([0.0, 1.0, 0.0]),
+    np.array([0.0, 0.0, 1.0]),
+)
+#: Marker colour per kind; falls back to the theme text colour.
+MARKER_KINDS = {
+    "spawn": "#49b36b",
+    "objective": "#d8973c",
+    "light": "#e8d24a",
+    "worldspawn": "#6f8bd8",
+    "entity": "#9aa0a6",
+}
+
+
+class MapEditController:
+    """Drives one ``EditSession`` from the 3D view: selection by marker, a translate or
+    rotate drag constrained to a world axis, and add / delete / duplicate. The maths are the
+    pure functions in ``opent5.edit.gizmo``; this holds the per-drag state and the selection,
+    so it can be exercised without a GPU."""
+
+    def __init__(self, session):
+        self.session = session
+        self.selected_id: int | None = None
+        self.mode = "translate"  # or "rotate"
+        self.grid = 0.0  # translate snap, world units (0: off)
+        self.angle = 0.0  # rotate snap, degrees (0: off)
+        self._drag = None
+        self._drag_token = 0
+
+    # selection and projection
+    def markers(self) -> list:
+        return self.session.markers()
+
+    def marker_screen(self, cam: Camera, w: int, h: int):
+        from opent5.edit import gizmo as gz
+
+        eye, right, up, forward = cam.basis()
+        f = focal(h)
+        ids, pts, depths = [], [], []
+        for o in self.markers():
+            sx, sy, depth, front = gz.project_point(o.origin, eye, right, up, forward, f, w, h)
+            ids.append(o.id)
+            pts.append((sx, sy) if front else (np.nan, np.nan))
+            depths.append(depth if front else np.inf)
+        return ids, np.array(pts, np.float64).reshape(-1, 2), np.array(depths, np.float64)
+
+    def pick(self, cam: Camera, px: float, py: float, w: int, h: int, radius: float = 12.0):
+        from opent5.edit import gizmo as gz
+
+        ids, pts, depths = self.marker_screen(cam, w, h)
+        if not ids:
+            self.selected_id = None
+            return None
+        i = gz.nearest_marker(pts, (px, py), radius, depths)
+        self.selected_id = None if i is None else ids[i]
+        return self.selected_id
+
+    def selected(self):
+        if self.selected_id is None:
+            return None
+        from opent5.edit import EditError
+
+        try:
+            return self.session.object(self.selected_id)
+        except EditError:
+            self.selected_id = None
+            return None
+
+    def axis_handles(self, cam: Camera, w: int, h: int, length_px: float = 60.0):
+        """The selected object's gizmo: ``(centre_screen, [(axis_index, (sx, sy), front)])``,
+        the three world-axis handle ends sized to about ``length_px`` on screen. Empty when
+        nothing is selected or it is behind the camera."""
+        from opent5.edit import gizmo as gz
+
+        obj = self.selected()
+        if obj is None:
+            return None, []
+        eye, right, up, forward = cam.basis()
+        f = focal(h)
+        centre = np.asarray(obj.origin, np.float64)
+        csx, csy, cdepth, cfront = gz.project_point(centre, eye, right, up, forward, f, w, h)
+        if not cfront:
+            return None, []
+        world_len = max(cdepth, 1.0) * length_px / f
+        handles = []
+        for i, axis in enumerate(EDIT_AXES):
+            sx, sy, _d, front = gz.project_point(
+                centre + axis * world_len, eye, right, up, forward, f, w, h
+            )
+            handles.append((i, (sx, sy), front))
+        return (csx, csy), handles
+
+    def hit_axis(self, cam: Camera, px: float, py: float, w: int, h: int, radius: float = 10.0):
+        """The axis whose handle end the cursor is within ``radius`` pixels of, or None."""
+        _centre, handles = self.axis_handles(cam, w, h)
+        best, best_d = None, radius * radius
+        for i, (sx, sy), front in handles:
+            if not front:
+                continue
+            d = (sx - px) ** 2 + (sy - py) ** 2
+            if d <= best_d:
+                best, best_d = i, d
+        return best
+
+    # dragging
+    def begin_drag(self, axis_index: int, cam: Camera, px: float, py: float, w: int, h: int):
+        from opent5.edit import gizmo as gz
+
+        obj = self.selected()
+        if obj is None:
+            return False
+        eye, d = cursor_ray(cam, px, py, w, h)
+        axis = EDIT_AXES[axis_index]
+        centre = np.asarray(obj.origin, np.float64)
+        self._drag_token += 1
+        if self.mode == "rotate":
+            self._drag = {
+                "axis": axis_index,
+                "centre": centre,
+                "hit0": gz.ray_plane(eye, d, centre, axis),
+                "angles": np.asarray(obj.angles, np.float64),
+            }
+        else:
+            self._drag = {
+                "axis": axis_index,
+                "start": centre,
+                "s0": gz.axis_param(eye, d, centre, axis),
+            }
+        return True
+
+    def update_drag(self, cam: Camera, px: float, py: float, w: int, h: int) -> None:
+        from opent5.edit import gizmo as gz
+
+        if self._drag is None:
+            return
+        obj = self.selected()
+        if obj is None:
+            return
+        eye, d = cursor_ray(cam, px, py, w, h)
+        axis_index = self._drag["axis"]
+        axis = EDIT_AXES[axis_index]
+        if self.mode == "rotate":
+            hit0 = self._drag["hit0"]
+            hit1 = gz.ray_plane(eye, d, self._drag["centre"], axis)
+            if hit0 is None or hit1 is None:
+                return
+            delta = math.degrees(gz.rotation_delta(self._drag["centre"], axis, hit0, hit1))
+            delta = gz.snap(delta, self.angle) if self.angle else delta
+            angles = gz.rotate_angles(self._drag["angles"], axis_index, delta)
+            self.session.rotate_object(obj.id, angles, coalesce=True, group=self._drag_token)
+        else:
+            s1 = gz.axis_param(eye, d, self._drag["start"], axis)
+            origin = gz.translate_on_axis(self._drag["start"], axis, self._drag["s0"], s1)
+            origin = gz.snap_vec(origin, self.grid) if self.grid else origin
+            self.session.move_object(obj.id, origin, coalesce=True, group=self._drag_token)
+
+    def end_drag(self) -> None:
+        self._drag = None
+
+    @property
+    def dragging(self) -> bool:
+        return self._drag is not None
+
+    # structural edits
+    def add(self, keys: dict) -> int:
+        self.selected_id = self.session.add_object(keys)
+        return self.selected_id
+
+    def duplicate(self) -> int | None:
+        if self.selected_id is None:
+            return None
+        self.selected_id = self.session.duplicate_object(self.selected_id)
+        return self.selected_id
+
+    def delete(self) -> None:
+        if self.selected_id is not None:
+            self.session.delete_object(self.selected_id)
+            self.selected_id = None
+
+    def set_property(self, key: str, value: str | None) -> None:
+        if self.selected_id is not None:
+            self.session.set_property(self.selected_id, key, value)
+
+    def undo(self) -> None:
+        self.session.undo()
+        if self.selected() is None:
+            self.selected_id = None
+
+    def redo(self) -> None:
+        self.session.redo()
+
+
 class Renderer:
     """Holds a mesh's edges and renders frames into QImages."""
 
@@ -472,10 +675,17 @@ class MeshCanvas(QWidget):
     """The drawing surface: owns the camera and the renderer."""
 
     camera_changed = Signal()
+    #: An entity was picked (its id, or None); the view updates the property panel.
+    selection_changed = Signal(object)
+    #: An edit went through the session (move, rotate, add, delete, ...).
+    edited = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.controller = None  # a MapEditController while editing, else None
+        self._edit_drag = False
+        self._press_pos = None
         self.setMinimumSize(120, 90)
         self.renderer = Renderer()
         self.camera = Camera()
@@ -505,6 +715,13 @@ class MeshCanvas(QWidget):
         self._fly_timer = QTimer(self)
         self._fly_timer.setInterval(16)
         self._fly_timer.timeout.connect(self._fly_step)
+
+    def set_controller(self, controller) -> None:
+        """Attach (or clear with None) the in-place edit controller. While set, the canvas
+        draws entity markers and the selection gizmo and routes left-button events to it."""
+        self.controller = controller
+        self._edit_drag = False
+        self.invalidate()
 
     def set_mesh(self, positions, triangles, title: str) -> None:
         self.renderer.set_mesh(positions, triangles)
@@ -652,6 +869,8 @@ class MeshCanvas(QWidget):
             p.setPen(QColor(t.text_dim))
             p.drawText(8, help_top - 6, f"grid {step:g} units")
         self._paint_gizmo(p)
+        if self.controller is not None:
+            self._paint_edit(p)
         p.end()
 
     def _paint_help(self, p: QPainter) -> int:
@@ -688,14 +907,97 @@ class MeshCanvas(QWidget):
             p.setPen(QColor(t.text))
             p.drawText(QPointF(cx + sx * (r + 7) - 3, cy + sy * (r + 7) + 4), name)
 
+    def _paint_edit(self, p: QPainter) -> None:
+        """Draw entity markers (billboarded) and the selection gizmo."""
+        ctl = self.controller
+        t = theme.current()
+        w, h = self.width(), self.height()
+        ids, pts, _depths = ctl.marker_screen(self.camera, w, h)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        for obj in ctl.markers():
+            try:
+                i = ids.index(obj.id)
+            except ValueError:
+                continue
+            sx, sy = pts[i]
+            if np.isnan(sx):
+                continue
+            selected = obj.id == ctl.selected_id
+            colour = QColor(MARKER_KINDS.get(obj.kind, t.text))
+            r = 5 if selected else 3
+            if selected:
+                p.setPen(QPen(QColor(t.text), 1.5))
+            else:
+                p.setPen(QPen(colour, 1.0))
+            p.setBrush(colour)
+            p.drawRect(int(sx - r), int(sy - r), 2 * r, 2 * r)
+        self._paint_gizmo_handles(p)
+        self._paint_edit_readout(p)
+
+    def _paint_gizmo_handles(self, p: QPainter) -> None:
+        ctl = self.controller
+        centre, handles = ctl.axis_handles(self.camera, self.width(), self.height())
+        if centre is None:
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        names = ("X", "Y", "Z")
+        colours = ("#d85c5c", "#49b36b", "#5c7cd8")
+        for i, (sx, sy), front in handles:
+            if not front:
+                continue
+            pen = QPen(QColor(colours[i]), 2.0)
+            p.setPen(pen)
+            p.drawLine(QPointF(*centre), QPointF(sx, sy))
+            p.setBrush(QColor(colours[i]))
+            p.drawEllipse(QPointF(sx, sy), 4, 4)
+            p.drawText(QPointF(sx + 4, sy - 4), names[i])
+
+    def _paint_edit_readout(self, p: QPainter) -> None:
+        ctl = self.controller
+        t = theme.current()
+        obj = ctl.selected()
+        bits = [f"edit: {ctl.mode}"]
+        if obj is not None:
+            bits.append(f"{obj.label}  {obj.keys.get('origin', '')}")
+        if ctl.session.dirty:
+            bits.append("edited")
+        text = "    ".join(bits)
+        p.setFont(theme.mono_font(8))
+        p.setPen(QColor(t.text))
+        fm = p.fontMetrics()
+        x = self.width() - fm.horizontalAdvance(text) - 10
+        p.drawText(max(x, 8), 16, text)
+
     # interaction
     def mousePressEvent(self, e) -> None:
+        self._press_pos = e.position()
+        if self.controller is not None and e.button() == Qt.MouseButton.LeftButton:
+            axis = self.controller.hit_axis(
+                self.camera, e.position().x(), e.position().y(), self.width(), self.height()
+            )
+            if axis is not None and self.controller.selected() is not None:
+                self.controller.begin_drag(
+                    axis, self.camera, e.position().x(), e.position().y(),
+                    self.width(), self.height(),
+                )  # fmt: skip
+                self._edit_drag = True
+                self._drag = None
+                self.setFocus()
+                return
         self._drag = (e.position(), e.buttons())
         self.setFocus()
         if e.button() == Qt.MouseButton.RightButton:
             self._start_fly()
 
     def mouseMoveEvent(self, e) -> None:
+        if self._edit_drag and self.controller is not None:
+            self.controller.update_drag(
+                self.camera, e.position().x(), e.position().y(), self.width(), self.height()
+            )
+            self._dragging = True
+            self.invalidate()
+            self.edited.emit()
+            return
         if self._drag is None:
             return
         last, _buttons = self._drag
@@ -725,6 +1027,24 @@ class MeshCanvas(QWidget):
         self.camera_changed.emit()
 
     def mouseReleaseEvent(self, e) -> None:
+        if self._edit_drag and e.button() == Qt.MouseButton.LeftButton:
+            self.controller.end_drag()
+            self._edit_drag = False
+            self._dragging = False
+            self.invalidate()
+            self.edited.emit()
+            return
+        if (
+            self.controller is not None
+            and e.button() == Qt.MouseButton.LeftButton
+            and self._press_pos is not None
+            and (e.position() - self._press_pos).manhattanLength() < 4
+        ):
+            picked = self.controller.pick(
+                self.camera, e.position().x(), e.position().y(), self.width(), self.height()
+            )
+            self.selection_changed.emit(picked)
+            self.invalidate()
         if e.button() == Qt.MouseButton.RightButton:
             self._stop_fly()
         self._drag = None
@@ -805,6 +1125,8 @@ class MeshCanvas(QWidget):
 
     def keyPressEvent(self, e) -> None:
         k = e.key()
+        if self.controller is not None and self._edit_key(e, k):
+            return
         if k == Qt.Key.Key_F:
             self.frame_focus()
         elif k == Qt.Key.Key_Home:
@@ -818,6 +1140,31 @@ class MeshCanvas(QWidget):
         else:
             super().keyPressEvent(e)
 
+    def _edit_key(self, e, k) -> bool:
+        """Editing keys: G translate, R rotate, Delete delete, Ctrl+D duplicate, Esc
+        deselect. Returns True when the key was an editing key."""
+        ctl = self.controller
+        ctrl = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        if k == Qt.Key.Key_G:
+            ctl.mode = "translate"
+        elif k == Qt.Key.Key_R and not ctrl:
+            ctl.mode = "rotate"
+        elif k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and ctl.selected_id is not None:
+            ctl.delete()
+            self.selection_changed.emit(None)
+            self.edited.emit()
+        elif k == Qt.Key.Key_D and ctrl and ctl.selected_id is not None:
+            ctl.duplicate()
+            self.selection_changed.emit(ctl.selected_id)
+            self.edited.emit()
+        elif k == Qt.Key.Key_Escape and ctl.selected_id is not None:
+            ctl.selected_id = None
+            self.selection_changed.emit(None)
+        else:
+            return False
+        self.invalidate()
+        return True
+
     def keyReleaseEvent(self, e) -> None:
         if not e.isAutoRepeat():
             self._fly_keys.discard(e.key())
@@ -826,6 +1173,223 @@ class MeshCanvas(QWidget):
     def resizeEvent(self, e) -> None:
         self.invalidate()
         super().resizeEvent(e)
+
+
+class MapEditPanel(QWidget):
+    """Property panel for the in-place editor: the selected entity's keys, the gizmo mode and
+    snap, add / duplicate / delete, undo / redo and save to a new file."""
+
+    changed = Signal()  # an edit happened; the view refreshes markers
+    status = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("MapEditPanel")
+        self.controller = None
+        self._on_save = None  # callback(path) set by the view
+        self._field_edits: dict[str, QLineEdit] = {}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
+        title = QLabel("Map editor")
+        f = title.font()
+        f.setBold(True)
+        title.setFont(f)
+        root.addWidget(title)
+
+        mode_row = QHBoxLayout()
+        self.mode = QComboBox(self)
+        self.mode.addItems(["Translate (G)", "Rotate (R)"])
+        self.mode.currentIndexChanged.connect(self._set_mode)
+        mode_row.addWidget(QLabel("Gizmo"))
+        mode_row.addWidget(self.mode, 1)
+        root.addLayout(mode_row)
+
+        snap_row = QHBoxLayout()
+        self.grid = QLineEdit("0", self)
+        self.grid.setToolTip("Translate snap, world units (0 off)")
+        self.grid.editingFinished.connect(self._set_snap)
+        self.angle = QLineEdit("0", self)
+        self.angle.setToolTip("Rotate snap, degrees (0 off)")
+        self.angle.editingFinished.connect(self._set_snap)
+        snap_row.addWidget(QLabel("Snap"))
+        snap_row.addWidget(self.grid)
+        snap_row.addWidget(QLabel("deg"))
+        snap_row.addWidget(self.angle)
+        root.addLayout(snap_row)
+
+        act_row = QHBoxLayout()
+        self.add_button = QPushButton("Add", self)
+        self.add_button.clicked.connect(self._add)
+        self.dup_button = QPushButton("Duplicate", self)
+        self.dup_button.clicked.connect(self._duplicate)
+        self.del_button = QPushButton("Delete", self)
+        self.del_button.clicked.connect(self._delete)
+        for b in (self.add_button, self.dup_button, self.del_button):
+            act_row.addWidget(b)
+        root.addLayout(act_row)
+
+        hist_row = QHBoxLayout()
+        self.undo_button = QPushButton("Undo", self)
+        self.undo_button.clicked.connect(self._undo)
+        self.redo_button = QPushButton("Redo", self)
+        self.redo_button.clicked.connect(self._redo)
+        hist_row.addWidget(self.undo_button)
+        hist_row.addWidget(self.redo_button)
+        root.addLayout(hist_row)
+
+        self.selected_label = QLabel("Nothing selected", self)
+        self.selected_label.setWordWrap(True)
+        root.addWidget(self.selected_label)
+
+        self.form_host = QWidget(self)
+        self.form = QFormLayout(self.form_host)
+        self.form.setContentsMargins(0, 0, 0, 0)
+        self.form.setSpacing(3)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.form_host)
+        root.addWidget(scroll, 1)
+
+        key_row = QHBoxLayout()
+        self.new_key = QLineEdit(self)
+        self.new_key.setPlaceholderText("new key")
+        self.new_value = QLineEdit(self)
+        self.new_value.setPlaceholderText("value")
+        add_key = QPushButton("Set", self)
+        add_key.clicked.connect(self._add_key)
+        key_row.addWidget(self.new_key)
+        key_row.addWidget(self.new_value)
+        key_row.addWidget(add_key)
+        root.addLayout(key_row)
+
+        self.save_button = QPushButton("Save edited map ...", self)
+        self.save_button.clicked.connect(self._save)
+        root.addWidget(self.save_button)
+
+    # wiring
+    def set_controller(self, controller, on_save=None) -> None:
+        self.controller = controller
+        self._on_save = on_save
+        self.show_object(controller.selected_id if controller else None)
+
+    def set_mode(self, mode: str) -> None:
+        self.mode.blockSignals(True)
+        self.mode.setCurrentIndex(1 if mode == "rotate" else 0)
+        self.mode.blockSignals(False)
+
+    def _set_mode(self, index: int) -> None:
+        if self.controller is not None:
+            self.controller.mode = "rotate" if index == 1 else "translate"
+
+    def _set_snap(self) -> None:
+        if self.controller is None:
+            return
+        self.controller.grid = _as_float(self.grid.text())
+        self.controller.angle = _as_float(self.angle.text())
+
+    def show_object(self, obj_id) -> None:
+        while self.form.rowCount():
+            self.form.removeRow(0)
+        self._field_edits.clear()
+        obj = None
+        if self.controller is not None and obj_id is not None:
+            obj = self.controller.selected()
+        has = obj is not None
+        self.dup_button.setEnabled(has)
+        self.del_button.setEnabled(has)
+        if self.controller is not None:
+            self.undo_button.setEnabled(self.controller.session.can_undo)
+            self.redo_button.setEnabled(self.controller.session.can_redo)
+        if obj is None:
+            self.selected_label.setText("Nothing selected")
+            return
+        self.selected_label.setText(f"{obj.kind}: {obj.label}  (id {obj.id})")
+        for key, value in obj.keys.items():
+            edit = QLineEdit(value, self)
+            edit.setReadOnly(key == "classname")
+            edit.editingFinished.connect(lambda k=key, e=edit: self._commit(k, e))
+            self.form.addRow(key, edit)
+            self._field_edits[key] = edit
+
+    # actions
+    def _commit(self, key: str, edit: QLineEdit) -> None:
+        if self.controller is None:
+            return
+        self._guard(lambda: self.controller.set_property(key, edit.text()))
+
+    def _add_key(self) -> None:
+        if self.controller is None or self.controller.selected_id is None:
+            return
+        key = self.new_key.text().strip()
+        if not key:
+            return
+        self._guard(lambda: self.controller.set_property(key, self.new_value.text()))
+        self.new_key.clear()
+        self.new_value.clear()
+        self.show_object(self.controller.selected_id)
+
+    def _add(self) -> None:
+        if self.controller is None:
+            return
+        name, ok = QInputDialog.getText(self, "Add entity", "classname:")
+        if not ok or not name.strip():
+            return
+        self._guard(lambda: self.controller.add({"classname": name.strip(), "origin": "0 0 0"}))
+        self.show_object(self.controller.selected_id)
+
+    def _duplicate(self) -> None:
+        if self.controller is not None:
+            self._guard(self.controller.duplicate)
+            self.show_object(self.controller.selected_id)
+
+    def _delete(self) -> None:
+        if self.controller is not None:
+            self._guard(self.controller.delete)
+            self.show_object(None)
+
+    def _undo(self) -> None:
+        if self.controller is not None:
+            self.controller.undo()
+            self.changed.emit()
+            self.show_object(self.controller.selected_id)
+
+    def _redo(self) -> None:
+        if self.controller is not None:
+            self.controller.redo()
+            self.changed.emit()
+            self.show_object(self.controller.selected_id)
+
+    def _save(self) -> None:
+        if self.controller is None or self._on_save is None:
+            return
+        session = self.controller.session
+        default = session.default_save_path()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save edited map", str(default or ""), "Fastfiles (*.ff)"
+        )
+        if path:
+            self._on_save(path)
+
+    def _guard(self, action) -> None:
+        from opent5.edit import EditError
+
+        try:
+            action()
+        except EditError as exc:
+            self.status.emit(str(exc))
+            return
+        self.changed.emit()
+        if self.controller is not None:
+            self.show_object(self.controller.selected_id)
+
+
+def _as_float(text: str) -> float:
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
 
 
 class MeshView(AssetView):
@@ -852,6 +1416,11 @@ class MeshView(AssetView):
         self.models_button = self._toggle("Static models", True, self._set_models)
         self.models_button.setToolTip("Place the world's static models (props)")
         self.models_button.setVisible(False)
+        self.edit_button = self._toggle("Edit", False, self._set_edit)
+        self.edit_button.setToolTip(
+            "Edit placed entities, the sun and fog in place; click a marker to select"
+        )
+        self.edit_button.setVisible(False)
         self.mode = QComboBox(bar)
         self.mode.addItems(COLLISION_MODES)
         self.mode.setToolTip("Which collision geometry to draw")
@@ -863,7 +1432,7 @@ class MeshView(AssetView):
         self.info = QLabel("", bar)
         self.info.setObjectName("AssetMeta")
         for w in (self.shaded_button, self.depth_button, self.grid_button,
-                  self.models_button, self.mode):  # fmt: skip
+                  self.models_button, self.edit_button, self.mode):  # fmt: skip
             row.addWidget(w)
         row.addStretch(1)
         row.addWidget(self.info)
@@ -872,6 +1441,8 @@ class MeshView(AssetView):
 
         self.canvas = MeshCanvas(self)
         self.canvas.camera_changed.connect(self._camera_status)
+        self.canvas.selection_changed.connect(self._on_pick)
+        self.canvas.edited.connect(self._on_edited)
         self.placeholder = empty_state("", self)
         self.stack = QStackedLayout()
         holder = QWidget(self)
@@ -879,11 +1450,23 @@ class MeshView(AssetView):
         self.stack.addWidget(self.placeholder)
         self.stack.addWidget(self.canvas)
 
+        self._session = None
+        self._edit_controller = None
+        self.panel = MapEditPanel(self)
+        self.panel.changed.connect(self._on_panel_changed)
+        self.panel.status.connect(self.status)
+        self.panel.setVisible(False)
+        self.split = QSplitter(Qt.Orientation.Horizontal, self)
+        self.split.addWidget(holder)
+        self.split.addWidget(self.panel)
+        self.split.setStretchFactor(0, 1)
+        self.split.setStretchFactor(1, 0)
+
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addWidget(bar)
-        lay.addWidget(holder, 1)
+        lay.addWidget(self.split, 1)
 
         self._frame_action = QAction("Frame focus", self)
         self._frame_action.setShortcut(QKeySequence("F"))
@@ -972,6 +1555,92 @@ class MeshView(AssetView):
             return
         self._start(self.doc, "world_models" if on else "world", self.ref)
 
+    # -- in-place editing --------------------------------------------------------------------
+
+    def _can_edit(self) -> bool:
+        return (
+            self.doc is not None
+            and getattr(self.doc, "backend", None) == "edit"
+            and self.mesh_kind in ("world", "world_models", "collision")
+        )
+
+    def _ensure_session(self):
+        if self._session is not None:
+            return self._session
+        from opent5.edit import EditError
+        from opent5.edit.mapedit import EditSession
+
+        try:
+            self._session = EditSession(self.doc.impl)
+        except EditError as exc:
+            self.status.emit(f"Cannot edit this map: {exc}")
+            return None
+        return self._session
+
+    def _set_edit(self, on: bool) -> None:
+        if on and not self._can_edit():
+            self.edit_button.blockSignals(True)
+            self.edit_button.setChecked(False)
+            self.edit_button.blockSignals(False)
+            self.status.emit("This zone cannot be edited in place (needs the edit backend).")
+            return
+        if on:
+            session = self._ensure_session()
+            if session is None:
+                self.edit_button.blockSignals(True)
+                self.edit_button.setChecked(False)
+                self.edit_button.blockSignals(False)
+                return
+            self._edit_controller = MapEditController(session)
+            self.canvas.set_controller(self._edit_controller)
+            self.panel.set_controller(self._edit_controller, on_save=self._save_edited)
+            self.panel.setVisible(True)
+            self.status.emit(
+                f"Editing {len(session.markers())} entities. Click a marker; G move, R rotate, "
+                "Delete remove, Ctrl+D duplicate."
+            )
+        else:
+            self.canvas.set_controller(None)
+            self.panel.setVisible(False)
+        self.canvas.invalidate()
+
+    def _teardown_edit(self) -> None:
+        if self.edit_button.isChecked():
+            self.edit_button.blockSignals(True)
+            self.edit_button.setChecked(False)
+            self.edit_button.blockSignals(False)
+        self.canvas.set_controller(None)
+        self.panel.set_controller(None)
+        self.panel.setVisible(False)
+        self._edit_controller = None
+        self._session = None
+
+    def _on_pick(self, obj_id) -> None:
+        self.panel.show_object(obj_id)
+
+    def _on_edited(self) -> None:
+        if self._edit_controller is not None:
+            self.panel.show_object(self._edit_controller.selected_id)
+        self.canvas.invalidate()
+
+    def _on_panel_changed(self) -> None:
+        self.canvas.invalidate()
+
+    def _save_edited(self, path) -> None:
+        if self._session is None:
+            return
+        from opent5.edit import EditError
+
+        try:
+            report = self._session.save(path)
+        except EditError as exc:
+            self.status.emit(f"Not saved: {exc}")
+            return
+        if report.verified:
+            self.status.emit(f"Saved {report.path.name} (verified, {report.bytes:,} bytes)")
+        else:
+            self.status.emit(f"Saved {report.path.name} but verify failed: {report.problems[:1]}")
+
     def _world_kind(self, kind: str | None) -> str | None:
         if kind == "world" and self.models_button.isChecked():
             return "world_models"
@@ -1006,6 +1675,8 @@ class MeshView(AssetView):
         self._generation += 1
         self.mesh_kind = kind
         self.models_button.setVisible(kind in ("world", "world_models"))
+        self._teardown_edit()
+        self.edit_button.setVisible(self._can_edit())
         label = ref.label if ref is not None else KIND_TITLES.get(kind, kind)
         self._show_message(f"Building mesh for {label} ...")
         job = _MeshJob(self._generation, doc, kind, ref)
@@ -1027,6 +1698,8 @@ class MeshView(AssetView):
         kind = self._world_kind(kind)
         self.mesh_kind = kind
         self.models_button.setVisible(kind in ("world", "world_models"))
+        self._teardown_edit()
+        self.edit_button.setVisible(self._can_edit())
         self._sync = True
         try:
             mesh = doc.mesh(kind, ref)

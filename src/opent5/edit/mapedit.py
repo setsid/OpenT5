@@ -367,18 +367,22 @@ class EditSession:
 
     # -- editing: entities -------------------------------------------------------------------
 
-    def move_object(self, obj_id: int, origin, coalesce: bool = False) -> None:
+    def move_object(self, obj_id: int, origin, coalesce: bool = False, group=None) -> None:
         obj = self._object(obj_id)
         after = _vec_str(origin)
-        merge = ("move", obj_id) if coalesce else None
+        if after == obj.keys.get("origin"):
+            return
+        merge = ("move", obj_id, group) if coalesce else None
         self._apply(
             MoveObject(obj_id, "origin", obj.keys.get("origin"), after, merge_key=merge)
         )
 
-    def rotate_object(self, obj_id: int, angles, coalesce: bool = False) -> None:
+    def rotate_object(self, obj_id: int, angles, coalesce: bool = False, group=None) -> None:
         obj = self._object(obj_id)
         after = _vec_str(angles)
-        merge = ("rotate", obj_id) if coalesce else None
+        if after == obj.keys.get("angles"):
+            return
+        merge = ("rotate", obj_id, group) if coalesce else None
         self._apply(
             RotateObject(obj_id, "angles", obj.keys.get("angles"), after, merge_key=merge)
         )
