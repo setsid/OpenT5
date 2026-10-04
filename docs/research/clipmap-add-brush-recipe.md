@@ -172,8 +172,45 @@ p_clip_d was **not** staged: the gate ("the trace reports solid offline AND repr
 cannot be met, because the offline oracle already reports p_clip_a solid yet the device disagrees,
 so staging another appended clip would only reproduce p_clip_a.
 
+## p_clip_move (staged, the diagnostic build)
+
+Staged at `/mnt/c/Users/bolst/Desktop/opent5-hwtest/nuked/p_clip_move/mp_nuked.ff`
+(`tools/stage_clip_move.py`). This is the recommended experiment, NOT an appended-brush build.
+
+- **Landmark:** the central road crossing between the two houses, slightly east of map
+  centre, the exact p_clip_a spot (204,-47) so it is a direct controlled comparison (same
+  location and shape; the only change from p_clip_a is moved-existing vs appended). The two
+  team spawn clusters sit west (x around -700..-2000) and east (x around +790..+2100), so a
+  player crossing the middle walks into it. The moved marker prop stands at the wall.
+- **Clip moved:** stock axial player-clip **brush 82** (a small perimeter clip, contents
+  0x08030200), from (788,555,86)..(799,564,146) to a wall across the road
+  **(180,-147,-48)..(228,53,112)** (thin in X, the travel axis; wide in Y; tall in Z over the
+  crouch/stand range). `numBrushes` stays 5890.
+- **Marker prop moved:** clipMap `cStaticModel_s` index 28 (a crate-sized central collidable
+  prop) and its matching GfxWorld `smodelDrawInst` 434 (plus the parallel `smodelInst` bounds)
+  moved to (204,-47,-20). Render follows the origin (Route-B); its own baked collision does not,
+  which is fine because collision here is the moved clip. `numStaticModels` stays 1385.
+- **Gate (all pass):** reparse-exact (`blocks_end_at_header` true), full oracle clean
+  (`consumed_exactly` true, 109496/109496 pointers identical, `targets_outside_their_block` 0,
+  both clipMap checks 0), `check_world_leaf_refs` 0, `check_leaf_contents_masks` 0,
+  `clip_oracle` reports the moved clip solid at (204,-47,*), `numBrushes` 5890 unchanged,
+  `numStaticModels` 1385 unchanged, `numBrushVerts` 48747 unchanged.
+- **File sha1:** `9488a3fee09dd9653497892d07985d6fdfa16b2e` (content sha1
+  `34e9df4a4040ba369201b818dc1479898754293b`).
+
+**Diagnostic reading on device:**
+- if p_clip_move is **solid** -> the cbrush-array append (the `numBrushes` growth in p_clip_a /
+  p_clip_c) is the cause, and the fix is to rebuild the clipMap the cod2map way: re-sort the
+  whole brush array, rebuild the leafBrushNode forest and update the cLeaf mins/maxs, rather
+  than appending past the original brush count;
+- if it still **walks through** -> the `numBrushes` growth is not it; the gap is in the
+  leafBrushes / leafBrushNode append or the leaf descent, and the next step needs a faithful
+  CM_BoxTrace from a symbolised t5mp.
+
 ## Tools (scratch, this branch)
 
 - `tools/clip_diff_build.py` - builds the two box maps and runs the real toolchain.
 - `tools/clip_diff_parse.py` - diffs two compiled PC clipMaps.
-- `tools/clip_probe*.py` - the structural-oracle probes (bus validation, reachability, byte diff).
+- `tools/clip_oracle.py` - the offline structural check (`validate` / `solid`).
+- `tools/stage_clip_move.py` - stages p_clip_move (moves clip 82 + marker prop 28), repacks the
+  PS3 .ff, and verifies the whole gate.
