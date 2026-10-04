@@ -11,14 +11,9 @@ from opent5.xfile.handlers.physics import PHYS_CONSTRAINT_SIZE, phys_constraint
 from opent5.xfile.stream import Chunk, XStream
 
 DYN_ENT_DEF_SIZE = 0x54
-#: sizeof(rope_t) as the loader strides the RUNTIME max_ropes pool (clipMap_t.rope at 0x144),
-#: per platform. PS3 is 0xC74 (stock mp_nuked carries 32 ropes and round-trips exactly at
-#: this size). The PC Mod Tools rope_t is 0x3C bytes larger, 0xCB0: measured exactly from a
-#: map with max_ropes 32 (the blocky map; at 0xC74 its RUNTIME block fell 0x780 = 32 x 0x3C
-#: short of the header size, at 0xCB0 it lands exactly). The rope_t field layout (0xC74) covers
-#: only up to m_lightingHandle at 3184; the extra PC bytes are trailing members it omits.
+#: sizeof(rope_t) as the loader strides the RUNTIME max_ropes pool (clipMap_t.rope at 0x144).
+#: Stock mp_nuked and the PC box both carry 32 ropes and reserve exactly at 0xC74.
 ROPE_SIZE = 0xC74
-ROPE_SIZE_PC = 0xCB0
 
 #: (field, pointer offset, align mask, element size, count offset) for the plain
 #: arrays loaded before leafbrushNodes, in load order.
@@ -131,8 +126,7 @@ def clipmap_body(io: XStream, h: Chunk, node: dict) -> None:
     )
     for c, element in constraints or ():
         phys_constraint(io, c, element)
-    rope_size = ROPE_SIZE_PC if io.platform.endian == "<" else ROPE_SIZE
-    runtime(io, h, 0x144, 3, rope_size * h.u32(0x140))
+    runtime(io, h, 0x144, 3, ROPE_SIZE * h.u32(0x140))
     io.pop()
 
 
