@@ -228,6 +228,18 @@ def convert_map(
     world.convert_com(pcom)
     world.convert_game(pgame)
     world.convert_clip(pclip)
+    # Path nodes: Domination and the other team-based modes stall at load on a map with no
+    # path-node connectivity (docs/research/box-objectives-cd.md 4, fixD proved it). The map
+    # generators emit a node_pathnode grid by default so cod2map compiles one; warn here when
+    # a converted map arrives with none, so the stall is not a surprise on device.
+    node_count = struct.unpack_from(">I", pgame["header"], 4)[0]
+    report["path_nodes"] = node_count
+    if node_count == 0:
+        report["notes"].append(
+            "path nodes: the map has 0 (GameWorldMp nodeCount); Domination and the other "
+            "team-based modes will stall at load. Place node_pathnode entities and recompile "
+            "(tools/testmap.py and the blocky generator do this by default)."
+        )
     model_words = smodels.model_words(bx)
     sres = smodels.convert_static_models(taken, model_words, foreign.xfile)
     clip_models = smodels.repoint_clip(pclip, model_words, foreign.xfile)

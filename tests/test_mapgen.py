@@ -173,17 +173,21 @@ def test_map_has_worldspawn_and_spawns(built):
 
 def test_map_has_own_materials_and_lighting(built):
     _, _, text = built
-    assert "mp_opent5blocks_grass_top" in text
-    assert "mp_opent5blocks_grass_side" in text
+    assert "blockout_test_fabric01" in text  # grass_top
+    assert "blockout_test_wood" in text  # grass_side
     assert mapwriter.LIGHT_GRID in text
-    assert mapwriter.SKY in text
-    assert "caulk" in text  # hidden faces
+    assert '"classname" "light"' in text  # primary lights (no sky techset, so no sun)
+    assert "caulk" in text  # hidden faces and the sealing shell
 
 
 def test_material_and_colormap_names():
-    assert mapwriter.material_name("grass_top") == "mp_opent5blocks_grass_top"
+    assert mapwriter.material_name("grass_top") == "blockout_test_fabric01"
     assert mapwriter.material_name("caulk") == "caulk"
-    assert mapwriter.colormap_name("dirt") == "mp_opent5blocks_dirt_c"
+    assert mapwriter.colormap_name("dirt") == "~-gblockout_concrete_med_test_c"
+    # distinct material and colour map per tile (so each gets its own art override)
+    tiles = mapwriter.STOCK_MATERIAL
+    assert len(set(tiles.values())) == len(tiles)
+    assert len(set(mapwriter.STOCK_COLORMAP.values())) == len(mapwriter.STOCK_COLORMAP)
 
 
 def test_spawn_classes_present_for_tdm_and_ffa(built):

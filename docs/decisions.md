@@ -150,3 +150,32 @@ or tangent handedness flip on some converted gfx faces). Investigating both
 offline while the user runs fixC/fixD. Blocky-map approach decided with the user:
 per-block stock materials plus forced converter overrides for the custom art
 (not debugging the material clone); held until fixC/fixD are reported.
+
+**fixC and fixD confirmed on device; the three converter/generator fixes.**
+fixC (radius triggers) showed the S&D objectives but gave no plant prompt; fixD
+(path nodes) made Domination load with no hang. Both diagnoses (box-objectives-cd.md
+C1, D1) are confirmed. The fixes, all in the map generators and the converter:
+
+1. **Path nodes by default.** A map with no path-node connectivity stalls at load
+   in Domination and the other team-based modes. The test map and the blocky
+   generator now emit a node_pathnode grid by default (cod2map compiles it into the
+   GameWorldMp path data; converted nodeCount 25 on the box). The converter warns
+   when a map arrives with 0 nodes.
+2. **S&D plant triggers.** The box's bomb sites now carry the exact stock mp_nuked
+   bombzone entity set (read from its own map_ents): two trigger_use_touch triggers
+   (plant with script_bombmode_original + script_label, defuse), the bomb
+   script_model with a script_exploder chaining them by target, and two solid
+   script_brushmodels. Brush-model use triggers give the plant prompt that radius
+   triggers did not.
+3. **Prop and site collision.** cod2map gives a misc_model no collision even though
+   it sits in the clipMap static model list (the box has 8 and had none on device),
+   so each prop and bomb site now gets a worldspawn clip box compiled into the BSP.
+
+**Blocky map: per-block stock materials, no cloned materials.** The cloned
+mp_opent5blocks_* materials crashed cod2rad. Each block face now uses a stock
+blockout_test_* material (eight of them) or one of three mp_nuked art materials,
+all with a colour-map IWI loose in the PC tools and all proven to bake. The
+converter force-builds those eleven materials from the PC zone and overrides each
+one's colour map with the map's own pixel art, so the block textures are the map's
+own while the material structure stays stock. No new material or IWI is written
+into the game folder.

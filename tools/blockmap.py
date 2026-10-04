@@ -32,64 +32,30 @@ import numpy as np  # noqa: E402
 from opent5.formats import texture as tx  # noqa: E402
 from opent5.mapgen import greedy, mapwriter, preview, terrain, textures  # noqa: E402
 
-# -- PC material / image registration (box-tex mechanism, demo-box-textures.md) -------------
-#: A material binary that compiles (techset l_sm_r0c0, colorMap + identity normalMap); we clone
-#: it per block material, changing only the material name and the colour-map image name. The
-#: pointer words into its string blob (verified to reproduce it byte for byte).
-_MAT_TEMPLATE = "blockout_test_wood"
-_MAT_PREFIX_LEN = 0x6C
-_MAT_FIELDS = {0x34: 0, 0x00: 1, 0x48: 2, 0x40: 3, 0x4C: 4, 0x54: 5, 0x58: 6}
-#: A known-good 512x512 DXT1 colour-map IWI copied under each block's own name; the converter
-#: overrides the pixels with the generated art, so only the IWI's validity (not content) matters.
-_IWI_TEMPLATE = "~-gblockout_average_test_c.iwi"
+# -- Stock block materials (docs/mapgen.md, docs/decisions.md) ------------------------------
+# Each block face uses a stock blockout_test_* material (mapwriter.STOCK_MATERIAL). No new
+# material or IWI is written into the game folder: the PC build includes the stock material
+# and its colour-map IWI, and the converter force-builds that material from the PC zone and
+# overrides its colour map with the map's own art. This replaces the earlier cloned
+# mp_opent5blocks_* materials, which crashed cod2rad (overnight-report, Parked).
 
 
-def _material_bytes(template: bytes, name: str, colormap: str) -> bytes:
-    import struct
-
-    strings = [
-        "l_sm_r0c0",
-        name,
-        colormap,
-        "colorMap",
-        "normalMap",
-        "$identitynormalmap",
-        "dynamicFoliageSunDiffuseMinMax",
-    ]
-    blob = bytearray()
-    offs = []
-    for s in strings:
-        offs.append(_MAT_PREFIX_LEN + len(blob))
-        blob += s.encode() + b"\0"
-    out = bytearray(template[:_MAT_PREFIX_LEN])
-    for foff, idx in _MAT_FIELDS.items():
-        struct.pack_into("<I", out, foff, offs[idx])
-    return bytes(out) + bytes(blob)
-
-
-def register_assets(game_dir: Path) -> list[str]:
-    """Write the block materials and colour-map IWIs the PC linker needs, all named
-    ``mp_opent5blocks*``. Returns the game-relative paths created. Refuses to overwrite a file
-    that is not one of ours."""
+def require_stock_assets(game_dir: Path) -> list[str]:
+    """Check every block face's stock material and its colour-map IWI are present in the PC
+    tools. Writes nothing (the materials are stock); returns an empty list."""
     mats = game_dir / "raw" / "materials"
     imgs = game_dir / "raw" / "images"
-    template = (mats / _MAT_TEMPLATE).read_bytes()
-    iwi = (imgs / _IWI_TEMPLATE).read_bytes()
-    created = []
+    missing = []
     for tile in textures.TILE_NAMES:
-        mat_name = mapwriter.material_name(tile)  # mp_opent5blocks_<tile>
-        col_name = mapwriter.colormap_name(tile)  # mp_opent5blocks_<tile>_c
-        if not mat_name.startswith("mp_opent5blocks"):
-            raise SystemExit(f"refusing non-mp_opent5blocks material {mat_name!r}")
-        for path, data in (
-            (mats / mat_name, _material_bytes(template, mat_name, col_name)),
-            (imgs / f"{col_name}.iwi", iwi),
-        ):
-            if path.exists() and not path.name.startswith("mp_opent5blocks"):
-                raise SystemExit(f"{path}: not an mp_opent5blocks file; not overwritten")
-            path.write_bytes(data)
-            created.append(str(path.relative_to(game_dir)))
-    return created
+        if not (mats / mapwriter.material_name(tile)).is_file():
+            missing.append("raw/materials/" + mapwriter.material_name(tile))
+        if not (imgs / f"{mapwriter.colormap_name(tile)}.iwi").is_file():
+            missing.append(f"raw/images/{mapwriter.colormap_name(tile)}.iwi")
+    if missing:
+        raise SystemExit(
+            "PC Mod Tools missing stock blockout assets: " + ", ".join(sorted(set(missing)))
+        )
+    return []
 
 
 #: The headline engine caps this map stays well under, with their evidence. See docs/mapgen.md.
@@ -219,8 +185,8 @@ def cmd_build(args) -> int:
             f"{args.game}: bin\\launcher_ldr.exe (the PC Mod Tools) not found; cannot build. "
             "The textures and .map from `gen` are the offline deliverables."
         )
-    # Register the block materials and colour-map IWIs (new mp_opent5blocks* files only).
-    raw_files = register_assets(game_dir)
+    # Check the stock block materials and their colour-map IWIs are present (nothing written).
+    raw_files = require_stock_assets(game_dir)
     # Write the map into --work, then run testmap's exact three steps via a shimmed write_map.
     work_dir = testmap._wsl(args.work)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -263,6 +229,11 @@ def cmd_convert(args) -> int:
         mapwriter.colormap_name(n): textures.render(n, args.px, args.seed)
         for n in textures.TILE_NAMES
     }
+    # Build every one of the map's materials anew from the PC zone so the overrides land on
+    # all of them (some block materials, e.g. the vinyl-siding and concrete the map borrows,
+    # also exist in Nuketown and would otherwise be reused from the base with its texture).
+    # The map's only materials are the block ones; the shell is caulk, not a material.
+    force = True
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
     result = convert_map(
@@ -271,7 +242,7 @@ def cmd_convert(args) -> int:
         name=args.name,
         lighting=args.lighting,
         image_roots=(),
-        force_materials=True,
+        force_materials=force,
         overrides=overrides,
     )
     target = outdir / f"{result.zone_name}.ff"
