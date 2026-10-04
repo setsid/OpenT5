@@ -29,6 +29,11 @@ The version is bumped to 0.2.0 locally. Review, then push and release yourself.
 | Version | 24257c3 | Bump to 0.2.0 |
 | Diagnosis | 37a9ef6 | fixC radius-trigger and fixD path-node test-map options |
 | Exe | fa6f23a | Index builds serially in the frozen exe; bundle the OpenGL modules |
+| GUI | 5026281 | Polish: structured error dialogs, empty states, Quit shortcut, theme checks |
+| Textures | b11cc90, 5fb995a | Texture-pack workflow: batch-replace a zone's textures from a folder. CLI wired |
+
+Final 0.2.0 exe sha1 3b329952 (opent5-hwtest/OpenT5-0.2.0-preview/); both smoke
+tests pass on it.
 
 ## App features (section 3)
 
@@ -43,6 +48,12 @@ The version is bumped to 0.2.0 locally. Review, then push and release yourself.
 - **Textured viewer** (Shaded/Wireframe toggle, GPU path). The model and world
   viewer draws with the assets' own textures and lighting; the tree shows image
   thumbnails and per-type icons. See "needs you" for the exe caveat.
+- **Texture pack** (`opent5 texpack list/apply`). Batch-replace a zone's textures
+  from a folder of PNGs named after the images (a dry run previews the mapping,
+  and a map file gives exact control). mp_nuked has 1004 replaceable images.
+- **GUI polish.** Error dialogs now show expected, found and the offset in a clear
+  grid; empty states and a first-run view; a complete keyboard list; both themes
+  checked.
 
 ## Test files on your desktop
 
