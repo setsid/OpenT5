@@ -344,6 +344,11 @@ class MapEditController:
         self.angle = 0.0  # rotate snap, degrees (0: off)
         self._drag = None
         self._drag_token = 0
+        #: a prop drag in progress: its axis index, mode, centre and the drag's start param.
+        self._prop_drag: dict | None = None
+        #: live preview of a prop drag, applied only to the drawn highlight until release:
+        #: ``("translate", np.ndarray delta)`` or ``("rotate", float degrees)``, or None.
+        self._prop_preview: tuple | None = None
         #: non-blocking notices from the last clip edit (baked shadow, collision stays).
         self.warnings: list = []
         self._props_cache: list | None = None
@@ -392,6 +397,48 @@ class MapEditController:
         self.warnings = result["warnings"]
         self._props_cache = None
         return result
+
+    def rotate_selected_prop(self, degrees: float) -> dict:
+        """Rotate the selected prop about Z by ``degrees`` (render and clip in step).
+        Records warnings; returns the result dict."""
+        prop = self.selected_prop_obj()
+        if prop is None:
+            self.warnings = []
+            return {"rotated": [], "found": False, "warnings": []}
+        result = self.session.rotate_prop_clip(prop.index, degrees, footprint=prop.footprint)
+        self.warnings = result["warnings"]
+        self._props_cache = None
+        return result
+
+    def add_prop(self, model: str, origin, half_extent) -> dict:
+        """Place a solid crate prop centred at ``origin`` with the given half-extents (render
+        static model + clip). Selects the new prop. Returns the session result dict."""
+        origin = np.asarray(origin, np.float64)
+        half = np.asarray(half_extent, np.float64)
+        result = self.session.add_prop(model, origin - half, origin + half)
+        self.warnings = result["warnings"]
+        self._props_cache = None
+        self.selected_prop = result["prop"]
+        self.selected_id = None
+        return result
+
+    def prop_models(self) -> list[str]:
+        """Distinct model names of the zone's static-model props, for the add palette."""
+        seen: list[str] = []
+        for p in self.props():
+            if p.model and p.model not in seen:
+                seen.append(p.model)
+        return seen
+
+    def default_crate_model(self) -> str | None:
+        """A crate-like model the zone already carries, for the quick add; the first model
+        whose name reads like a box/crate, else the first prop model of all."""
+        models = self.prop_models()
+        for m in models:
+            low = m.lower()
+            if any(k in low for k in ("crate", "cardboardbox", "cargo", "container", "_box")):
+                return m
+        return models[0] if models else None
 
     def delete_selected_prop_clip(self) -> dict:
         prop = self.selected_prop_obj()
@@ -466,18 +513,30 @@ class MapEditController:
             self.selected_id = None
             return None
 
+    def gizmo_centre(self):
+        """World centre the gizmo sits on: the selected prop's origin (shifted by any live
+        translate preview) or the selected entity's origin, else None."""
+        prop = self.selected_prop_obj()
+        if prop is not None:
+            centre = np.asarray(prop.origin, np.float64)
+            if self._prop_preview is not None and self._prop_preview[0] == "translate":
+                centre = centre + self._prop_preview[1]
+            return centre
+        obj = self.selected()
+        return None if obj is None else np.asarray(obj.origin, np.float64)
+
     def axis_handles(self, cam: Camera, w: int, h: int, length_px: float = 60.0):
         """The selected object's gizmo: ``(centre_screen, [(axis_index, (sx, sy), front)])``,
         the three world-axis handle ends sized to about ``length_px`` on screen. Empty when
-        nothing is selected or it is behind the camera."""
+        nothing is selected or it is behind the camera. Works for a selected entity or a
+        selected static-model prop."""
         from opent5.edit import gizmo as gz
 
-        obj = self.selected()
-        if obj is None:
+        centre = self.gizmo_centre()
+        if centre is None:
             return None, []
         eye, right, up, forward = cam.basis()
         f = focal(h)
-        centre = np.asarray(obj.origin, np.float64)
         csx, csy, cdepth, cfront = gz.project_point(centre, eye, right, up, forward, f, w, h)
         if not cfront:
             return None, []
@@ -506,11 +565,13 @@ class MapEditController:
     def begin_drag(self, axis_index: int, cam: Camera, px: float, py: float, w: int, h: int):
         from opent5.edit import gizmo as gz
 
+        eye, d = cursor_ray(cam, px, py, w, h)
+        axis = EDIT_AXES[axis_index]
+        if self.selected_prop is not None:
+            return self._begin_prop_drag(axis_index, axis, eye, d)
         obj = self.selected()
         if obj is None:
             return False
-        eye, d = cursor_ray(cam, px, py, w, h)
-        axis = EDIT_AXES[axis_index]
         centre = np.asarray(obj.origin, np.float64)
         self._drag_token += 1
         if self.mode == "rotate":
@@ -528,15 +589,42 @@ class MapEditController:
             }
         return True
 
+    def _begin_prop_drag(self, axis_index, axis, eye, d) -> bool:
+        from opent5.edit import gizmo as gz
+
+        prop = self.selected_prop_obj()
+        if prop is None:
+            return False
+        centre = np.asarray(prop.origin, np.float64)
+        self._prop_preview = None
+        if self.mode == "rotate":
+            self._prop_drag = {
+                "mode": "rotate",
+                "axis": axis_index,
+                "centre": centre,
+                "hit0": gz.ray_plane(eye, d, centre, axis),
+            }
+        else:
+            self._prop_drag = {
+                "mode": "translate",
+                "axis": axis_index,
+                "start": centre,
+                "s0": gz.axis_param(eye, d, centre, axis),
+            }
+        return True
+
     def update_drag(self, cam: Camera, px: float, py: float, w: int, h: int) -> None:
         from opent5.edit import gizmo as gz
 
+        eye, d = cursor_ray(cam, px, py, w, h)
+        if self._prop_drag is not None:
+            self._update_prop_drag(gz, eye, d)
+            return
         if self._drag is None:
             return
         obj = self.selected()
         if obj is None:
             return
-        eye, d = cursor_ray(cam, px, py, w, h)
         axis_index = self._drag["axis"]
         axis = EDIT_AXES[axis_index]
         if self.mode == "rotate":
@@ -554,12 +642,66 @@ class MapEditController:
             origin = gz.snap_vec(origin, self.grid) if self.grid else origin
             self.session.move_object(obj.id, origin, coalesce=True, group=self._drag_token)
 
+    def _update_prop_drag(self, gz, eye, d) -> None:
+        """A prop drag updates only the live preview; the heavy clip edit lands on release."""
+        drag = self._prop_drag
+        axis = EDIT_AXES[drag["axis"]]
+        if drag["mode"] == "rotate":
+            hit1 = gz.ray_plane(eye, d, drag["centre"], axis)
+            if drag["hit0"] is None or hit1 is None:
+                return
+            deg = math.degrees(gz.rotation_delta(drag["centre"], axis, drag["hit0"], hit1))
+            deg = gz.snap(deg, self.angle) if self.angle else deg
+            self._prop_preview = ("rotate", float(deg))
+        else:
+            s1 = gz.axis_param(eye, d, drag["start"], axis)
+            origin = gz.translate_on_axis(drag["start"], axis, drag["s0"], s1)
+            origin = gz.snap_vec(origin, self.grid) if self.grid else origin
+            self._prop_preview = ("translate", np.asarray(origin, np.float64) - drag["start"])
+
     def end_drag(self) -> None:
+        """Finish a drag. An entity drag already applied live; a prop drag commits its
+        previewed translate or rotate now, as one reversible edit."""
+        if self._prop_drag is not None:
+            preview, self._prop_preview = self._prop_preview, None
+            self._prop_drag = None
+            if preview is None:
+                return
+            if preview[0] == "rotate" and abs(preview[1]) > 1e-6:
+                self.rotate_selected_prop(preview[1])
+            elif preview[0] == "translate" and float(np.linalg.norm(preview[1])) > 1e-6:
+                self.move_selected_prop(tuple(float(v) for v in preview[1]))
+            return
         self._drag = None
 
     @property
     def dragging(self) -> bool:
-        return self._drag is not None
+        return self._drag is not None or self._prop_drag is not None
+
+    @property
+    def previewing(self) -> bool:
+        """True while a prop drag is showing a preview but has not yet committed, so the
+        canvas repaints without a per-move session edit."""
+        return self._prop_drag is not None
+
+    def preview_cluster_boxes(self) -> list:
+        """The selected prop's cluster boxes, transformed by any live drag preview, for the
+        highlight to follow the cursor before the edit commits."""
+        boxes = self.selected_cluster_boxes()
+        if self._prop_preview is None or not boxes:
+            return boxes
+        from opent5.edit import gizmo as gz
+
+        kind, value = self._prop_preview
+        if kind == "translate":
+            d = value
+
+            def shift(v):
+                return (v[0] + d[0], v[1] + d[1], v[2] + d[2])
+
+            return [(shift(mn), shift(mx)) for mn, mx in boxes]
+        centre = [sum(mn[k] + mx[k] for mn, mx in boxes) / (2 * len(boxes)) for k in range(3)]
+        return [gz.rotated_box_aabb_z(mn, mx, centre, value) for mn, mx in boxes]
 
     # structural edits
     def add(self, keys: dict) -> int:
@@ -763,6 +905,8 @@ class MeshCanvas(QWidget):
     selection_changed = Signal(object)
     #: An edit went through the session (move, rotate, add, delete, ...).
     edited = Signal()
+    #: A short message for the status bar (e.g. why an add could not be placed).
+    status = Signal(str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -1031,12 +1175,17 @@ class MeshCanvas(QWidget):
         eye, right, up, forward = self.camera.basis()
         f = focal(self.height())
         for prop in ctl.props():
+            selected = prop.index == ctl.selected_prop
+            origin = prop.origin
+            if selected:
+                centre = ctl.gizmo_centre()  # follows a live translate preview
+                if centre is not None:
+                    origin = centre
             sx, sy, _d, front = gz.project_point(
-                prop.origin, eye, right, up, forward, f, self.width(), self.height()
+                origin, eye, right, up, forward, f, self.width(), self.height()
             )
             if not front:
                 continue
-            selected = prop.index == ctl.selected_prop
             colour = QColor("#c88bd8" if selected else "#7a6f86")
             p.setPen(QPen(QColor(t.text) if selected else colour, 1.5 if selected else 1.0))
             p.setBrush(colour)
@@ -1049,7 +1198,7 @@ class MeshCanvas(QWidget):
         """Highlight the selected prop's clip cluster (the collision a move or delete
         affects) as wireframe boxes, so the user sees exactly what will change."""
         ctl = self.controller
-        boxes = ctl.selected_cluster_boxes() if ctl.selected_prop is not None else []
+        boxes = ctl.preview_cluster_boxes() if ctl.selected_prop is not None else []
         if not boxes:
             return
         from opent5.edit import gizmo as gz
@@ -1116,7 +1265,10 @@ class MeshCanvas(QWidget):
             axis = self.controller.hit_axis(
                 self.camera, e.position().x(), e.position().y(), self.width(), self.height()
             )
-            if axis is not None and self.controller.selected() is not None:
+            has_sel = (
+                self.controller.selected() is not None or self.controller.selected_prop is not None
+            )
+            if axis is not None and has_sel:
                 self.controller.begin_drag(
                     axis, self.camera, e.position().x(), e.position().y(),
                     self.width(), self.height(),
@@ -1137,7 +1289,9 @@ class MeshCanvas(QWidget):
             )
             self._dragging = True
             self.invalidate()
-            self.edited.emit()
+            # a prop drag only previews until release, so no session edit has happened yet.
+            if not self.controller.previewing:
+                self.edited.emit()
             return
         if self._drag is None:
             return
@@ -1282,14 +1436,16 @@ class MeshCanvas(QWidget):
             super().keyPressEvent(e)
 
     def _edit_key(self, e, k) -> bool:
-        """Editing keys: G translate, R rotate, Delete delete, Ctrl+D duplicate, Esc
-        deselect. Returns True when the key was an editing key."""
+        """Editing keys: G translate, R rotate, B add a crate, Delete delete, Ctrl+D
+        duplicate, Esc deselect. Returns True when the key was an editing key."""
         ctl = self.controller
         ctrl = bool(e.modifiers() & Qt.KeyboardModifier.ControlModifier)
         if k == Qt.Key.Key_G:
             ctl.mode = "translate"
         elif k == Qt.Key.Key_R and not ctrl:
             ctl.mode = "rotate"
+        elif k == Qt.Key.Key_B and not ctrl:
+            self._add_crate()
         elif k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and ctl.selected_prop is not None:
             ctl.delete_selected_prop_clip()  # remove the prop's clip cluster (collision)
             ctl.selected_prop = None
@@ -1310,6 +1466,28 @@ class MeshCanvas(QWidget):
             return False
         self.invalidate()
         return True
+
+    def _add_crate(self) -> None:
+        """Place a solid crate prop at the current view target (render static model + clip),
+        then select it. Reports why if the spot cannot take one."""
+        ctl = self.controller
+        if ctl is None or not ctl.can_edit_clips:
+            self.status.emit("This zone has no editable clipMap, so a prop cannot be added.")
+            return
+        model = ctl.default_crate_model()
+        if model is None:
+            self.status.emit("This zone carries no static-model prop to place.")
+            return
+        target = np.asarray(self.camera.target, np.float64)
+        try:
+            result = ctl.add_prop(model, target, (24.0, 24.0, 24.0))
+        except EditError as exc:
+            self.status.emit(f"Could not add a crate here: {exc}")
+            return
+        note = f"  ({result['warnings'][0]})" if result.get("warnings") else ""
+        self.status.emit(f"Added crate {model}{note}")
+        self.selection_changed.emit(None)
+        self.edited.emit()
 
     def keyReleaseEvent(self, e) -> None:
         if not e.isAutoRepeat():
@@ -1601,7 +1779,7 @@ class MeshView(AssetView):
         self.models_button.setVisible(False)
         self.edit_button = self._toggle("Edit", False, self._set_edit)
         self.edit_button.setToolTip(
-            "Edit placed entities, the sun and fog in place; click a marker to select"
+            "Edit placed entities and static-model props in place; click a marker to select"
         )
         self.edit_button.setVisible(False)
         self.mode = QComboBox(bar)
@@ -1626,6 +1804,7 @@ class MeshView(AssetView):
         self.canvas.camera_changed.connect(self._camera_status)
         self.canvas.selection_changed.connect(self._on_pick)
         self.canvas.edited.connect(self._on_edited)
+        self.canvas.status.connect(self.status)
         self.placeholder = empty_state("", self)
         self.stack = QStackedLayout()
         holder = QWidget(self)
@@ -1779,8 +1958,8 @@ class MeshView(AssetView):
             self.panel.set_controller(self._edit_controller, on_save=self._save_edited)
             self.panel.setVisible(True)
             self.status.emit(
-                f"Editing {len(session.markers())} entities. Click a marker; G move, R rotate, "
-                "Delete remove, Ctrl+D duplicate."
+                f"Editing {len(session.markers())} entities. Click a marker or prop; G move, "
+                "R rotate, B add a crate, Delete remove, Ctrl+D duplicate."
             )
         else:
             self.canvas.set_controller(None)

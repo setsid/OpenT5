@@ -14,6 +14,8 @@ game stores it.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 EPS = 1e-9
@@ -125,6 +127,48 @@ def snap_vec(vec, step: float) -> np.ndarray:
 def duplicate_offset(origin, offset) -> np.ndarray:
     """Origin of a duplicate: the source origin shifted by ``offset``."""
     return np.asarray(origin, np.float64) + np.asarray(offset, np.float64)
+
+
+# -- prop rotation about Z (clip footprint and render axes) -----------------------------------
+
+
+def yaw_matrix(degrees: float) -> np.ndarray:
+    """Rotation about world Z (yaw) by ``degrees``, as a 3x3 applied to a column vector
+    on the right (``v @ R`` rotates row vectors the same way the render's axis rows do)."""
+    a = math.radians(float(degrees))
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]], np.float64)
+
+
+def is_axial_turn(degrees: float, tol: float = 0.5) -> bool:
+    """Whether ``degrees`` is (within ``tol``) a multiple of 90, so an axis-aligned box
+    rotated by it is still an exact axis-aligned box. A non-axial angle cannot be
+    represented by an axial clip, so the editor keeps the clip as the rotated bounding box
+    and says so."""
+    r = abs(float(degrees)) % 90.0
+    return r <= tol or r >= 90.0 - tol
+
+
+def rotated_box_aabb_z(mins, maxs, centre, degrees: float) -> tuple[tuple, tuple]:
+    """The axis-aligned bounding box of ``(mins, maxs)`` after rotating it about the world
+    Z axis through ``centre`` by ``degrees``. For a quarter turn this is the box with its X
+    and Y extents swapped (lossless); for any other angle it is the enclosing axis-aligned
+    box (an over-approximation, since an axial clip cannot slant). Z is unchanged."""
+    mins = [float(v) for v in mins]
+    maxs = [float(v) for v in maxs]
+    cx, cy = float(centre[0]), float(centre[1])
+    a = math.radians(float(degrees))
+    c, s = math.cos(a), math.sin(a)
+    xs, ys = [], []
+    for x in (mins[0], maxs[0]):
+        for y in (mins[1], maxs[1]):
+            dx, dy = x - cx, y - cy
+            xs.append(cx + dx * c - dy * s)
+            ys.append(cy + dx * s + dy * c)
+    return (
+        (min(xs), min(ys), mins[2]),
+        (max(xs), max(ys), maxs[2]),
+    )
 
 
 def project_point(point, eye, right, up, forward, focal: float, w: int, h: int):
