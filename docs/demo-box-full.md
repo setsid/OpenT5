@@ -214,3 +214,16 @@ Device test:
 - Issue 1: the props have no collision, the player walks through them.
 - Issue 2: the wall texture's text reads mirrored on one wall (a UV or tangent
   flip on those faces).
+
+## Result in RPCS3 (k_box_fixC, local Search and Destroy)
+
+- Objectives now appear: the bomb model, both site models, and DEFEND/TARGET A/B
+  icons on the HUD and minimap. Walking over the bomb picks it up (stock behaviour).
+- Root cause of C confirmed: with radius triggers the objectives appear, so the
+  original problem was the brush-model ("*N") triggers not spawning on PS3.
+- Problem 1: no plant prompt at either site. Radius triggers are not use triggers;
+  sd.gsc bombzones need trigger_use_touch brush entities with a hintstring, as on
+  stock maps. Fix: replicate the stock S&D bombzone entity setup from a real zone
+  (mp_nuked's own entity string) and make those brush-model triggers spawn.
+- Problem 2: the bomb-site models and all static props have no collision (same as
+  k_box_full). Fix: carry stock-style xmodel prop collision through the converter.
