@@ -81,6 +81,7 @@ def convert_map(
     shared_zones=None,
     force_materials: frozenset[str] | bool = frozenset(),
     overrides: dict | None = None,
+    compass_image=None,
 ) -> ConvertResult:
     """Convert. ``pc_fastfile``: the PC ``.ff`` bytes (``IWffu100``); ``base_path``: the
     stock PS3 map zone whose world is replaced. ``lighting``: "baked" (the PC map's own
@@ -390,7 +391,7 @@ def convert_map(
         else:
             label = own if renamed else base_name
             compass_node, compass_rgba, report["compass"] = compass.add_to_zone(
-                bx, stock_cpg, label, base_name, pgfx, nw, se
+                bx, stock_cpg, label, base_name, pgfx, nw, se, override_rgba=compass_image
             )
             if renamed:
                 report["compass"]["script"] = _point_script_at(
