@@ -4,7 +4,7 @@
 APP_NAME = "OpenT5"
 #: The author credit. Every "by ..." mention reads it from here.
 APP_AUTHOR = "setsid"
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 #: Shown by --version and the About box, as the GPL asks.
 LICENCE_NOTICE = (
