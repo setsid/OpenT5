@@ -4,6 +4,7 @@ drags, and add / delete / duplicate. No GPU; the interactive gizmo feel is a dev
 
 from __future__ import annotations
 
+import math
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -228,10 +229,20 @@ def test_prop_selection_shows_cluster_and_delete_removes_it():
     session = EditSession(Document.open(path.read_bytes(), name="mp_nuked.ff"))
     ctl = mv.MapEditController(session)
     bus = next(p for p in ctl.props() if p.model == "t5_veh_schoolbus")
+    # frame the bus from a side the moving truck beside it does not occlude, and click where
+    # its centre projects: a ray into the bus's world bounds selects the prop, not an entity.
+    from opent5.edit import gizmo as gz
+
+    centre = np.array([(bus.absmin[k] + bus.absmax[k]) / 2 for k in range(3)], float)
     cam = mv.Camera()
-    _aim(cam, bus.origin)
-    # the bus marker under the cursor selects the prop (not an entity)
-    picked = ctl.pick(cam, 320, 240, 640, 480)
+    cam.target = centre
+    cam.distance = 500.0
+    cam.yaw = math.radians(180.0)
+    cam.pitch = math.radians(40.0)
+    eye, right, up, forward = cam.basis()
+    sx, sy, _d, front = gz.project_point(centre, eye, right, up, forward, mv.focal(480), 640, 480)
+    assert front
+    picked = ctl.pick(cam, sx, sy, 640, 480)
     assert picked is None and ctl.selected_prop == bus.index
     cluster = ctl.selected_cluster()
     assert cluster and ctl.selected_cluster_boxes()  # highlighted before any edit
@@ -258,10 +269,21 @@ def _nuked_controller():
 
 
 def _pick_prop(ctl, model="t5_veh_schoolbus"):
+    from opent5.edit import gizmo as gz
+
     prop = next((p for p in ctl.props() if p.model == model), None) or ctl.props()[0]
+    # frame from a side not occluded by a neighbouring prop and click the bounds centre, so
+    # the ray enters this prop's world bounds (the picker is bounds-level).
+    centre = np.array([(prop.absmin[k] + prop.absmax[k]) / 2 for k in range(3)], float)
     cam = mv.Camera()
-    _aim(cam, prop.origin)
-    ctl.pick(cam, 320, 240, 640, 480)
+    cam.target = centre
+    cam.distance = 500.0
+    cam.yaw = math.radians(180.0)
+    cam.pitch = math.radians(40.0)
+    eye, right, up, forward = cam.basis()
+    sx, sy, _d, front = gz.project_point(centre, eye, right, up, forward, mv.focal(480), 640, 480)
+    if front:
+        ctl.pick(cam, sx, sy, 640, 480)
     if ctl.selected_prop != prop.index:
         pytest.skip("the prop did not pick under the cursor on this build")
     return prop, cam

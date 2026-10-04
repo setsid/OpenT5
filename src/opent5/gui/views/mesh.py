@@ -21,7 +21,7 @@ import time
 
 import numpy as np
 from PySide6.QtCore import QObject, QPointF, QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen
+from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -317,6 +317,33 @@ def ray_mesh_hit(origin, direction, points, triangles):
     return o + d * float(t[nearest])
 
 
+def ray_aabb_distance(origin, direction, mins, maxs):
+    """Distance along the ray (unit ``direction``) to where it first enters the world-space
+    box ``(mins, maxs)``, or ``None`` when it misses. Zero when the eye is inside the box.
+    The slab method; used to pick a static-model prop by its world bounds, the same bounds
+    the renderer places and draws each instance within."""
+    o = np.asarray(origin, np.float64)
+    d = np.asarray(direction, np.float64)
+    lo = np.asarray(mins, np.float64)
+    hi = np.asarray(maxs, np.float64)
+    tmin, tmax = 0.0, np.inf
+    for k in range(3):
+        if abs(d[k]) < 1e-12:  # ray parallel to this slab: must start between its planes
+            if o[k] < lo[k] or o[k] > hi[k]:
+                return None
+            continue
+        inv = 1.0 / d[k]
+        t1 = (lo[k] - o[k]) * inv
+        t2 = (hi[k] - o[k]) * inv
+        if t1 > t2:
+            t1, t2 = t2, t1
+        tmin = max(tmin, t1)
+        tmax = min(tmax, t2)
+        if tmin > tmax:
+            return None
+    return float(tmin)
+
+
 # -- in-place editing (v0.3.0) ---------------------------------------------------------------
 
 #: World axes a translate or rotate drag is constrained to.
@@ -341,11 +368,24 @@ class MapEditController:
     pure functions in ``opent5.edit.gizmo``; this holds the per-drag state and the selection,
     so it can be exercised without a GPU."""
 
+    #: pick filter values: everything, static-model props only, or placed entities only.
+    PICK_ALL = "all"
+    PICK_PROPS = "props"
+    PICK_ENTITIES = "entities"
+
     def __init__(self, session):
         self.session = session
         self.selected_id: int | None = None
         #: index of the selected static-model prop (clipMap staticModelList), or None.
         self.selected_prop: int | None = None
+        #: what a click selects, and which markers the view draws: PICK_ALL / PICK_PROPS /
+        #: PICK_ENTITIES. Defaults to everything; the view switches it to PICK_PROPS when Edit
+        #: turns on, so the map is not buried under its hundreds of entity dots and the props
+        #: are reachable.
+        self.pick_filter = self.PICK_ALL
+        #: whether the static models are drawn; props pick only when they are (you cannot
+        #: click a prop that is not on screen). Set by the view from its Static models toggle.
+        self.props_shown = True
         self.mode = "translate"  # or "rotate"
         self.grid = 0.0  # translate snap, world units (0: off)
         self.angle = 0.0  # rotate snap, degrees (0: off)
@@ -488,26 +528,69 @@ class MapEditController:
             depths.append(depth if front else np.inf)
         return idxs, np.array(pts, np.float64).reshape(-1, 2), np.array(depths, np.float64)
 
+    @property
+    def props_pickable(self) -> bool:
+        """Props can be picked only when the filter allows them, they are drawn, and the
+        zone carries an editable clipMap with static models."""
+        return (
+            self.pick_filter in (self.PICK_ALL, self.PICK_PROPS)
+            and self.props_shown
+            and self.can_edit_clips
+        )
+
+    @property
+    def entities_pickable(self) -> bool:
+        return self.pick_filter in (self.PICK_ALL, self.PICK_ENTITIES)
+
+    def pick_prop_ray(self, cam: Camera, px: float, py: float, w: int, h: int):
+        """Nearest static-model prop the cursor ray enters, as ``(prop_index, distance)``, or
+        ``(None, inf)``. The ray is tested against each prop's world-space bounds (the
+        clipMap cStaticModel absmin/absmax, the same bounds the renderer places and draws the
+        instance within), so a click lands on the model's body, not on a screen point at its
+        origin. Bounds level only: the per-instance triangles are not cleanly available in
+        this transform here, so a prop is a box to the picker."""
+        eye, d = cursor_ray(cam, px, py, w, h)
+        best_i, best_t = None, np.inf
+        for p in self.props():
+            t = ray_aabb_distance(eye, d, p.absmin, p.absmax)
+            if t is not None and t < best_t:
+                best_i, best_t = p.index, t
+        return best_i, best_t
+
     def pick(self, cam: Camera, px: float, py: float, w: int, h: int, radius: float = 12.0):
-        """Select the nearest marker under the cursor, entity or static-model prop.
-        Picking a prop sets ``selected_prop`` (and clears the entity selection), so the
-        editor can show and move its clip cluster; picking an entity does the reverse."""
+        """Select what the cursor is over, honouring the pick filter. A prop is hit by ray
+        against its world bounds; an entity marker by screen proximity. When both are under
+        the cursor the one nearer the camera wins (compared by world-space distance from the
+        eye, not screen distance). Picking a prop sets ``selected_prop`` and clears the entity
+        selection; picking an entity does the reverse."""
         from opent5.edit import gizmo as gz
 
-        ids, pts, depths = self.marker_screen(cam, w, h)
-        ent_i = gz.nearest_marker(pts, (px, py), radius, depths) if ids else None
-        pids, ppts, pdepths = self.prop_screen(cam, w, h)
-        prop_i = gz.nearest_marker(ppts, (px, py), radius, pdepths) if pids else None
-        ent_d = depths[ent_i] if ent_i is not None else np.inf
-        prop_d = pdepths[prop_i] if prop_i is not None else np.inf
         self.warnings = []
-        if prop_i is not None and prop_d <= ent_d:
-            self.selected_prop = pids[prop_i]
+        eye, _d = cursor_ray(cam, px, py, w, h)
+        prop_i, prop_t = (None, np.inf)
+        if self.props_pickable:
+            prop_i, prop_t = self.pick_prop_ray(cam, px, py, w, h)
+        ent_id, ent_dist = None, np.inf
+        if self.entities_pickable:
+            ids, pts, depths = self.marker_screen(cam, w, h)
+            ent_i = gz.nearest_marker(pts, (px, py), radius, depths) if ids else None
+            if ent_i is not None:
+                ent_id = ids[ent_i]
+                origin = np.asarray(self._object_origin(ent_id), np.float64)
+                ent_dist = float(np.linalg.norm(origin - eye))
+        if prop_i is not None and prop_t <= ent_dist:
+            self.selected_prop = prop_i
             self.selected_id = None
             return None
         self.selected_prop = None
-        self.selected_id = None if ent_i is None else ids[ent_i]
+        self.selected_id = ent_id
         return self.selected_id
+
+    def _object_origin(self, obj_id):
+        for o in self.markers():
+            if o.id == obj_id:
+                return o.origin
+        return (0.0, 0.0, 0.0)
 
     def selected(self):
         if self.selected_id is None:
@@ -1161,25 +1244,29 @@ class MeshCanvas(QWidget):
         ctl = self.controller
         t = theme.current()
         w, h = self.width(), self.height()
-        ids, pts, _depths = ctl.marker_screen(self.camera, w, h)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        for obj in ctl.markers():
-            try:
-                i = ids.index(obj.id)
-            except ValueError:
-                continue
-            sx, sy = pts[i]
-            if np.isnan(sx):
-                continue
-            selected = obj.id == ctl.selected_id
-            colour = QColor(MARKER_KINDS.get(obj.kind, t.text))
-            r = 5 if selected else 3
-            if selected:
-                p.setPen(QPen(QColor(t.text), 1.5))
-            else:
-                p.setPen(QPen(colour, 1.0))
-            p.setBrush(colour)
-            p.drawRect(int(sx - r), int(sy - r), 2 * r, 2 * r)
+        # Entity markers (spawns, triggers, path-relevant entities) are hundreds of dots on a
+        # real map, so draw them only when the pick filter includes entities; the default
+        # Props filter hides them so the props are visible and reachable.
+        if ctl.entities_pickable:
+            ids, pts, _depths = ctl.marker_screen(self.camera, w, h)
+            for obj in ctl.markers():
+                try:
+                    i = ids.index(obj.id)
+                except ValueError:
+                    continue
+                sx, sy = pts[i]
+                if np.isnan(sx):
+                    continue
+                selected = obj.id == ctl.selected_id
+                colour = QColor(MARKER_KINDS.get(obj.kind, t.text))
+                r = 5 if selected else 3
+                if selected:
+                    p.setPen(QPen(QColor(t.text), 1.5))
+                else:
+                    p.setPen(QPen(colour, 1.0))
+                p.setBrush(colour)
+                p.drawRect(int(sx - r), int(sy - r), 2 * r, 2 * r)
         self._paint_prop_markers(p)
         self._paint_cluster(p)
         self._paint_gizmo_handles(p)
@@ -1188,7 +1275,9 @@ class MeshCanvas(QWidget):
     def _paint_prop_markers(self, p: QPainter) -> None:
         """Static-model props as small diamonds; the selected one brighter."""
         ctl = self.controller
-        if not ctl.can_edit_clips:
+        # Props are drawn (and clickable) only when the filter includes them and they are on
+        # screen; the selected prop is always drawn so it stays visible under any filter.
+        if not ctl.props_pickable and ctl.selected_prop is None:
             return
         t = theme.current()
         from opent5.edit import gizmo as gz
@@ -1197,6 +1286,8 @@ class MeshCanvas(QWidget):
         f = focal(self.height())
         for prop in ctl.props():
             selected = prop.index == ctl.selected_prop
+            if not selected and not ctl.props_pickable:
+                continue
             origin = prop.origin
             if selected:
                 centre = ctl.gizmo_centre()  # follows a live translate preview
@@ -1207,12 +1298,23 @@ class MeshCanvas(QWidget):
             )
             if not front:
                 continue
-            colour = QColor("#c88bd8" if selected else "#7a6f86")
-            p.setPen(QPen(QColor(t.text) if selected else colour, 1.5 if selected else 1.0))
+            # props stand out from the entity dots: a brighter, larger diamond, not a square.
+            colour = QColor("#c88bd8" if selected else "#8e7fa0")
+            p.setPen(QPen(QColor(t.text) if selected else colour, 1.5 if selected else 1.2))
             p.setBrush(colour)
-            r = 5 if selected else 3
+            r = 6 if selected else 4
+            # QPainter.drawPolygon takes a single QPolygonF, not loose points: passing four
+            # QPointF args raises inside paintEvent, which unwinds through Qt's C++ paint
+            # callback and crashes the windowed app on the first repaint with props drawn.
             p.drawPolygon(
-                QPointF(sx, sy - r), QPointF(sx + r, sy), QPointF(sx, sy + r), QPointF(sx - r, sy)
+                QPolygonF(
+                    [
+                        QPointF(sx, sy - r),
+                        QPointF(sx + r, sy),
+                        QPointF(sx, sy + r),
+                        QPointF(sx - r, sy),
+                    ]
+                )
             )
 
     def _paint_cluster(self, p: QPainter) -> None:
@@ -1552,6 +1654,18 @@ class MapEditPanel(QWidget):
         how.setWordWrap(True)
         root.addWidget(how)
 
+        filter_row = QHBoxLayout()
+        self.pick_filter = QComboBox(self)
+        self.pick_filter.addItems(["Props", "Entities", "All"])
+        self.pick_filter.setToolTip(
+            "What a click selects, and which markers are shown. Props hides the entity dots so "
+            "the models are reachable."
+        )
+        self.pick_filter.currentIndexChanged.connect(self._set_pick_filter)
+        filter_row.addWidget(QLabel("Pick"))
+        filter_row.addWidget(self.pick_filter, 1)
+        root.addLayout(filter_row)
+
         mode_row = QHBoxLayout()
         self.mode = QComboBox(self)
         self.mode.addItems(["Translate (G)", "Rotate (R)"])
@@ -1645,6 +1759,30 @@ class MapEditPanel(QWidget):
         if self.controller is not None:
             self.controller.mode = "rotate" if index == 1 else "translate"
 
+    #: combo index -> controller pick-filter value.
+    _PICK_VALUES = (MapEditController.PICK_PROPS, MapEditController.PICK_ENTITIES,
+                    MapEditController.PICK_ALL)  # fmt: skip
+
+    def set_pick_filter(self, value: str) -> None:
+        """Reflect the controller's pick filter in the combo without re-firing the change."""
+        index = self._PICK_VALUES.index(value) if value in self._PICK_VALUES else 0
+        self.pick_filter.blockSignals(True)
+        self.pick_filter.setCurrentIndex(index)
+        self.pick_filter.blockSignals(False)
+
+    def _set_pick_filter(self, index: int) -> None:
+        if self.controller is None:
+            return
+        self.controller.pick_filter = self._PICK_VALUES[index]
+        # a selection the new filter excludes is dropped, so the gizmo does not hang on a
+        # hidden object, then the view redraws with the right markers.
+        if self.controller.pick_filter == MapEditController.PICK_PROPS:
+            self.controller.selected_id = None
+        elif self.controller.pick_filter == MapEditController.PICK_ENTITIES:
+            self.controller.selected_prop = None
+        self.show_object(self.controller.selected_id)
+        self.changed.emit()
+
     def _set_snap(self) -> None:
         if self.controller is None:
             return
@@ -1670,15 +1808,15 @@ class MapEditPanel(QWidget):
             cluster = self.controller.selected_cluster()
             self.dup_button.setEnabled(False)
             self.del_button.setEnabled(bool(cluster))
-            name = prop.model or f"static model {prop.index}"
+            name = prop.model or "(unnamed static model)"
             if cluster:
                 self.selected_label.setText(
-                    f"prop: {name}  ({len(cluster)} clip brush(es); Delete removes them, "
-                    "shown highlighted)"
+                    f"prop: {name}\nindex {prop.index}, {len(cluster)} clip brush(es) "
+                    "(Delete removes them, shown highlighted)"
                 )
             else:
                 self.selected_label.setText(
-                    f"prop: {name}  (no clip collision found at its footprint)"
+                    f"prop: {name}\nindex {prop.index}, no clip collision at its footprint"
                 )
             return
         obj = None
@@ -1844,6 +1982,9 @@ class MeshView(AssetView):
 
         self._session = None
         self._edit_controller = None
+        #: set while Edit is being turned on but the static models still need loading; _done
+        #: re-enters Edit once the world_models mesh is ready.
+        self._edit_after_models = False
         self.panel = MapEditPanel(self)
         self.panel.changed.connect(self._on_panel_changed)
         self.panel.status.connect(self.status)
@@ -1977,6 +2118,13 @@ class MeshView(AssetView):
             self.status.emit("This zone cannot be edited in place (needs the edit backend).")
             return
         if on:
+            # Props are only pickable when drawn, so bring the static models on with Edit.
+            # The toggle reloads the mesh (world -> world_models) off the GUI thread, so defer
+            # entering Edit until that mesh is ready (handled in _done).
+            if self.models_button.isVisible() and not self.models_button.isChecked():
+                self._edit_after_models = True
+                self.models_button.setChecked(True)
+                return
             session = self._ensure_session()
             if session is None:
                 self.edit_button.blockSignals(True)
@@ -1984,12 +2132,18 @@ class MeshView(AssetView):
                 self.edit_button.blockSignals(False)
                 return
             self._edit_controller = MapEditController(session)
+            self._edit_controller.props_shown = self.models_button.isChecked()
+            # start on Props so the view is not buried under the entity dots; the panel's Pick
+            # control switches to Entities or All.
+            self._edit_controller.pick_filter = MapEditController.PICK_PROPS
             self.canvas.set_controller(self._edit_controller)
             self.panel.set_controller(self._edit_controller, on_save=self._save_edited)
+            self.panel.set_pick_filter(MapEditController.PICK_PROPS)
             self.panel.setVisible(True)
             self.status.emit(
-                f"Editing {len(session.markers())} entities. Click a marker or prop; G move, "
-                "R rotate, B add a crate, Delete remove, Ctrl+D duplicate."
+                f"Editing: {len(session.static_models())} props, {len(session.markers())} "
+                "entities. Click a prop; G move, R rotate, B add a crate, Delete remove. "
+                "Use Pick to show entities."
             )
         else:
             self.canvas.set_controller(None)
@@ -2121,6 +2275,12 @@ class MeshView(AssetView):
         self.canvas.reset_camera()
         if self.shaded_button.isChecked() and not self._sync:
             self._build_scene()
+        if self._edit_after_models:
+            # Edit was requested before the static models were loaded; now that they are,
+            # turn Edit on (static models are drawn, so props are pickable).
+            self._edit_after_models = False
+            if self._can_edit() and not self.edit_button.isChecked():
+                self.edit_button.setChecked(True)  # fires _set_edit(True), models now on
 
     def _failed(self, generation: int, message: str) -> None:
         if generation != self._generation:
