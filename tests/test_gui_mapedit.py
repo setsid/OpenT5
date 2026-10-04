@@ -209,3 +209,35 @@ def test_view_save_refused_reports(tmp_path):
     view._save_edited(out)
     assert not out.exists()
     assert any("tdm" in m for m in messages)
+
+
+# -- clip collision in the editor (needs a real clipMap) --------------------------------------
+
+
+import pytest  # noqa: E402
+
+from test_propclip import find_zone  # noqa: E402
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_prop_selection_shows_cluster_and_delete_removes_it():
+    path = find_zone("mp_nuked")
+    if path is None:
+        pytest.skip("mp_nuked.ff is not on this machine")
+    session = EditSession(Document.open(path.read_bytes(), name="mp_nuked.ff"))
+    ctl = mv.MapEditController(session)
+    bus = next(p for p in ctl.props() if p.model == "t5_veh_schoolbus")
+    cam = mv.Camera()
+    _aim(cam, bus.origin)
+    # the bus marker under the cursor selects the prop (not an entity)
+    picked = ctl.pick(cam, 320, 240, 640, 480)
+    assert picked is None and ctl.selected_prop == bus.index
+    cluster = ctl.selected_cluster()
+    assert cluster and ctl.selected_cluster_boxes()  # highlighted before any edit
+    # deleting the prop removes its clip cluster and warns about the baked shadow
+    result = ctl.delete_selected_prop_clip()
+    assert result["found"] and sorted(result["removed"]) == sorted(cluster)
+    assert any("baked lightmap shadow" in w for w in ctl.warnings)
+    session.undo()
+    assert not session.can_undo  # the clip delete was the only edit, now undone

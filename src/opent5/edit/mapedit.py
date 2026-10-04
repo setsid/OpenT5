@@ -20,16 +20,20 @@ rewrites it in the canonical ``"key" "value"`` form, which still reparses exactl
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from opent5.convert import entities as ent
+from opent5.convert import propclip as pc
 from opent5.convert.scripts import entity_text, parse_entities
 from opent5.edit.document import Document
 from opent5.edit.types import AssetKey, EditError, SaveReport
 from opent5.xfile.constants import AssetType as T
+from opent5.xfile.schema import view
 
 #: Default world axes to offset a duplicate along, and the default nudge.
 DUPLICATE_OFFSET = (64.0, 0.0, 0.0)
@@ -37,6 +41,22 @@ DUPLICATE_OFFSET = (64.0, 0.0, 0.0)
 #: Classname fragments used to label a marker in the 3D view.
 _SPAWN = "_spawn"
 _LIGHT_CLASSES = frozenset({"light", "corona", "light_environment"})
+
+#: Shown when a prop's footprint holds no clip cluster to move or remove.
+_COLLISION_STAYS = (
+    "No clip collision was found at this prop's footprint, so its collision is left as "
+    "it is. Nothing was moved or removed."
+)
+
+
+def _baked_shadow_notice(action: str) -> str:
+    """The baked-lightmap warning for moving or deleting a stock prop. The editor cannot
+    relight the map, so a prop's baked shadow stays where it was baked."""
+    return (
+        f"{action} this prop leaves its baked lightmap shadow at the old position. The "
+        "editor does not relight the map, so the shadow moves only with a full relight, "
+        "which is not available here."
+    )
 
 
 def _vec_str(vec) -> str:
@@ -49,6 +69,23 @@ def _parse_vec(text: str | None, default=(0.0, 0.0, 0.0)) -> tuple[float, float,
     except ValueError:
         return tuple(float(v) for v in default)  # type: ignore[return-value]
     return (x, y, z)
+
+
+@dataclass
+class StaticModelProp:
+    """A static-model prop read from the clipMap's ``staticModelList``: its index, the
+    model name, world origin and the baked collision footprint (absmin, absmax). The
+    editor finds a prop's clip cluster under this footprint."""
+
+    index: int
+    model: str | None
+    origin: tuple[float, float, float]
+    absmin: tuple[float, float, float]
+    absmax: tuple[float, float, float]
+
+    @property
+    def footprint(self) -> tuple[tuple, tuple]:
+        return (self.absmin, self.absmax)
 
 
 @dataclass
@@ -236,6 +273,30 @@ class SetFog(_SunFog):
     label: str = "set fog"
 
 
+@dataclass
+class ClipEdit(Edit):
+    """A reversible clip-collision edit. The clipMap node is mutated in place by
+    ``opent5.convert.propclip`` through the document's Rewrite, so the edit holds a
+    full snapshot of the clip node (and the engine's append bookkeeping) before and
+    after, plus the prop->clip association either side. ``apply`` and ``revert``
+    assign the snapshots back, restoring the clipMap exactly."""
+
+    before: dict
+    after: dict
+    assoc_before: dict
+    assoc_after: dict
+    label: str = "clip"
+    merge_key: tuple | None = None
+
+    def apply(self, session: EditSession) -> None:
+        session._restore_clip(self.after)
+        session._prop_clips = {k: list(v) for k, v in self.assoc_after.items()}
+
+    def revert(self, session: EditSession) -> None:
+        session._restore_clip(self.before)
+        session._prop_clips = {k: list(v) for k, v in self.assoc_before.items()}
+
+
 # -- the session -----------------------------------------------------------------------------
 
 
@@ -266,14 +327,19 @@ class EditSession:
     def _locate(self) -> None:
         self._ent_key: AssetKey | None = None
         self._clip_node: dict | None = None
+        self._clip_index: AssetKey | None = None
         self._gfx_index: int | None = None
         self._gfx_node: dict | None = None
         for a in self.doc.assets:
-            if a.type in (T.COL_MAP_MP, T.COL_MAP_SP) and self._ent_key is None:
+            if a.type in (T.COL_MAP_MP, T.COL_MAP_SP):
                 node = self.doc.xfile.assets[a.index].data
-                if isinstance(node, dict) and isinstance(node.get("map_ents"), dict):
-                    self._ent_key = a.index
+                if isinstance(node, dict) and self._clip_node is None:
+                    # the clipMap carries the collision (brushes, leaves, BSP) the clip
+                    # editor edits, and often the entity string too.
                     self._clip_node = node
+                    self._clip_index = a.index
+                    if self._ent_key is None and isinstance(node.get("map_ents"), dict):
+                        self._ent_key = a.index
             elif a.type == T.MAP_ENTS and self._ent_key is None:
                 self._ent_key = a.index
             elif a.type == T.GFX_MAP and self._gfx_index is None:
@@ -289,6 +355,10 @@ class EditSession:
         self._orig_text = text
 
     def _load_model(self) -> None:
+        #: (ClipMap, BspLocator) once built, (None, None) when the zone has none; None at first.
+        self._clip: tuple | None = None
+        #: prop key -> the clip brush indices the editor manages for it (editor-added or moved).
+        self._prop_clips: dict[Any, list[int]] = {}
         self._objects: list[MapObject] = []
         for keys in parse_entities(self._orig_text):
             self._objects.append(MapObject(self._next_id, dict(keys)))
@@ -458,6 +528,187 @@ class EditSession:
         if not changes:
             return
         self._apply(SetFog(changes))
+
+    # -- editing: static-model prop collision (clip cbrushes) --------------------------------
+
+    #: node keys the clip operations rewrite; snapshotted for exact undo.
+    _CLIP_KEYS = ("header", "brushes", "leafs", "leafbrushes", "brush_verts")
+
+    def _clip_engine(self) -> tuple | None:
+        """``(ClipMap, BspLocator)`` for this zone's clipMap, or ``None`` when the zone
+        carries no clipMap with a cNode BSP (a synthetic or entity-only zone). Built
+        once and cached."""
+        if self._clip is not None:
+            return self._clip if self._clip[0] is not None else None
+        if self._clip_node is None:
+            self._clip = (None, None)
+            return None
+        try:
+            cm = pc.ClipMap(self._clip_node, rewrite=self.doc._rw)
+            loc = pc.BspLocator.from_xfile(self.doc.xfile, self._clip_node)
+        except pc.ClipError:
+            self._clip = (None, None)
+            return None
+        self._clip = (cm, loc)
+        return self._clip
+
+    @property
+    def can_edit_clips(self) -> bool:
+        return self._clip_engine() is not None
+
+    def static_models(self) -> list[StaticModelProp]:
+        """The clipMap's static-model props, each with its collision footprint. Empty
+        when the zone has no clipMap static models."""
+        if self._clip_node is None or self._clip_node.get("static_model_list") is None:
+            return []
+        out: list[StaticModelProp] = []
+        v = view(self._clip_node)
+        for i, s in enumerate(v.array("static_model_list")):
+            target = self.doc.xfile.resolve(int(s["xmodel"]))
+            name = target.asset.get("name") if target and target.asset else None
+            out.append(
+                StaticModelProp(
+                    i,
+                    name,
+                    tuple(float(x) for x in s["origin"]),
+                    tuple(float(x) for x in s["absmin"]),
+                    tuple(float(x) for x in s["absmax"]),
+                )
+            )
+        return out
+
+    def clip_cluster_in_footprint(self, mins, maxs) -> list[int]:
+        """The clip brushes under a footprint (within it), as the editor shows and moves
+        for a prop. Empty when the zone has no clipMap or no clip sits there."""
+        engine = self._clip_engine()
+        if engine is None:
+            return []
+        cm, _ = engine
+        return pc.clips_in_footprint(cm, tuple(mins), tuple(maxs), within=True)
+
+    def cluster_boxes(self, brush_indices) -> list[tuple[tuple, tuple]]:
+        """The (mins, maxs) box of each clip brush in a cluster, for highlighting the
+        collision a move or delete will affect."""
+        engine = self._clip_engine()
+        if engine is None:
+            return []
+        cm, _ = engine
+        out = []
+        for i in brush_indices:
+            if 0 <= i < cm.num_brushes:
+                b = cm.brush(i)
+                out.append((b.mins, b.maxs))
+        return out
+
+    def managed_cluster(self, key) -> list[int]:
+        return list(self._prop_clips.get(key, []))
+
+    def _cluster_for(self, key, footprint) -> list[int]:
+        """The clip cluster for a prop: the one the editor manages for it, else the stock
+        cluster under its footprint."""
+        if key in self._prop_clips:
+            return list(self._prop_clips[key])
+        if footprint is None:
+            return []
+        return self.clip_cluster_in_footprint(footprint[0], footprint[1])
+
+    def add_prop_clip(self, key, mins, maxs) -> int:
+        """Add a solid clip sized to a newly placed prop's footprint (the contiguous BSP
+        path, so a trace hits it) and associate it with the prop. Reversible."""
+        new = self._commit_clip(
+            lambda cm, loc: pc.add_clip_bsp(cm, loc, tuple(mins), tuple(maxs)),
+            lambda idx: self._prop_clips.__setitem__(key, [idx]),
+            "add prop clip",
+        )
+        return new
+
+    def move_prop_clip(self, key, delta, footprint=None) -> dict:
+        """Move the prop's existing clip cluster by ``delta`` (the whole cluster moves,
+        so the old spot is left clear and ``numBrushes`` is unchanged). Finds the managed
+        cluster, else the stock cluster under ``footprint``. Returns the moved brush
+        indices and any warnings; when no cluster is found it moves nothing and reports
+        that the collision stays."""
+        cluster = self._cluster_for(key, footprint)
+        if not cluster:
+            return {"moved": [], "found": False, "warnings": [_COLLISION_STAYS]}
+        warnings = [] if key in self._prop_clips else [_baked_shadow_notice("Moving")]
+        d = tuple(float(v) for v in delta)
+        self._commit_clip(
+            lambda cm, loc: pc.move_cluster_bsp(cm, loc, cluster, d),
+            lambda _r: self._prop_clips.__setitem__(key, list(cluster)),
+            "move prop clip",
+        )
+        return {"moved": list(cluster), "found": True, "warnings": warnings}
+
+    def remove_prop_clip(self, key, footprint=None) -> dict:
+        """Remove (soft-disable) the prop's existing clip cluster. Finds the managed
+        cluster, else the stock cluster under ``footprint``. Returns the removed brush
+        indices and any warnings; when none is found it removes nothing and reports that
+        the collision stays."""
+        cluster = self._cluster_for(key, footprint)
+        if not cluster:
+            return {"removed": [], "found": False, "warnings": [_COLLISION_STAYS]}
+        warnings = [] if key in self._prop_clips else [_baked_shadow_notice("Deleting")]
+        self._commit_clip(
+            lambda cm, loc: pc.remove_cluster(cm, cluster),
+            lambda _r: self._prop_clips.pop(key, None),
+            "remove prop clip",
+        )
+        return {"removed": list(cluster), "found": True, "warnings": warnings}
+
+    # -- the clip reversibility machinery ----------------------------------------------------
+
+    def _capture_clip(self, cm) -> dict:
+        node = cm.node
+        snap = {k: node.get(k) for k in self._CLIP_KEYS}  # bytes: immutable, cheap to hold
+        snap["leafbrush_nodes"] = copy.deepcopy(node["leafbrush_nodes"])
+        snap["_mine"] = set(cm._mine)
+        snap["_padded"] = set(cm._padded)
+        snap["_append"] = set(self.doc._rw.append_identities)
+        return snap
+
+    def _restore_clip(self, snap: dict) -> None:
+        engine = self._clip_engine()
+        if engine is None:  # pragma: no cover - only reached with a clip edit in history
+            raise EditError("clip edit cannot be undone: the clipMap is no longer available")
+        cm, _ = engine
+        node = cm.node
+        for k in self._CLIP_KEYS:
+            node[k] = snap[k]
+        node["leafbrush_nodes"] = copy.deepcopy(snap["leafbrush_nodes"])
+        cm._mine = set(snap["_mine"])
+        cm._padded = set(snap["_padded"])
+        self.doc._rw.append_identities = set(snap["_append"])
+
+    def _commit_clip(self, op_fn, assoc_fn, label: str):
+        engine = self._clip_engine()
+        if engine is None:
+            raise EditError(
+                f"{self.doc.zone_name}: this zone has no editable clipMap collision"
+            )
+        cm, loc = engine
+        before = self._capture_clip(cm)
+        assoc_before = {k: list(v) for k, v in self._prop_clips.items()}
+        try:
+            result = op_fn(cm, loc)
+        except pc.ClipError as exc:
+            self._restore_clip(before)
+            raise EditError(f"{self.doc.zone_name}: clip edit failed ({exc})") from None
+        assoc_fn(result)
+        after = self._capture_clip(cm)
+        edit = ClipEdit(
+            before,
+            after,
+            assoc_before,
+            {k: list(v) for k, v in self._prop_clips.items()},
+            label=label,
+        )
+        before_ops = len(self.doc._undo)
+        self.doc.touch_asset(self._clip_index)
+        ops = len(self.doc._undo) - before_ops
+        self._undo.append(_Entry(edit, ops))
+        self._redo.clear()
+        return result
 
     # -- applying, reconciling, history ------------------------------------------------------
 

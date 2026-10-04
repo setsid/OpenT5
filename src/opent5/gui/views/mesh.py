@@ -337,11 +337,70 @@ class MapEditController:
     def __init__(self, session):
         self.session = session
         self.selected_id: int | None = None
+        #: index of the selected static-model prop (clipMap staticModelList), or None.
+        self.selected_prop: int | None = None
         self.mode = "translate"  # or "rotate"
         self.grid = 0.0  # translate snap, world units (0: off)
         self.angle = 0.0  # rotate snap, degrees (0: off)
         self._drag = None
         self._drag_token = 0
+        #: non-blocking notices from the last clip edit (baked shadow, collision stays).
+        self.warnings: list = []
+        self._props_cache: list | None = None
+
+    # static-model props and their clip collision
+    def props(self) -> list:
+        """The zone's static-model props (clipMap staticModelList); cached per session."""
+        if self._props_cache is None:
+            self._props_cache = self.session.static_models() if self.can_edit_clips else []
+        return self._props_cache
+
+    @property
+    def can_edit_clips(self) -> bool:
+        return getattr(self.session, "can_edit_clips", False)
+
+    def selected_prop_obj(self):
+        if self.selected_prop is None:
+            return None
+        for p in self.props():
+            if p.index == self.selected_prop:
+                return p
+        return None
+
+    def selected_cluster(self) -> list:
+        """The clip brush indices of the selected prop's cluster (under its footprint),
+        for the editor to highlight before a move or delete. Empty when nothing is
+        selected, the prop has no clip, or the zone has no clipMap."""
+        prop = self.selected_prop_obj()
+        if prop is None:
+            return []
+        return self.session.clip_cluster_in_footprint(*prop.footprint)
+
+    def selected_cluster_boxes(self) -> list:
+        """(mins, maxs) of each brush in the selected prop's cluster, for drawing the
+        highlight."""
+        return self.session.cluster_boxes(self.selected_cluster())
+
+    def move_selected_prop(self, delta) -> dict:
+        """Move the selected prop's clip cluster by ``delta`` (the whole cluster, so the
+        old spot clears). Records warnings; returns the result dict."""
+        prop = self.selected_prop_obj()
+        if prop is None:
+            self.warnings = []
+            return {"moved": [], "found": False, "warnings": []}
+        result = self.session.move_prop_clip(prop.index, delta, footprint=prop.footprint)
+        self.warnings = result["warnings"]
+        self._props_cache = None
+        return result
+
+    def delete_selected_prop_clip(self) -> dict:
+        prop = self.selected_prop_obj()
+        if prop is None:
+            self.warnings = []
+            return {"removed": [], "found": False, "warnings": []}
+        result = self.session.remove_prop_clip(prop.index, footprint=prop.footprint)
+        self.warnings = result["warnings"]
+        return result
 
     # selection and projection
     def markers(self) -> list:
@@ -360,15 +419,40 @@ class MapEditController:
             depths.append(depth if front else np.inf)
         return ids, np.array(pts, np.float64).reshape(-1, 2), np.array(depths, np.float64)
 
+    def prop_screen(self, cam: Camera, w: int, h: int):
+        """Static-model prop origins projected to the screen, for picking and markers:
+        ``(indices, (n, 2) positions, depths)``."""
+        from opent5.edit import gizmo as gz
+
+        eye, right, up, forward = cam.basis()
+        f = focal(h)
+        idxs, pts, depths = [], [], []
+        for p in self.props():
+            sx, sy, depth, front = gz.project_point(p.origin, eye, right, up, forward, f, w, h)
+            idxs.append(p.index)
+            pts.append((sx, sy) if front else (np.nan, np.nan))
+            depths.append(depth if front else np.inf)
+        return idxs, np.array(pts, np.float64).reshape(-1, 2), np.array(depths, np.float64)
+
     def pick(self, cam: Camera, px: float, py: float, w: int, h: int, radius: float = 12.0):
+        """Select the nearest marker under the cursor, entity or static-model prop.
+        Picking a prop sets ``selected_prop`` (and clears the entity selection), so the
+        editor can show and move its clip cluster; picking an entity does the reverse."""
         from opent5.edit import gizmo as gz
 
         ids, pts, depths = self.marker_screen(cam, w, h)
-        if not ids:
+        ent_i = gz.nearest_marker(pts, (px, py), radius, depths) if ids else None
+        pids, ppts, pdepths = self.prop_screen(cam, w, h)
+        prop_i = gz.nearest_marker(ppts, (px, py), radius, pdepths) if pids else None
+        ent_d = depths[ent_i] if ent_i is not None else np.inf
+        prop_d = pdepths[prop_i] if prop_i is not None else np.inf
+        self.warnings = []
+        if prop_i is not None and prop_d <= ent_d:
+            self.selected_prop = pids[prop_i]
             self.selected_id = None
             return None
-        i = gz.nearest_marker(pts, (px, py), radius, depths)
-        self.selected_id = None if i is None else ids[i]
+        self.selected_prop = None
+        self.selected_id = None if ent_i is None else ids[ent_i]
         return self.selected_id
 
     def selected(self):
@@ -931,8 +1015,65 @@ class MeshCanvas(QWidget):
                 p.setPen(QPen(colour, 1.0))
             p.setBrush(colour)
             p.drawRect(int(sx - r), int(sy - r), 2 * r, 2 * r)
+        self._paint_prop_markers(p)
+        self._paint_cluster(p)
         self._paint_gizmo_handles(p)
         self._paint_edit_readout(p)
+
+    def _paint_prop_markers(self, p: QPainter) -> None:
+        """Static-model props as small diamonds; the selected one brighter."""
+        ctl = self.controller
+        if not ctl.can_edit_clips:
+            return
+        t = theme.current()
+        from opent5.edit import gizmo as gz
+
+        eye, right, up, forward = self.camera.basis()
+        f = focal(self.height())
+        for prop in ctl.props():
+            sx, sy, _d, front = gz.project_point(
+                prop.origin, eye, right, up, forward, f, self.width(), self.height()
+            )
+            if not front:
+                continue
+            selected = prop.index == ctl.selected_prop
+            colour = QColor("#c88bd8" if selected else "#7a6f86")
+            p.setPen(QPen(QColor(t.text) if selected else colour, 1.5 if selected else 1.0))
+            p.setBrush(colour)
+            r = 5 if selected else 3
+            p.drawPolygon(
+                QPointF(sx, sy - r), QPointF(sx + r, sy), QPointF(sx, sy + r), QPointF(sx - r, sy)
+            )
+
+    def _paint_cluster(self, p: QPainter) -> None:
+        """Highlight the selected prop's clip cluster (the collision a move or delete
+        affects) as wireframe boxes, so the user sees exactly what will change."""
+        ctl = self.controller
+        boxes = ctl.selected_cluster_boxes() if ctl.selected_prop is not None else []
+        if not boxes:
+            return
+        from opent5.edit import gizmo as gz
+
+        eye, right, up, forward = self.camera.basis()
+        f = focal(self.height())
+        w, h = self.width(), self.height()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.setPen(QPen(QColor("#e0a0ff"), 1.2))
+        edges = (
+            (0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        )  # fmt: skip
+        for mins, maxs in boxes:
+            corners = [
+                (mins[0], mins[1], mins[2]), (maxs[0], mins[1], mins[2]),
+                (maxs[0], maxs[1], mins[2]), (mins[0], maxs[1], mins[2]),
+                (mins[0], mins[1], maxs[2]), (maxs[0], mins[1], maxs[2]),
+                (maxs[0], maxs[1], maxs[2]), (mins[0], maxs[1], maxs[2]),
+            ]  # fmt: skip
+            scr = [gz.project_point(c, eye, right, up, forward, f, w, h) for c in corners]
+            for a, b in edges:
+                if scr[a][3] and scr[b][3]:
+                    p.drawLine(QPointF(scr[a][0], scr[a][1]), QPointF(scr[b][0], scr[b][1]))
 
     def _paint_gizmo_handles(self, p: QPainter) -> None:
         ctl = self.controller
@@ -1149,6 +1290,11 @@ class MeshCanvas(QWidget):
             ctl.mode = "translate"
         elif k == Qt.Key.Key_R and not ctrl:
             ctl.mode = "rotate"
+        elif k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and ctl.selected_prop is not None:
+            ctl.delete_selected_prop_clip()  # remove the prop's clip cluster (collision)
+            ctl.selected_prop = None
+            self.selection_changed.emit(None)
+            self.edited.emit()
         elif k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and ctl.selected_id is not None:
             ctl.delete()
             self.selection_changed.emit(None)
@@ -1243,6 +1389,14 @@ class MapEditPanel(QWidget):
         self.selected_label.setWordWrap(True)
         root.addWidget(self.selected_label)
 
+        # non-blocking notices from the last clip edit (baked shadow, collision stays)
+        self.notice = QLabel("", self)
+        self.notice.setWordWrap(True)
+        self.notice.setObjectName("EditNotice")
+        self.notice.setStyleSheet("color: #d8973c;")
+        self.notice.setVisible(False)
+        root.addWidget(self.notice)
+
         self.form_host = QWidget(self)
         self.form = QFormLayout(self.form_host)
         self.form.setContentsMargins(0, 0, 0, 0)
@@ -1289,19 +1443,42 @@ class MapEditPanel(QWidget):
         self.controller.grid = _as_float(self.grid.text())
         self.controller.angle = _as_float(self.angle.text())
 
+    def _show_notice(self) -> None:
+        warnings = list(getattr(self.controller, "warnings", []) or []) if self.controller else []
+        self.notice.setText("\n".join(warnings))
+        self.notice.setVisible(bool(warnings))
+
     def show_object(self, obj_id) -> None:
         while self.form.rowCount():
             self.form.removeRow(0)
         self._field_edits.clear()
+        self._show_notice()
+        if self.controller is not None:
+            self.undo_button.setEnabled(self.controller.session.can_undo)
+            self.redo_button.setEnabled(self.controller.session.can_redo)
+        # a static-model prop selected: show its clip cluster, not entity fields
+        prop = self.controller.selected_prop_obj() if self.controller else None
+        if prop is not None:
+            cluster = self.controller.selected_cluster()
+            self.dup_button.setEnabled(False)
+            self.del_button.setEnabled(bool(cluster))
+            name = prop.model or f"static model {prop.index}"
+            if cluster:
+                self.selected_label.setText(
+                    f"prop: {name}  ({len(cluster)} clip brush(es); Delete removes them, "
+                    "shown highlighted)"
+                )
+            else:
+                self.selected_label.setText(
+                    f"prop: {name}  (no clip collision found at its footprint)"
+                )
+            return
         obj = None
         if self.controller is not None and obj_id is not None:
             obj = self.controller.selected()
         has = obj is not None
         self.dup_button.setEnabled(has)
         self.del_button.setEnabled(has)
-        if self.controller is not None:
-            self.undo_button.setEnabled(self.controller.session.can_undo)
-            self.redo_button.setEnabled(self.controller.session.can_redo)
         if obj is None:
             self.selected_label.setText("Nothing selected")
             return
@@ -1345,9 +1522,15 @@ class MapEditPanel(QWidget):
             self.show_object(self.controller.selected_id)
 
     def _delete(self) -> None:
-        if self.controller is not None:
-            self._guard(self.controller.delete)
+        if self.controller is None:
+            return
+        if self.controller.selected_prop is not None:
+            self._guard(self.controller.delete_selected_prop_clip)
+            self.controller.selected_prop = None
             self.show_object(None)
+            return
+        self._guard(self.controller.delete)
+        self.show_object(None)
 
     def _undo(self) -> None:
         if self.controller is not None:
