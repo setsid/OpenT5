@@ -1,52 +1,51 @@
 """Axis-aligned clip cbrushes for the v0.3.0 map editor (Route A of the spike,
-docs/research/static-model-collision.md).
+docs/research/static-model-collision.md; the device test confirmed Route A and
+rejected static-model collision).
 
 A moved or added static-model prop stays solid the way cod2map makes the v0.2.0
 box props solid: an axis-aligned clip ``cbrush_t`` in the clipMap, referenced
-from the BSP leaf(s) it falls in so a trace finds it. This module adds, moves
-and removes such a brush on a parsed ``col_map_mp`` / ``col_map_sp`` node,
-keeping every count and reference consistent, so the editor can keep collision
-in step without recompiling.
+from the BSP leaf(s) it falls in so a trace finds it. A stock prop's collision is
+a *cluster* of such cbrushes (a bus is a bus-sized brush plus thinner shell
+brushes at its footprint), identifiable by their axis-aligned bounds. This module
+adds, moves and removes these on a parsed ``col_map_mp`` / ``col_map_sp`` node,
+keeping every count and reference consistent, and finds the cluster under a
+footprint so a whole prop's clips move or go together.
 
-What a cod2map clip box looks like (confirmed from out/demo/n_box_all2, whose 8
-props carry clip boxes, brushes 0..7):
+How a cod2map clip is shaped (confirmed from out/demo/n_box_all2 and retail
+mp_nuked):
 
 - ``cbrush_t`` (0x60): mins (+0x0), contents (+0xC), maxs (+0x10), numsides=0
-  (+0x1C), sides=NULL (+0x20), then the six axial side flag words
-  axial_cflags[6] (+0x24) and axial_sflags[6] (+0x3C), numverts (+0x54) and a
-  verts pointer (+0x58). An axis-aligned brush has no brushSides: its six faces
-  are the implicit axial planes taken from mins/maxs (see
-  opent5.export.collision.brush_planes), so the collision volume needs nothing
-  but mins/maxs and the contents. cod2map also writes the eight box-corner verts
-  and points +0x58 at them; those verts are brush-edge data the axial box trace
-  does not need, and the shared ``brushVerts`` pool cannot take an appended run
-  through the re-layout (it is followed immediately by ``cmodels``, so a
-  one-past-the-end pointer is ambiguous), so an *added* brush is written with
-  numverts=0 and a NULL verts pointer. A *moved* brush that already owns verts
-  keeps them, rewritten in place to the new corners.
+  (+0x1C), sides=NULL (+0x20), the six axial side-flag words axial_cflags[6]
+  (+0x24) and axial_sflags[6] (+0x3C), numverts (+0x54) and a verts pointer
+  (+0x58). An axis-aligned brush has no brushSides: its six faces are the axial
+  planes taken from mins/maxs (opent5.export.collision.brush_planes). cod2map
+  also writes the eight box-corner verts and points +0x58 at them.
 
 - A trace reaches a brush through the BSP: a ``cNode_t`` tree to a ``cLeaf_s``,
   then the leaf's ``leafBrushNode`` index into the ``cLeafBrushNode_s`` kd-tree.
-  A kd-tree node with leafBrushCount==0 is a split (inline dist/range/childOffset
-  at +0x8, childOffset relative and forward), one with leafBrushCount>0 is a leaf
-  listing that many brush indices, inline when its +0x8 pointer is -1 or through
-  the flat ``leafBrushes`` pool otherwise. T5's ``cLeaf_s`` has no
-  firstLeafBrush/numLeafBrushes; brushes are reached only through this kd-tree.
+  A kd-tree node with leafBrushCount==0 is a split (inline dist/range and two
+  forward, relative child offsets at +0x8); one with leafBrushCount>0 is a leaf
+  listing that many brush indices. **A world leaf's brush list is always read
+  through the flat ``leafBrushes`` pool** (the leaf node's +0x8 points into it);
+  cod2map never gives a world leaf an *inline* brush list (+0x8 == -1). Inline
+  lists are used only by submodel (cmodel) leaf nodes. The engine's world trace
+  treats a world leaf node's +0x8 as a pointer into the pool, so an inline list
+  under a world leaf makes it index the pool out of bounds and dereference float
+  data as a pointer. T5's ``cLeaf_s`` has no firstLeafBrush/numLeafBrushes field;
+  brushes are reached only through this kd-tree.
 
-A brush is added as an inline single-brush ``cLeafBrushNode_s`` (the shape of
-n_box_all2's submodel nodes 33..51: axis 0, count 1, data pointer -1, one inline
-u16 index), attached to every empty BSP leaf whose box overlaps the brush by
-pointing that leaf's ``leafBrushNode`` at the new node. This needs no new plane
-(the shared plane pool lives in another asset) and no new BSP ``cNode_t``.
-Leaves that already hold cod2map brushes (a split or flat-backed kd-tree) are
-not merged into: that is the one case this module refuses rather than guess, and
-the device check still has the final say on solidity (collision is only
-confirmable on device).
+So an added brush is referenced the cod2map way: its index is appended to the
+flat ``leafBrushes`` pool and each attachable world leaf is given a flat-backed
+leaf node (+0x8 pointing into the pool). The editor drives this through
+``opent5.xfile.remap.Rewrite``: parse for editing, pass the ``Rewrite`` to
+``ClipMap`` so appends to the pool and the ``brushVerts`` tail resolve (the
+Rewrite's ``append_identities``), call the operations, then ``Rewrite.build``.
 
-The editor drives this through ``opent5.xfile.remap.Rewrite``: parse for
-editing, call these functions on the clipMap node, then ``Rewrite.build`` to
-re-lay-out the zone and remap every offset pointer. Appends only grow arrays at
-their tail, so the re-layout follows every pointer.
+Attaching to the exact BSP leaf for a point needs the cNode tree and the shared
+plane pool (another asset); instead the leaf boxes the parse carries are used
+(attach to every attachable leaf the clip overlaps, else the zero-volume
+catch-all). Over-inclusion is harmless: a brush's own bounds gate the hit.
+Leaves already holding cod2map brushes are not merged into.
 """
 
 from __future__ import annotations
@@ -54,7 +53,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-#: ``cbrush_t`` big-endian struct offsets (see module docstring / structs.py).
+#: ``cbrush_t`` big-endian struct offsets.
 CBRUSH_SIZE = 0x60
 _B_MINS = 0x00
 _B_CONTENTS = 0x0C
@@ -72,7 +71,6 @@ _N_AXIS = 0x00
 _N_COUNT = 0x02
 _N_CONTENTS = 0x04
 _N_DATA = 0x08  # leaf: brushes pointer; split: dist (f32)
-_N_RANGE = 0x0C
 _N_CHILD0 = 0x10
 _N_CHILD1 = 0x12
 
@@ -89,22 +87,21 @@ _H_NUM_LEAFBRUSHES = 0x40
 _H_NUM_BRUSHVERTS = 0x58
 _H_NUM_BRUSHES = 0x94
 
-#: Device-proven player-clip flags: the v0.2.0 box clip boxes (brushes 0..7 of
-#: n_box_all2) carry contents 0x8030200 and the surface word 0x440A0 on all six
-#: axial faces, and were solid on PS3 (n_box_all2 collision confirmed on device).
+#: Device-proven player-clip flags: the v0.2.0 box clip boxes carry contents
+#: 0x8030200 and the surface word 0x440A0 on all six axial faces, solid on PS3.
 PLAYER_CLIP_CONTENTS = 0x8030200
 PLAYER_CLIP_SURFACE = 0x000440A0
 
 _PTR_NULL = 0
 _PTR_INLINE = 0xFFFFFFFF
+_OFFSET_BLOCK_SHIFT = 29
 _OFFSET_MASK = 0x1FFFFFFF
+
+Vec3 = tuple[float, float, float]
 
 
 class ClipError(Exception):
     """A clip edit the clipMap structure cannot take safely."""
-
-
-Vec3 = tuple[float, float, float]
 
 
 # -- pure builders ---------------------------------------------------------------------------
@@ -119,10 +116,9 @@ def clip_cbrush(
     numverts: int = 0,
 ) -> bytes:
     """The 0x60 ``cbrush_t`` bytes of an axis-aligned clip brush: no brushSides
-    (the six axial planes come from mins/maxs), the contents on every axial
-    cflag and ``surface_flags`` on every axial sflag. Matches the shape of a
-    cod2map clip box of the same bounds. ``verts_ptr``/``numverts`` default to a
-    NULL run (see the module docstring)."""
+    (the six axial planes come from mins/maxs), the contents on every axial cflag
+    and ``surface_flags`` on every axial sflag. Matches the shape of a cod2map
+    clip box of the same bounds."""
     for name, lo, hi in (("x", mins[0], maxs[0]), ("y", mins[1], maxs[1]), ("z", mins[2], maxs[2])):
         if hi < lo:
             raise ClipError(f"clip bounds {name}: maxs {hi} is below mins {lo}")
@@ -155,19 +151,19 @@ def box_corner_verts(mins: Vec3, maxs: Vec3) -> bytes:
     return bytes(out)
 
 
-def inline_leaf_node(contents: int, brush_indices: list[int]) -> dict:
-    """A ``cLeafBrushNode_s`` leaf element node holding its brush indices inline
-    (data pointer -1), as the handler stores a parsed one: ``{"_t", "raw",
-    "brushes"}``. The shape of n_box_all2's nodes 33..51."""
-    if not brush_indices:
-        raise ClipError("inline_leaf_node: expected at least one brush index")
+def flat_leaf_node(contents: int, data_ptr: int, count: int) -> dict:
+    """A ``cLeafBrushNode_s`` leaf element node whose brush list is read through
+    the flat ``leafBrushes`` pool (data pointer into the pool), as the handler
+    stores a parsed one (no inline ``brushes``). This is cod2map's world-leaf
+    shape."""
+    if count <= 0:
+        raise ClipError("flat_leaf_node: expected a positive brush count")
     r = bytearray(CLEAFBRUSHNODE_SIZE)
     struct.pack_into(">b", r, _N_AXIS, 0)
-    struct.pack_into(">h", r, _N_COUNT, len(brush_indices))
+    struct.pack_into(">h", r, _N_COUNT, count)
     struct.pack_into(">i", r, _N_CONTENTS, contents)
-    struct.pack_into(">I", r, _N_DATA, _PTR_INLINE)
-    brushes = b"".join(struct.pack(">H", i) for i in brush_indices)
-    return {"_t": "cLeafBrushNode_s", "raw": bytes(r), "brushes": brushes}
+    struct.pack_into(">I", r, _N_DATA, data_ptr)
+    return {"_t": "cLeafBrushNode_s", "raw": bytes(r), "brushes": None}
 
 
 def boxes_overlap(a_min: Vec3, a_max: Vec3, b_min: Vec3, b_max: Vec3) -> bool:
@@ -189,18 +185,30 @@ class BrushInfo:
 
 
 class ClipMap:
-    """A thin typed view over a parsed clipMap node (the handler's dict). Reads
-    and writes the header counts and the brush / leaf / kd-tree arrays in place.
-    Node-only: it never needs the zone layout."""
+    """A typed view over a parsed clipMap node (the handler's dict). Reads and
+    writes the header counts and the brush / leaf / kd-tree / pool arrays in
+    place.
 
-    def __init__(self, node: dict):
+    ``rewrite`` is the ``opent5.xfile.remap.Rewrite`` the node belongs to; it is
+    required for ``add_clip`` / ``move_clip`` because appending to the flat
+    ``leafBrushes`` pool and the ``brushVerts`` tail needs the Rewrite to resolve
+    the appended-tail pointers (``append_identities``). The read-only views
+    (``brush``, ``reachable_brushes``, ``clips_in_footprint``, the checker) work
+    without it."""
+
+    def __init__(self, node: dict, rewrite=None):
         self.node = node
+        self.rewrite = rewrite
+        #: Indices of the leaf nodes this view created, so a later attach extends
+        #: its own node rather than treating it as a cod2map one.
+        self._mine: set[int] = set()
+        #: Pools already given their one-element boundary pad (see ``_append_pool``).
+        self._padded: set[str] = set()
 
     # header counts ------------------------------------------------------------------------
 
     def _hget(self, off: int, u16: bool = False) -> int:
-        fmt = ">H" if u16 else ">I"
-        return struct.unpack_from(fmt, self.node["header"], off)[0]
+        return struct.unpack_from(">H" if u16 else ">I", self.node["header"], off)[0]
 
     def _hset(self, off: int, value: int, u16: bool = False) -> None:
         h = bytearray(self.node["header"])
@@ -218,6 +226,53 @@ class ClipMap:
     @property
     def lbn_count(self) -> int:
         return self._hget(_H_LBN_COUNT)
+
+    # appending to tail-resolvable pools ---------------------------------------------------
+
+    def _orig_alloc(self, key: str) -> tuple[int, int]:
+        """The (block, memory offset) the original parse loaded ``node[key]`` at,
+        from the Rewrite's event log (the original layout, not the edited node)."""
+        if self.rewrite is None:
+            raise ClipError(f"appending to {key!r} needs a Rewrite (pass rewrite= to ClipMap)")
+        event = self.rewrite.event_of(("L", id(self.node), key))
+        if event is None:
+            raise ClipError(f"the clipMap has no {key!r} array to append to")
+        rows = self.rewrite.xfile.log.table()
+        return int(rows[event, 3]), int(rows[event, 4])
+
+    def _append_pool(self, key: str, data: bytes, element_size: int) -> int:
+        """Append ``data`` to ``node[key]`` and return the offset-pointer value of
+        the appended bytes' start, which ``Rewrite.build`` maps to its new place
+        (the Rewrite is told this allocation grows at its tail). The first append
+        to a pool leaves one unused element at the original end, so no pointer of
+        ours lands on the boundary with the allocation that follows the pool (see
+        the remap's ``append_identities``)."""
+        block, mem = self._orig_alloc(key)
+        if key not in self._padded:
+            self.node[key] = self.node[key] + bytes(element_size)
+            self._padded.add(key)
+            self.rewrite.append_identities.add(("L", id(self.node), key))
+        inner = len(self.node[key])  # byte offset of the appended data in the pool
+        self.node[key] = self.node[key] + data
+        return ((block << _OFFSET_BLOCK_SHIFT) | ((mem + inner) & _OFFSET_MASK)) + 1
+
+    def append_flat_run(self, brush_indices: list[int]) -> int:
+        """Append a run of u16 brush indices to the flat ``leafBrushes`` pool;
+        returns the pointer a flat leaf node uses to read them."""
+        data = b"".join(struct.pack(">H", i) for i in brush_indices)
+        ptr = self._append_pool("leafbrushes", data, 2)
+        self._hset(_H_NUM_LEAFBRUSHES, len(self.node["leafbrushes"]) // 2)
+        return ptr
+
+    def append_verts(self, mins: Vec3, maxs: Vec3) -> int:
+        """Append a brush's eight corner verts to the ``brushVerts`` pool; returns
+        the pointer for the brush's +0x58 field. Returns 0 when the clipMap has no
+        brushVerts pool (no brushes carry verts)."""
+        if self.node.get("brush_verts") is None:
+            return 0
+        ptr = self._append_pool("brush_verts", box_corner_verts(mins, maxs), 12)
+        self._hset(_H_NUM_BRUSHVERTS, len(self.node["brush_verts"]) // 12)
+        return ptr
 
     # brushes ------------------------------------------------------------------------------
 
@@ -248,14 +303,7 @@ class ClipMap:
         self._hset(_H_NUM_BRUSHES, index + 1, u16=True)
         return index
 
-    def drop_last_brush(self) -> None:
-        n = self.num_brushes
-        self.node["brushes"] = self.node["brushes"][: (n - 1) * CBRUSH_SIZE]
-        self._hset(_H_NUM_BRUSHES, n - 1, u16=True)
-
-    def brush_verts_base(self) -> int | None:
-        """The block-memory offset of the ``brushVerts`` pool (the smallest brush
-        verts pointer), or None when no brush owns verts."""
+    def _brush_verts_base(self) -> int | None:
         best = None
         for i in range(self.num_brushes):
             br = self.brush(i)
@@ -265,12 +313,12 @@ class ClipMap:
         return best
 
     def set_brush_verts(self, i: int, verts: bytes) -> None:
-        """Rewrite a brush's eight corner verts in the shared pool, in place (same
-        size), leaving its pointer valid. Only for a brush that already owns verts."""
+        """Rewrite a brush's corner verts in the pool, in place (same size),
+        leaving its pointer valid. Only for a brush that already owns verts."""
         br = self.brush(i)
         if not (br.numverts and br.verts_ptr):
             raise ClipError(f"brush {i}: owns no verts to rewrite")
-        base = self.brush_verts_base()
+        base = self._brush_verts_base()
         inner = ((br.verts_ptr - 1) & _OFFSET_MASK) - base
         bv = bytearray(self.node["brush_verts"])
         if inner < 0 or inner + len(verts) > len(bv):
@@ -309,47 +357,23 @@ class ClipMap:
     def nodes(self) -> list[dict]:
         return self.node["leafbrush_nodes"]
 
-    def _node_count(self, i: int) -> int:
-        return struct.unpack_from(">h", self.nodes[i]["raw"], _N_COUNT)[0]
+    def _node(self, i: int) -> bytes:
+        return self.nodes[i]["raw"]
 
-    def inline_brush_list(self, i: int) -> list[int] | None:
-        """The brush indices a node lists inline (data pointer -1), or None when
-        the node is a split or references the flat leafBrushes pool."""
-        element = self.nodes[i]
-        raw = element["raw"]
-        count = struct.unpack_from(">h", raw, _N_COUNT)[0]
-        data = struct.unpack_from(">I", raw, _N_DATA)[0]
-        if count <= 0 or data != _PTR_INLINE:
-            return None
-        extra = element.get("brushes")
-        if extra is None:
-            return None
-        return [struct.unpack_from(">H", extra, 2 * k)[0] for k in range(count)]
+    def node_count(self, i: int) -> int:
+        return struct.unpack_from(">h", self._node(i), _N_COUNT)[0]
 
-    def set_inline_brush_list(self, i: int, brush_indices: list[int], contents: int) -> None:
-        element = self.nodes[i]
-        raw = bytearray(element["raw"])
-        struct.pack_into(">h", raw, _N_COUNT, len(brush_indices))
-        struct.pack_into(">i", raw, _N_CONTENTS, contents)
-        struct.pack_into(">I", raw, _N_DATA, _PTR_INLINE)
-        element["raw"] = bytes(raw)
-        element["brushes"] = b"".join(struct.pack(">H", b) for b in brush_indices)
+    def node_data(self, i: int) -> int:
+        return struct.unpack_from(">I", self._node(i), _N_DATA)[0]
 
-    def flat_brushes(self) -> list[int]:
-        fb = self.node["leafbrushes"]
-        return [struct.unpack_from(">H", fb, 2 * k)[0] for k in range(len(fb) // 2)]
-
-    def set_flat_brushes(self, indices: list[int]) -> None:
-        self.node["leafbrushes"] = b"".join(struct.pack(">H", i) for i in indices)
-        self._hset(_H_NUM_LEAFBRUSHES, len(indices))
+    def is_inline(self, i: int) -> bool:
+        """A leaf node whose brush list is inline (data == -1), not pool-backed."""
+        return self.node_count(i) > 0 and self.node_data(i) == _PTR_INLINE
 
     def _flat_base(self) -> int | None:
-        """Block-memory offset of the flat leafBrushes pool: the smallest address
-        any pool-backed leaf node points at (each points at the start of its own
-        run). None when no node is pool-backed."""
         offs = []
-        for element in self.nodes:
-            raw = element["raw"]
+        for e in self.nodes:
+            raw = e["raw"]
             count = struct.unpack_from(">h", raw, _N_COUNT)[0]
             data = struct.unpack_from(">I", raw, _N_DATA)[0]
             if count > 0 and data not in (_PTR_NULL, _PTR_INLINE):
@@ -358,35 +382,33 @@ class ClipMap:
 
     def node_brush_list(self, i: int) -> list[int]:
         """Every brush index a kd-tree leaf node lists, inline or via the pool."""
-        raw = self.nodes[i]["raw"]
-        count = struct.unpack_from(">h", raw, _N_COUNT)[0]
+        count = self.node_count(i)
         if count <= 0:
             return []
-        inline = self.inline_brush_list(i)
-        if inline is not None:
-            return inline
-        data = struct.unpack_from(">I", raw, _N_DATA)[0]
+        if self.node_data(i) == _PTR_INLINE:
+            extra = self.nodes[i].get("brushes")
+            if extra is None:
+                return []
+            return [struct.unpack_from(">H", extra, 2 * k)[0] for k in range(count)]
         base = self._flat_base()
         if base is None:
             return []
-        start = (((data - 1) & _OFFSET_MASK) - base) // 2
-        flat = self.flat_brushes()
-        return flat[start : start + count]
+        start = (((self.node_data(i) - 1) & _OFFSET_MASK) - base) // 2
+        fb = self.node["leafbrushes"]
+        return [struct.unpack_from(">H", fb, 2 * (start + k))[0] for k in range(count)]
 
     def reachable_brushes(self, leaf_index: int) -> set[int]:
         """Every brush index reachable from a BSP leaf, walking its leafBrushNode
-        kd-tree and visiting both children of every split. This is the structural
-        test of 'is this brush referenced from this leaf'."""
+        kd-tree and visiting both children of every split."""
         return self._reach(self.leaf_root(leaf_index), set())
 
     def _reach(self, node_index: int, seen: set[int]) -> set[int]:
         if node_index in seen or node_index < 0 or node_index >= len(self.nodes):
             return set()
         seen.add(node_index)
-        raw = self.nodes[node_index]["raw"]
-        count = struct.unpack_from(">h", raw, _N_COUNT)[0]
-        if count > 0:
+        if self.node_count(node_index) > 0:
             return set(self.node_brush_list(node_index))
+        raw = self._node(node_index)
         out: set[int] = set()
         for child_off in (_N_CHILD0, _N_CHILD1):
             rel = struct.unpack_from(">H", raw, child_off)[0]
@@ -394,178 +416,28 @@ class ClipMap:
                 out |= self._reach(node_index + rel, seen)
         return out
 
-    def append_inline_node(self, contents: int, brush_indices: list[int]) -> int:
+    def append_flat_node(self, contents: int, brush_indices: list[int]) -> int:
+        """Append a flat-backed leaf node (its run appended to the pool) and
+        return its index; records it as one of ours."""
+        ptr = self.append_flat_run(brush_indices)
         index = len(self.nodes)
-        self.nodes.append(inline_leaf_node(contents, brush_indices))
+        self.nodes.append(flat_leaf_node(contents, ptr, len(brush_indices)))
         self._hset(_H_LBN_COUNT, index + 1)
+        self._mine.add(index)
         return index
 
-
-# -- high-level operations -------------------------------------------------------------------
-
-
-def _is_attachable(cm: ClipMap, leaf: int) -> bool:
-    """A leaf is attachable when it holds no cod2map brushes: it reaches nothing,
-    or its root is an inline node this module created earlier."""
-    root = cm.leaf_root(leaf)
-    if root <= 0 or not cm.reachable_brushes(leaf):
-        return True
-    return cm.inline_brush_list(root) is not None
+    def set_flat_node(self, i: int, contents: int, brush_indices: list[int]) -> None:
+        """Repoint one of our leaf nodes at a fresh run of ``brush_indices``."""
+        ptr = self.append_flat_run(brush_indices)
+        raw = bytearray(CLEAFBRUSHNODE_SIZE)
+        struct.pack_into(">h", raw, _N_COUNT, len(brush_indices))
+        struct.pack_into(">i", raw, _N_CONTENTS, contents)
+        struct.pack_into(">I", raw, _N_DATA, ptr)
+        self.nodes[i]["raw"] = bytes(raw)
+        self.nodes[i]["brushes"] = None
 
 
-def _attach_targets(cm: ClipMap, mins: Vec3, maxs: Vec3) -> list[int]:
-    """The leaves to reference a clip box from. A trace lands in the BSP leaf the
-    cNode tree routes its region to; computing that exactly needs the shared plane
-    pool (another asset) and the device-confirmed child convention, so this uses
-    the leaf boxes the parse gives: every attachable leaf whose own box overlaps
-    the clip. When none do (a map like n_box whose leaves are tight around
-    existing collision, with open space routed to a zero-volume catch-all leaf),
-    it falls back to the attachable zero-volume catch-all leaves. Over-inclusion
-    is harmless: a brush's own bounds gate the hit."""
-    overlapping = []
-    catch_all = []
-    for i in range(cm.num_leafs):
-        if not _is_attachable(cm, i):
-            continue
-        lo, hi = cm.leaf_box(i)
-        if lo == hi:
-            catch_all.append(i)
-        elif boxes_overlap(mins, maxs, lo, hi):
-            overlapping.append(i)
-    return overlapping or catch_all
-
-
-def _attach(cm: ClipMap, leaf_index: int, brush_index: int, contents: int) -> None:
-    """Reference ``brush_index`` from a leaf: extend its inline node when it has
-    one, else give it a fresh inline single-brush node."""
-    root = cm.leaf_root(leaf_index)
-    inline = cm.inline_brush_list(root) if root > 0 else None
-    if inline is not None:
-        if brush_index not in inline:
-            was = struct.unpack_from(">i", cm.nodes[root]["raw"], _N_CONTENTS)[0]
-            cm.set_inline_brush_list(root, inline + [brush_index], was | contents)
-    else:
-        node_index = cm.append_inline_node(contents, [brush_index])
-        cm.set_leaf_root(leaf_index, node_index)
-    cm.or_leaf_contents(leaf_index, contents)
-
-
-def add_clip(
-    cm: ClipMap,
-    mins: Vec3,
-    maxs: Vec3,
-    contents: int = PLAYER_CLIP_CONTENTS,
-    surface_flags: int = PLAYER_CLIP_SURFACE,
-) -> int:
-    """Add an axis-aligned clip brush and reference it from the attachable BSP
-    leaf(s) for its footprint (see ``_attach_targets``). Returns the new brush
-    index. Raises ``ClipError`` when the clipMap has no attachable leaf at all."""
-    targets = _attach_targets(cm, mins, maxs)
-    if not targets:
-        raise ClipError("clipMap has no empty BSP leaf to reference the clip from")
-    brush_index = cm.append_brush(clip_cbrush(mins, maxs, contents, surface_flags))
-    for leaf_index in targets:
-        _attach(cm, leaf_index, brush_index, contents)
-    return brush_index
-
-
-def move_clip(cm: ClipMap, brush_index: int, mins: Vec3, maxs: Vec3) -> None:
-    """Move a clip brush to new bounds: rewrite the ``cbrush_t`` (its six axial
-    planes follow mins/maxs), rewrite its corner verts in place when it owns any,
-    and re-evaluate the leaves that reference it. Raises ``ClipError`` when the
-    new box reaches no empty leaf."""
-    br = cm.brush(brush_index)
-    if br.numsides:
-        raise ClipError(f"brush {brush_index} is not axis-aligned (has {br.numsides} sides)")
-    targets = _attach_targets(cm, mins, maxs)
-    if not targets:
-        raise ClipError("clipMap has no empty BSP leaf to reference the moved clip from")
-    cm.set_brush_bytes(
-        brush_index,
-        clip_cbrush(mins, maxs, br.contents, _surface_of(cm, brush_index),
-                    verts_ptr=br.verts_ptr, numverts=br.numverts),
-    )
-    if br.numverts and br.verts_ptr:
-        cm.set_brush_verts(brush_index, box_corner_verts(mins, maxs))
-    keep = set(targets)
-    for leaf_index in range(cm.num_leafs):
-        if leaf_index in keep:
-            continue
-        root = cm.leaf_root(leaf_index)
-        inline = cm.inline_brush_list(root) if root > 0 else None
-        if inline is None or brush_index not in inline:
-            continue
-        rest = [b for b in inline if b != brush_index]
-        if rest:
-            contents = struct.unpack_from(">i", cm.nodes[root]["raw"], _N_CONTENTS)[0]
-            cm.set_inline_brush_list(root, rest, contents)
-        else:
-            cm.set_leaf_root(leaf_index, 0)
-    for leaf_index in targets:
-        _attach(cm, leaf_index, brush_index, br.contents)
-
-
-def _surface_of(cm: ClipMap, brush_index: int) -> int:
-    o = brush_index * CBRUSH_SIZE + _B_AXIAL_SFLAGS
-    return struct.unpack_from(">i", cm.node["brushes"], o)[0]
-
-
-def _empty_node(cm: ClipMap, node_index: int) -> None:
-    """Turn a kd-tree node into an empty one (count 0, no children): it reaches
-    no brushes. Leaves the element in place so no node index or split child
-    offset moves."""
-    raw = bytearray(CLEAFBRUSHNODE_SIZE)
-    cm.nodes[node_index]["raw"] = bytes(raw)
-    cm.nodes[node_index]["brushes"] = None
-
-
-def remove_clip(cm: ClipMap, brush_index: int) -> None:
-    """Remove a clip brush: drop every reference to it from the kd-tree leaf
-    nodes and the flat pool, renumber the higher brush indices down by one, and
-    drop the ``cbrush_t`` record. Orphaned verts and emptied kd-tree nodes are
-    left in place (harmless, and renumbering node indices would move split child
-    offsets)."""
-    n = cm.num_brushes
-    if not 0 <= brush_index < n:
-        raise ClipError(f"brush {brush_index}: out of range 0..{n - 1}")
-    if brush_index in cm.flat_brushes():
-        raise ClipError(
-            f"brush {brush_index} is referenced through the flat leafBrushes pool "
-            "(cod2map-built); this module removes only brushes it added (inline-referenced)"
-        )
-
-    def renum(i: int) -> int:
-        return i - 1 if i > brush_index else i
-
-    for node_index in range(len(cm.nodes)):
-        inline = cm.inline_brush_list(node_index)
-        if inline is None:
-            continue
-        kept = [renum(b) for b in inline if b != brush_index]
-        if kept:
-            contents = struct.unpack_from(">i", cm.nodes[node_index]["raw"], _N_CONTENTS)[0]
-            cm.set_inline_brush_list(node_index, kept, contents)
-        else:
-            _empty_node(cm, node_index)
-            for leaf_index in range(cm.num_leafs):
-                if cm.leaf_root(leaf_index) == node_index:
-                    cm.set_leaf_root(leaf_index, 0)
-
-    flat = cm.flat_brushes()
-    if flat:
-        cm.set_flat_brushes([renum(b) for b in flat])  # length kept (guarded above)
-
-    b = bytearray(cm.node["brushes"])
-    del b[brush_index * CBRUSH_SIZE : (brush_index + 1) * CBRUSH_SIZE]
-    cm.node["brushes"] = bytes(b)
-    cm._hset(_H_NUM_BRUSHES, n - 1, u16=True)
-
-
-# -- footprint and clusters (a stock prop's collision is a cluster of clips) ------------------
-
-
-def _add3(a: Vec3, d: Vec3) -> Vec3:
-    return (a[0] + d[0], a[1] + d[1], a[2] + d[2])
+# -- footprint ------------------------------------------------------------------------------
 
 
 def clips_in_footprint(
@@ -577,10 +449,8 @@ def clips_in_footprint(
 ) -> list[int]:
     """The axis-aligned clip brushes under a footprint, by AABB. ``within`` keeps
     only brushes whose box lies inside [mins, maxs] (the cluster at a prop's
-    footprint: a stock prop is a bus-sized brush plus thinner shell brushes, all
-    inside its footprint); ``within=False`` keeps any brush whose box overlaps.
-    ``contents`` filters to one contents value (e.g. ``PLAYER_CLIP_CONTENTS``).
-    Non-axial brushes (numsides>0) are skipped."""
+    footprint); ``within=False`` keeps any brush whose box overlaps. ``contents``
+    filters to one contents value. Non-axial brushes (numsides>0) are skipped."""
     out = []
     for i in range(cm.num_brushes):
         br = cm.brush(i)
@@ -596,26 +466,128 @@ def clips_in_footprint(
     return out
 
 
-def translate_clip(cm: ClipMap, brush_index: int, delta: Vec3) -> None:
-    """Move one clip brush by a translation, keeping its size (``move_clip`` to
-    absolute bounds)."""
+# -- attachment -----------------------------------------------------------------------------
+
+
+def _is_attachable(cm: ClipMap, leaf: int) -> bool:
+    """A leaf is attachable when it holds no cod2map brushes: it reaches nothing,
+    or its root is a leaf node this view created."""
+    root = cm.leaf_root(leaf)
+    if root <= 0 or not cm.reachable_brushes(leaf):
+        return True
+    return root in cm._mine
+
+
+def _attach_targets(cm: ClipMap, mins: Vec3, maxs: Vec3) -> list[int]:
+    """The world leaves to reference a clip box from: every attachable leaf whose
+    box overlaps it, else the attachable zero-volume catch-all leaves (a map whose
+    leaves are tight around existing collision routes open space there)."""
+    overlapping, catch_all = [], []
+    for i in range(cm.num_leafs):
+        if not _is_attachable(cm, i):
+            continue
+        lo, hi = cm.leaf_box(i)
+        if lo == hi:
+            catch_all.append(i)
+        elif boxes_overlap(mins, maxs, lo, hi):
+            overlapping.append(i)
+    return overlapping or catch_all
+
+
+def _attach(cm: ClipMap, leaf_index: int, brush_index: int, contents: int) -> None:
+    """Reference ``brush_index`` from a world leaf through the flat pool: extend
+    our leaf node there, or give the leaf a fresh flat-backed node."""
+    root = cm.leaf_root(leaf_index)
+    if root in cm._mine:
+        have = cm.node_brush_list(root)
+        if brush_index not in have:
+            was = struct.unpack_from(">i", cm.nodes[root]["raw"], _N_CONTENTS)[0]
+            cm.set_flat_node(root, was | contents, have + [brush_index])
+    else:
+        node_index = cm.append_flat_node(contents, [brush_index])
+        cm.set_leaf_root(leaf_index, node_index)
+    cm.or_leaf_contents(leaf_index, contents)
+
+
+def _detach(cm: ClipMap, brush_index: int, keep: set[int]) -> None:
+    """Drop ``brush_index`` from our leaf nodes on leaves not in ``keep``."""
+    for leaf_index in range(cm.num_leafs):
+        if leaf_index in keep:
+            continue
+        root = cm.leaf_root(leaf_index)
+        if root not in cm._mine:
+            continue
+        have = cm.node_brush_list(root)
+        if brush_index not in have:
+            continue
+        rest = [b for b in have if b != brush_index]
+        if rest:
+            was = struct.unpack_from(">i", cm.nodes[root]["raw"], _N_CONTENTS)[0]
+            cm.set_flat_node(root, was, rest)
+        else:
+            cm.set_leaf_root(leaf_index, 0)
+
+
+# -- operations -----------------------------------------------------------------------------
+
+
+def add_clip(
+    cm: ClipMap,
+    mins: Vec3,
+    maxs: Vec3,
+    contents: int = PLAYER_CLIP_CONTENTS,
+    surface_flags: int = PLAYER_CLIP_SURFACE,
+) -> int:
+    """Add an axis-aligned clip brush (with its eight corner verts) and reference
+    it the cod2map way from the attachable world leaf(s) for its footprint.
+    Returns the new brush index. Raises ``ClipError`` when the clipMap has no
+    attachable leaf."""
+    targets = _attach_targets(cm, mins, maxs)
+    if not targets:
+        raise ClipError("clipMap has no empty BSP leaf to reference the clip from")
+    verts_ptr = cm.append_verts(mins, maxs)
+    numverts = 8 if verts_ptr else 0
+    brush = clip_cbrush(mins, maxs, contents, surface_flags, verts_ptr, numverts)
+    brush_index = cm.append_brush(brush)
+    for leaf_index in targets:
+        _attach(cm, leaf_index, brush_index, contents)
+    return brush_index
+
+
+def move_clip(cm: ClipMap, brush_index: int, mins: Vec3, maxs: Vec3) -> None:
+    """Move a clip brush to new bounds: rewrite the ``cbrush_t`` (its six axial
+    planes follow mins/maxs) and its corner verts in place, then re-evaluate the
+    world leaves it is referenced from. Raises ``ClipError`` when the new box
+    reaches no attachable leaf."""
     br = cm.brush(brush_index)
-    move_clip(cm, brush_index, _add3(br.mins, delta), _add3(br.maxs, delta))
+    if br.numsides:
+        raise ClipError(f"brush {brush_index} is not axis-aligned (has {br.numsides} sides)")
+    targets = _attach_targets(cm, mins, maxs)
+    if not targets:
+        raise ClipError("clipMap has no empty BSP leaf to reference the moved clip from")
+    cm.set_brush_bytes(
+        brush_index,
+        clip_cbrush(mins, maxs, br.contents, _surface_of(cm, brush_index),
+                    verts_ptr=br.verts_ptr, numverts=br.numverts),
+    )
+    if br.numverts and br.verts_ptr:
+        cm.set_brush_verts(brush_index, box_corner_verts(mins, maxs))
+    _detach(cm, brush_index, set(targets))
+    for leaf_index in targets:
+        _attach(cm, leaf_index, brush_index, br.contents)
 
 
-def move_cluster(cm: ClipMap, brush_indices: list[int], delta: Vec3) -> None:
-    """Move a whole clip cluster (a prop's set of brushes) by the same
-    translation, keeping the cluster's shape."""
-    for i in brush_indices:
-        translate_clip(cm, i, delta)
+def _surface_of(cm: ClipMap, brush_index: int) -> int:
+    off = brush_index * CBRUSH_SIZE + _B_AXIAL_SFLAGS
+    return struct.unpack_from(">i", cm.node["brushes"], off)[0]
 
 
 def disable_clip(cm: ClipMap, brush_index: int) -> None:
-    """Make a clip brush non-solid in place: zero its contents and its six axial
-    contents flags, leaving the record and its BSP references untouched. This is
-    the safe way to drop a stock (cod2map, flat-referenced) prop's collision,
-    where removing the record would have to shift the shared leafBrushes pool.
-    The brush stays in the array (harmless) but collides with nothing."""
+    """Make a clip brush non-solid in place: zero its contents and the six axial
+    contents flags, leaving the record and its references untouched. This is how a
+    clip is removed: the shared leafBrushes pool can only grow at its tail, so the
+    record and its pool entries stay (harmless) and the brush simply collides with
+    nothing."""
     b = bytearray(cm.node["brushes"])
     o = brush_index * CBRUSH_SIZE
     struct.pack_into(">i", b, o + _B_CONTENTS, 0)
@@ -624,17 +596,103 @@ def disable_clip(cm: ClipMap, brush_index: int) -> None:
     cm.node["brushes"] = bytes(b)
 
 
+def remove_clip(cm: ClipMap, brush_index: int) -> None:
+    """Remove a clip's collision: disable the brush in place (see ``disable_clip``)
+    and drop it from the leaf nodes this view attached it to."""
+    if not 0 <= brush_index < cm.num_brushes:
+        raise ClipError(f"brush {brush_index}: out of range 0..{cm.num_brushes - 1}")
+    disable_clip(cm, brush_index)
+    _detach(cm, brush_index, set())
+
+
+# -- clusters -------------------------------------------------------------------------------
+
+
+def _add3(a: Vec3, d: Vec3) -> Vec3:
+    return (a[0] + d[0], a[1] + d[1], a[2] + d[2])
+
+
+def translate_clip(cm: ClipMap, brush_index: int, delta: Vec3) -> None:
+    """Move one clip brush by a translation, keeping its size."""
+    br = cm.brush(brush_index)
+    move_clip(cm, brush_index, _add3(br.mins, delta), _add3(br.maxs, delta))
+
+
+def move_cluster(cm: ClipMap, brush_indices: list[int], delta: Vec3) -> None:
+    """Move a whole clip cluster (a prop's brushes) by the same translation,
+    keeping the cluster's shape."""
+    for i in brush_indices:
+        translate_clip(cm, i, delta)
+
+
 def remove_cluster(cm: ClipMap, brush_indices: list[int]) -> None:
-    """Remove a whole clip cluster. Brushes this module added (inline-referenced)
-    are removed outright (record dropped, indices renumbered); stock brushes
-    (referenced through the shared leafBrushes pool) are disabled in place. Mixed
-    clusters are handled: the inline ones are removed last, in descending index
-    order, so renumbering stays valid."""
-    indices = sorted(set(brush_indices), reverse=True)
-    flat = set(cm.flat_brushes())
-    for i in indices:
-        if i in flat:
-            disable_clip(cm, i)
-    for i in indices:
-        if i not in flat:
-            remove_clip(cm, i)
+    """Remove a whole clip cluster's collision (each brush disabled in place)."""
+    for i in sorted(set(brush_indices)):
+        remove_clip(cm, i)
+
+
+# -- offline check ---------------------------------------------------------------------------
+
+
+def check_world_leaf_refs(cm: ClipMap) -> list[str]:
+    """Problems that would crash the engine's world collision though the loader
+    and the pointer oracle pass. A world leaf's brush list is read through the
+    flat ``leafBrushes`` pool, so for every brush reachable from a ``cLeaf``:
+
+    - no leaf node under a world leaf may list its brushes *inline* (data == -1);
+      cod2map only does that for submodels, and an inline list under a world leaf
+      makes the engine index the pool out of bounds (this is what crashed
+      p_propclip: an added clip referenced by inline world-leaf nodes);
+    - every flat-backed leaf node's pool offset and count must stay inside the
+      pool and name brushes that exist.
+
+    Empty when the clipMap is safe."""
+    problems: list[str] = []
+    nbrush = cm.num_brushes
+    nflat = len(cm.node.get("leafbrushes") or b"") // 2
+    base = cm._flat_base()
+    for leaf in range(cm.num_leafs):
+        root = cm.leaf_root(leaf)
+        for node_index in _walk_nodes(cm, root):
+            if cm.node_count(node_index) <= 0:
+                continue
+            if cm.node_data(node_index) == _PTR_INLINE:
+                problems.append(
+                    f"leaf {leaf}: leaf node {node_index} lists its brushes inline "
+                    "(data == -1); world leaves must reference the flat leafBrushes pool"
+                )
+                continue
+            if base is None:
+                problems.append(f"leaf {leaf}: leaf node {node_index} is pool-backed but no pool")
+                continue
+            off = ((cm.node_data(node_index) - 1) & _OFFSET_MASK) - base
+            start, count = off // 2, cm.node_count(node_index)
+            if off < 0 or off % 2 or start + count > nflat:
+                problems.append(
+                    f"leaf {leaf}: leaf node {node_index} run {start}..{start + count} "
+                    f"is outside the {nflat}-entry leafBrushes pool"
+                )
+                continue
+            for b in cm.node_brush_list(node_index):
+                if not 0 <= b < nbrush:
+                    problems.append(
+                        f"leaf {leaf}: leaf node {node_index} names brush {b}, out of "
+                        f"0..{nbrush - 1}"
+                    )
+    return problems
+
+
+def _walk_nodes(cm: ClipMap, root: int, seen: set[int] | None = None) -> list[int]:
+    if seen is None:
+        seen = set()
+    if root in seen or root < 0 or root >= len(cm.nodes):
+        return []
+    seen.add(root)
+    out = [root]
+    if cm.node_count(root) <= 0:
+        raw = cm._node(root)
+        for child_off in (_N_CHILD0, _N_CHILD1):
+            rel = struct.unpack_from(">H", raw, child_off)[0]
+            if rel:
+                out += _walk_nodes(cm, root + rel, seen)
+    return out
