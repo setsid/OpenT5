@@ -61,6 +61,13 @@ HELP_LINES = (
     "hold RMB to fly: WASD move, Q/E down/up, Shift faster, wheel sets speed",
     "double click to focus   F frame focus   Home frame all   H hide help",
 )
+#: Prepended to the hint when the view can be edited but Edit mode is off.
+EDIT_OFF_HINT = ("Edit is OFF: click Edit (top right) to select and move props",)
+#: Prepended to the hint when Edit mode is on.
+EDIT_ON_HELP = (
+    "EDIT ON: click a prop to select, then drag a gizmo axis to move",
+    "G move   R rotate   B add crate   Del remove   Ctrl+D duplicate   Esc deselect",
+)
 _FLY_KEYS = frozenset(
     (Qt.Key.Key_W, Qt.Key.Key_A, Qt.Key.Key_S, Qt.Key.Key_D, Qt.Key.Key_Q, Qt.Key.Key_E)
 )
@@ -912,6 +919,9 @@ class MeshCanvas(QWidget):
         super().__init__(parent)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.controller = None  # a MapEditController while editing, else None
+        #: True when this zone can be edited, so the hint prompts to turn on Edit even
+        #: before the controller exists.
+        self.edit_available = False
         self._edit_drag = False
         self._press_pos = None
         self.setMinimumSize(120, 90)
@@ -1101,20 +1111,31 @@ class MeshCanvas(QWidget):
             self._paint_edit(p)
         p.end()
 
+    def _help_lines(self) -> tuple[str, ...]:
+        """Camera controls, plus edit controls when Edit is on, or a prompt to turn it on."""
+        if self.controller is not None:
+            return EDIT_ON_HELP + HELP_LINES
+        if self.edit_available:
+            return EDIT_OFF_HINT + HELP_LINES
+        return HELP_LINES
+
     def _paint_help(self, p: QPainter) -> int:
         """Draw the controls hint in the bottom-left corner. Returns its top y."""
         t = theme.current()
         p.setFont(theme.mono_font(7))
         fm = p.fontMetrics()
-        width = max(fm.horizontalAdvance(line) for line in HELP_LINES) + 12
-        block = fm.height() * len(HELP_LINES) + 8
+        lines = self._help_lines()
+        width = max(fm.horizontalAdvance(line) for line in lines) + 12
+        block = fm.height() * len(lines) + 8
         top = self.height() - block - 6
         back = QColor(t.base)
         back.setAlpha(170)
         p.fillRect(6, top, width, block, back)
-        p.setPen(QColor(t.text_dim))
+        # the first line is the edit cue; draw it in the accent so it stands out
+        edit_cue = self.controller is not None or self.edit_available
         y = top + 4 + fm.ascent()
-        for line in HELP_LINES:
+        for i, line in enumerate(lines):
+            p.setPen(QColor(t.accent if edit_cue and i == 0 else t.text_dim))
             p.drawText(12, y, line)
             y += fm.height()
         return top
@@ -1522,6 +1543,15 @@ class MapEditPanel(QWidget):
         title.setFont(f)
         root.addWidget(title)
 
+        how = QLabel(
+            "Click a prop in the view to select it, then drag a gizmo axis to move it.\n"
+            "G move   R rotate   B add crate   Del remove   Ctrl+D duplicate   Esc deselect",
+            self,
+        )
+        how.setObjectName("AssetMeta")
+        how.setWordWrap(True)
+        root.addWidget(how)
+
         mode_row = QHBoxLayout()
         self.mode = QComboBox(self)
         self.mode.addItems(["Translate (G)", "Rotate (R)"])
@@ -1658,7 +1688,7 @@ class MapEditPanel(QWidget):
         self.dup_button.setEnabled(has)
         self.del_button.setEnabled(has)
         if obj is None:
-            self.selected_label.setText("Nothing selected")
+            self.selected_label.setText("Nothing selected: click a prop in the view to select it.")
             return
         self.selected_label.setText(f"{obj.kind}: {obj.label}  (id {obj.id})")
         for key, value in obj.keys.items():
@@ -2039,6 +2069,7 @@ class MeshView(AssetView):
         self.models_button.setVisible(kind in ("world", "world_models"))
         self._teardown_edit()
         self.edit_button.setVisible(self._can_edit())
+        self.canvas.edit_available = self._can_edit()
         label = ref.label if ref is not None else KIND_TITLES.get(kind, kind)
         self._show_message(f"Building mesh for {label} ...")
         job = _MeshJob(self._generation, doc, kind, ref)
@@ -2062,6 +2093,7 @@ class MeshView(AssetView):
         self.models_button.setVisible(kind in ("world", "world_models"))
         self._teardown_edit()
         self.edit_button.setVisible(self._can_edit())
+        self.canvas.edit_available = self._can_edit()
         self._sync = True
         try:
             mesh = doc.mesh(kind, ref)
