@@ -141,3 +141,12 @@ either make the material/IWI clone cod2rad-valid, or compile with per-block-type
 stock materials and apply the custom pixel art through the converter's forced
 map-own overrides. Added generator toggles (--no-water/--no-caves/--flat, commit
 eaf1704) that made the bisection possible and are useful in their own right.
+
+**k_box_full passed the lighting fix on device; two converter bugs found.** The
+viewmodel is normally lit, so the primary-light grid fix works. Two real bugs:
+(1) static-model props have no collision (placed visually but their collision is
+not carried into the clipMap); (2) a wall texture reads mirrored on one wall (UV
+or tangent handedness flip on some converted gfx faces). Investigating both
+offline while the user runs fixC/fixD. Blocky-map approach decided with the user:
+per-block stock materials plus forced converter overrides for the custom art
+(not debugging the material clone); held until fixC/fixD are reported.

@@ -206,3 +206,11 @@ Device test:
   path nodes for converted maps). Still hangs at "Awaiting challenge" -> the stall is the
   DOM flag influencers themselves; also run Team Deathmatch on the plain modes box to split
   a generic `updateAllSpawnPoints` stall from the DOM-specific influencer path.
+
+## Result in RPCS3 (k_box_full, local TDM)
+
+- All 8 props render with correct textures; the custom checker wall texture shows;
+  the viewmodel is normally lit (maybe slightly dim). The light-grid fix (A) works.
+- Issue 1: the props have no collision, the player walks through them.
+- Issue 2: the wall texture's text reads mirrored on one wall (a UV or tangent
+  flip on those faces).
