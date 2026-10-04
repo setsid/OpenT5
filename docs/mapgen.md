@@ -134,12 +134,15 @@ spread of `mp_tdm_spawn` (TDM) and `mp_dm_spawn` (FFA) on flat surface cells; tw
 origins for the compass; and a `node_pathnode` grid on walkable cells by default, so Domination
 and the other team-based modes do not stall at load.
 
-Status (verified here): the full pipeline runs. cod2map, cod2rad and linker_pc all return 0 for
-the generated map, and `blockmap convert` parses the PC zone exactly, converts onto mp_nuked with
-0 pointers unresolved, verifies, and passes the emulated loader (same_values 63240/63240, 0 targets
-outside their block). The first map with ropes also surfaced a PC-only `rope_t` stride in the
-clipMap RUNTIME parse (0xCB0, not the PS3 0xC74; see the clipMap handler). The device check is
-whether the primary-light grid lights the world acceptably without a sun.
+Status (verified here): the PC build runs. cod2map, cod2rad and linker_pc all return 0 for the
+generated map. `blockmap convert` does not yet parse the PC zone exactly: its gfx_map RUNTIME
+block is 0x780 short of the header. This is a PC-parse gap in the gfx_map RUNTIME handler
+(convert/pc.py), exposed by the blocky map's terrain and nine-light structure, not present on the
+box (which parses exactly). It is unrelated to ropes: col_map and game_map both parse exactly, and
+every gfx_map RUNTIME reserve size is captured, so the 0x780 is an alignment or sizing subtlety in
+one gfx_map array for this map's counts. Parked until found; the earlier converted blocky zone was
+produced with a wrong rope stride that happened to mask the gap and should not be trusted. The
+generator side (map, materials, sealing, lighting, path nodes) is correct and compiles.
 
 ## 5. Conversion and offline validation
 

@@ -179,3 +179,21 @@ converter force-builds those eleven materials from the PC zone and overrides eac
 one's colour map with the map's own pixel art, so the block textures are the map's
 own while the material structure stays stock. No new material or IWI is written
 into the game folder.
+
+**Path nodes: the "not connected" failure is runtime linking, not cut links.** n_box_all
+dropped to the lobby on device with "Path nodes are not connected." Diffing fixD and
+n_box_all showed byte-identical path data (same 25 nodes, 0 stored links in both). cod2map
+does not author path-node links at all (a dense 9x9 grid still compiled with 0 links), so the
+engine links the nodes at load from their positions and the collision; the only difference
+between the two maps is the added prop clips and bomb-site solids. The box path-node grid is
+now dense (9x9), skips any node inside a solid, and the build fails unless the modelled graph
+is a single connected component (n_box_all2). Honest caveat: the offline connectivity models
+kept the 5x5 grid connected, so the exact blocker was not reproduced offline; the dense grid
+is a robustness fix pending the device result. If it still fails, a three-way device
+isolation (no clips / no site solids / no props) will pin the collision.
+
+**Reverted the PC rope_t stride change.** The box and stock mp_nuked both carry 32 ropes and
+reserve exactly at 0xC74, so PC rope_t is 0xC74. The blocky map's 0x780 RUNTIME shortfall is a
+separate, pre-existing gap in the gfx_map RUNTIME parse (convert/pc.py), not ropes; the rope
+bump masked it by coincidence (32 x 0x3C) and broke the box. The blocky convert is parked on
+that gfx_map gap; the earlier o_blocks zone was built with the wrong stride and is not trusted.
