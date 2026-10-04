@@ -114,3 +114,39 @@ def test_nearest_marker_depth_tie_break():
     pts = np.array([[300.0, 300.0], [300.0, 300.0]])
     # both equally close; the nearer depth wins
     assert gz.nearest_marker(pts, (300, 300), 10.0, depths=[50.0, 10.0]) == 1
+
+
+# -- prop rotation about Z (v0.3.0 phase 2.5) -------------------------------------------------
+
+
+def test_yaw_matrix_turns_x_to_y():
+    r = gz.yaw_matrix(90.0)
+    assert np.allclose(np.array([1.0, 0.0, 0.0]) @ r, (0.0, 1.0, 0.0), atol=1e-9)
+    assert np.allclose(np.array([0.0, 0.0, 1.0]) @ r, (0.0, 0.0, 1.0))  # Z unchanged
+
+
+def test_is_axial_turn():
+    assert all(gz.is_axial_turn(a) for a in (0, 90, 180, 270, 360, -90, 89.7))
+    assert not any(gz.is_axial_turn(a) for a in (45, 30, 1, 91.0))
+
+
+def test_rotated_box_aabb_quarter_turn_swaps_extents():
+    # a box 10 wide in X and 20 in Y, centred at the origin
+    mn, mx = (-5.0, -10.0, 0.0), (5.0, 10.0, 8.0)
+    nmn, nmx = gz.rotated_box_aabb_z(mn, mx, (0.0, 0.0, 0.0), 90.0)
+    # a quarter turn swaps the X and Y extents exactly, Z untouched
+    assert np.allclose((nmx[0] - nmn[0], nmx[1] - nmn[1]), (20.0, 10.0))
+    assert (nmn[2], nmx[2]) == (0.0, 8.0)
+
+
+def test_rotated_box_aabb_half_turn_is_same_box():
+    mn, mx = (-5.0, -10.0, 0.0), (5.0, 10.0, 8.0)
+    nmn, nmx = gz.rotated_box_aabb_z(mn, mx, (0.0, 0.0, 0.0), 180.0)
+    assert np.allclose(nmn, mn) and np.allclose(nmx, mx)
+
+
+def test_rotated_box_aabb_non_axial_encloses():
+    # a 10x10 square rotated 45 degrees has a wider axis-aligned bounding box
+    mn, mx = (-5.0, -5.0, 0.0), (5.0, 5.0, 2.0)
+    nmn, nmx = gz.rotated_box_aabb_z(mn, mx, (0.0, 0.0, 0.0), 45.0)
+    assert nmx[0] - nmn[0] > 13.0 and nmx[1] - nmn[1] > 13.0  # ~10*sqrt(2)

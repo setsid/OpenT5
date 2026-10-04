@@ -240,3 +240,108 @@ def _zone_content(path):
     from opent5.container.zone import Zone
 
     return Zone.open(path).content
+
+
+# -- prop render moves with the clip (phase 2.5) ----------------------------------------------
+
+
+def _addable_model(s: EditSession):
+    props = s.static_models()
+    if not props:
+        return None
+    box = next((p.model for p in props if p.model and "box" in p.model.lower()), None)
+    return box or props[0].model
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_add_prop_creates_render_and_clip_and_undo_restores(nuked_bytes):
+    s = _session(nuked_bytes)
+    cm, loc = s._clip_engine()
+    model = _addable_model(s)
+    if model is None:
+        pytest.skip("this mp_nuked build carries no static models to clone")
+    base = s.build()
+    nb, nsm, ndraw = cm.num_brushes, s._sml_count(), len(s._draw_insts() or [])
+
+    res = s.add_prop(model, *NEW_BOX)
+
+    assert cm.num_brushes == nb + 1  # a clip brush, so it is solid
+    assert _solid(cm, loc, res["brush"], _centre(NEW_BOX))
+    assert s._sml_count() == nsm + 1  # a clipMap cStaticModel render record
+    assert len(s._draw_insts() or []) == ndraw + 1  # and a GfxWorld draw instance
+    assert any(p.index == res["prop"] for p in s.static_models())  # listed, selectable
+    back = parse(s.build())
+    assert back.problems() == []
+    assert pc.check_world_leaf_refs(pc.ClipMap(_clipmap(back))) == []
+
+    assert s.undo() is not None
+    assert s.build() == base  # undo restores the clip and the render byte for byte
+    assert s.redo() is not None and cm.num_brushes == nb + 1
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_move_prop_moves_the_render_cstaticmodel(nuked_bytes):
+    import struct
+
+    from opent5.edit.mapedit import _SM_ORIGIN, _SM_SIZE
+
+    s = _session(nuked_bytes)
+    base = s.build()
+    bus = _bus(s)
+    o = bus.index * _SM_SIZE
+    old = struct.unpack_from(">3f", s._clip_node["static_model_list"], o + _SM_ORIGIN)
+    # a stock bus has a GfxWorld draw instance at its origin
+    assert s._draw_inst_at_origin(old) is not None
+    delta = (400.0, 0.0, 0.0)
+
+    res = s.move_prop_clip(bus.index, delta, footprint=bus.footprint)
+
+    assert res["found"]
+    new = struct.unpack_from(">3f", s._clip_node["static_model_list"], o + _SM_ORIGIN)
+    assert new[0] == pytest.approx(old[0] + 400.0)  # cStaticModel render origin moved
+    assert s._draw_inst_at_origin((old[0] + 400.0, old[1], old[2])) is not None  # draw inst too
+    assert s._draw_inst_at_origin(old) is None  # and left the old spot
+    assert parse(s.build()).problems() == []
+    assert s.undo() is not None
+    assert s.build() == base
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_rotate_prop_quarter_turn_swaps_cluster_and_undo(nuked_bytes):
+    import struct
+
+    from opent5.edit.mapedit import _SM_INVAXIS, _SM_SIZE
+
+    s = _session(nuked_bytes)
+    cm, _loc = s._clip_engine()
+    base = s.build()
+    bus = _bus(s)
+    cluster = s.clip_cluster_in_footprint(*bus.footprint)
+    i = cluster[0]
+    ext0 = (cm.brush(i).maxs[0] - cm.brush(i).mins[0], cm.brush(i).maxs[1] - cm.brush(i).mins[1])
+    o = bus.index * _SM_SIZE
+    inv0 = struct.unpack_from(">9f", s._clip_node["static_model_list"], o + _SM_INVAXIS)
+
+    res = s.rotate_prop_clip(bus.index, 90.0, footprint=bus.footprint)
+
+    assert res["found"] and not any("not a quarter turn" in w for w in res["warnings"])
+    ext1 = (cm.brush(i).maxs[0] - cm.brush(i).mins[0], cm.brush(i).maxs[1] - cm.brush(i).mins[1])
+    assert ext1[0] == pytest.approx(ext0[1]) and ext1[1] == pytest.approx(ext0[0])  # X/Y swapped
+    inv1 = struct.unpack_from(">9f", s._clip_node["static_model_list"], o + _SM_INVAXIS)
+    assert inv1 != inv0  # the render invScaledAxis turned too
+    assert parse(s.build()).problems() == []
+    assert s.undo() is not None
+    assert s.build() == base
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_rotate_prop_non_axial_keeps_axial_clip_and_warns(nuked_bytes):
+    s = _session(nuked_bytes)
+    bus = _bus(s)
+    result = s.rotate_prop_clip(bus.index, 45.0, footprint=bus.footprint)
+    assert result["found"]
+    assert any("not a quarter turn" in w for w in result["warnings"])

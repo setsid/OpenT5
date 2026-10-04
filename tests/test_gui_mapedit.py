@@ -241,3 +241,92 @@ def test_prop_selection_shows_cluster_and_delete_removes_it():
     assert any("baked lightmap shadow" in w for w in ctl.warnings)
     session.undo()
     assert not session.can_undo  # the clip delete was the only edit, now undone
+
+
+# -- prop drag-move, rotate and add-crate, driving the clip-aware EditSession (phase 2.5) -----
+
+
+def _nuked_controller():
+    path = find_zone("mp_nuked")
+    if path is None:
+        pytest.skip("mp_nuked.ff is not on this machine")
+    session = EditSession(Document.open(path.read_bytes(), name="mp_nuked.ff"))
+    ctl = mv.MapEditController(session)
+    if not ctl.props():
+        pytest.skip("this mp_nuked build carries no static-model props")
+    return session, ctl
+
+
+def _pick_prop(ctl, model="t5_veh_schoolbus"):
+    prop = next((p for p in ctl.props() if p.model == model), None) or ctl.props()[0]
+    cam = mv.Camera()
+    _aim(cam, prop.origin)
+    ctl.pick(cam, 320, 240, 640, 480)
+    if ctl.selected_prop != prop.index:
+        pytest.skip("the prop did not pick under the cursor on this build")
+    return prop, cam
+
+
+def _origin_bytes(session, index):
+    import struct
+
+    from opent5.edit.mapedit import _SM_ORIGIN, _SM_SIZE
+
+    o = index * _SM_SIZE
+    return struct.unpack_from(">3f", session._clip_node["static_model_list"], o + _SM_ORIGIN)
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_prop_drag_move_drives_move_prop_clip_reversibly():
+    session, ctl = _nuked_controller()
+    prop, cam = _pick_prop(ctl)
+    ctl.mode = "translate"
+    before = _origin_bytes(session, prop.index)
+    ctl.begin_drag(0, cam, 320, 240, 640, 480)  # grab the X handle
+    ctl.update_drag(cam, 470, 240, 640, 480)  # drag: preview only, no edit yet
+    assert ctl.previewing and not session.can_undo
+    ctl.end_drag()  # commit the move through EditSession.move_prop_clip
+    assert session.history() and session.history()[-1] == "move prop clip"
+    after = _origin_bytes(session, prop.index)
+    assert after[0] != before[0] and not ctl.previewing  # render origin moved with the clip
+    session.undo()
+    assert _origin_bytes(session, prop.index) == before  # exact undo
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_prop_rotate_drag_drives_rotate_prop_clip_reversibly():
+    session, ctl = _nuked_controller()
+    prop, cam = _pick_prop(ctl)
+    ctl.mode = "rotate"
+    ctl.begin_drag(2, cam, 400, 240, 640, 480)  # about Z
+    ctl.update_drag(cam, 320, 330, 640, 480)
+    assert ctl.previewing and not session.can_undo
+    ctl.end_drag()
+    assert session.history() and session.history()[-1] == "rotate prop clip"
+    assert not ctl.previewing
+    session.undo()
+    assert not session.can_undo  # the rotate was the only edit
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_gui_add_crate_creates_a_solid_prop_with_clip():
+    session, ctl = _nuked_controller()
+    if ctl.default_crate_model() is None:
+        pytest.skip("no crate-like model in this build")
+    view = mv.MeshView()
+    view.canvas.set_controller(ctl)
+    view.panel.set_controller(ctl, on_save=lambda p: None)
+    view.canvas.camera.target = np.array([204.0, -47.0, 60.0])  # the open R&D spot
+    n = len(ctl.props())
+    view.canvas.keyPressEvent(
+        QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_B, Qt.KeyboardModifier.NoModifier)
+    )
+    assert len(ctl.props()) == n + 1  # a new static-model prop
+    assert ctl.selected_prop is not None
+    assert ctl.selected_cluster()  # with a real clip cluster, so it is solid
+    assert session.history()[-1] == "add prop"
+    session.undo()
+    assert not session.can_undo  # one reversible edit
