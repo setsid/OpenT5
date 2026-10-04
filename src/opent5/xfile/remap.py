@@ -721,6 +721,15 @@ class Rewrite:
         self._layout: _Layout | None = None
         self._by_ident: dict[tuple, int] | None = None
         self._reads: tuple[list[int], list[int]] | None = None
+        #: Allocation identities (``("L", id(node), key)``) the caller grew by
+        #: appending at the tail. A pointer whose target is the old end of such an
+        #: allocation (one past its last original byte) resolves to the appended
+        #: tail of that same allocation, rather than to whatever allocation begins
+        #: there. Needed to point at data appended to an array that another
+        #: allocation immediately follows (e.g. the clipMap leafBrushes pool, which
+        #: leafBrushNodes follows). Empty by default, so ordinary remaps are
+        #: unchanged.
+        self.append_identities: set[tuple] = set()
 
     # -- the original layout ---------------------------------------------------------------
 
@@ -799,6 +808,29 @@ class Rewrite:
                     duplicate.add(ident)
                 by_ident[ident] = a
         positions: dict[int, dict[int, int]] = {}
+        # Allocations the caller grew by appending (see append_identities). A
+        # pointer into the appended tail, which lies strictly past the original
+        # end (where another allocation begins, so ``_Layout.find`` would pick
+        # that neighbour or padding), resolves to the grown allocation. The range
+        # is open at the old end so a legitimate pointer to the next allocation's
+        # start keeps resolving to it; the caller leaves the first appended slot
+        # unused so nothing of its own lands exactly on that boundary.
+        append_extents: list[tuple[int, int, int, Allocation]] = []
+        for b, allocs in old.by_block.items():
+            for a in allocs:
+                ident = self.trace.ident.get(a.event)
+                if ident in self.append_identities:
+                    a_new = by_ident.get(ident)
+                    if a_new is not None and a_new.old_size > a.old_size:
+                        old_end = a.old_start + a.old_size
+                        append_extents.append((b, old_end, a.old_start + a_new.old_size, a))
+
+        def _find_old(block: int, offset: int) -> Allocation:
+            for b, old_end, new_end, a in append_extents:
+                if b == block and old_end < offset < new_end:
+                    return a
+            return old.find(block, offset, NONE)
+
         endian = self.xfile.platform.endian
         out = bytearray(written.content)
         pointers: list[tuple[int, int, int]] = []
@@ -812,7 +844,7 @@ class Rewrite:
                     f"pointer field at {at:#x} (value {raw:#010x}): expected a target outside "
                     "TEMP, found one in TEMP"
                 )
-            a_old = old.find(block, offset, NONE)
+            a_old = _find_old(block, offset)
             ident = self.trace.ident.get(a_old.event)
             a_new = by_ident.get(ident) if ident is not None else None
             if a_new is None or ident in duplicate:

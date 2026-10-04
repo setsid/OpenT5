@@ -1,14 +1,17 @@
 """Axis-aligned clip cbrushes for the map editor (opent5.convert.propclip).
 
 Fast tests (no zones): the pure cbrush / vert / node builders, a cbrush byte for
-byte against a recorded cod2map clip box, and add / move / remove / footprint /
-cluster logic on a hand-built synthetic clipMap node.
+byte against a recorded cod2map clip box, the kd-tree walker and the footprint
+finder on a hand-built synthetic clipMap, and the world-leaf reference check
+(which catches the inline-under-world-leaf structure that crashed the first
+device build, p_propclip).
 
-Zone tests (marked ``zones``): on a real PS3 clipMap, a clip box added through
-the node rewrite reparses exactly and is reachable from the leaf(s) it was
-attached to, an added cbrush is byte-identical in shape to a cod2map axial
-brush, and a stock clip cluster moves and is disabled with the zone still exact.
-The emulated loader (oracle) is a slow, ELF-gated check.
+Zone tests (marked ``zones``): on a real PS3 clipMap, a clip added through the
+node rewrite reparses exactly, is referenced through the flat leafBrushes pool
+(as cod2map references world-leaf brushes, never inline), and passes the check;
+move and remove likewise; and an added cbrush is byte-identical in shape to a
+cod2map axial brush. The emulated loader (oracle) is a slow, ELF-gated check that
+now also runs the world-leaf reference check.
 """
 
 from __future__ import annotations
@@ -27,14 +30,11 @@ from opent5.xfile.remap import Rewrite
 
 # -- fast: pure builders ---------------------------------------------------------------------
 
-#: n_box_all2 brush 0 (a device-proven v0.2.0 clip box), its first 0x54 bytes:
-#: mins (266,-458,0), contents 0x8030200, maxs (334,-438,26), numsides 0, sides 0,
-#: six axial cflags 0x8030200, six axial sflags 0x440A0. The verts tail (0x54..0x60)
-#: is left out: cod2map points it at eight box-corner verts, an added brush does not.
+#: n_box_all2 brush 0 (a device-proven v0.2.0 clip box), its first 0x54 bytes.
 COD2MAP_BRUSH0_HEAD = bytes.fromhex(
-    "43850000c3e5000000000000"  # mins
+    "43850000c3e5000000000000"  # mins (266, -458, 0)
     "08030200"  # contents
-    "43a70000c3db000041d00000"  # maxs
+    "43a70000c3db000041d00000"  # maxs (334, -438, 26)
     "00000000"  # numsides
     "00000000"  # sides
     "080302000803020008030200080302000803020008030200"  # axial cflags[6]
@@ -46,18 +46,18 @@ def test_clip_cbrush_matches_cod2map_box():
     out = pc.clip_cbrush((266.0, -458.0, 0.0), (334.0, -438.0, 26.0))
     assert len(out) == pc.CBRUSH_SIZE
     assert out[:0x54] == COD2MAP_BRUSH0_HEAD
-    # an added brush carries no verts (NULL run)
-    assert struct.unpack_from(">I", out, pc._B_NUMVERTS)[0] == 0
-    assert struct.unpack_from(">I", out, pc._B_VERTS)[0] == 0
 
 
-def test_clip_cbrush_fields_round_trip():
-    out = pc.clip_cbrush((1.0, 2.0, 3.0), (4.0, 5.0, 6.0), contents=0x1, surface_flags=0x44)
+def test_clip_cbrush_fields():
+    out = pc.clip_cbrush((1.0, 2.0, 3.0), (4.0, 5.0, 6.0), contents=0x1, surface_flags=0x44,
+                         verts_ptr=0x1234, numverts=8)
     assert struct.unpack_from(">3f", out, pc._B_MINS) == (1.0, 2.0, 3.0)
     assert struct.unpack_from(">3f", out, pc._B_MAXS) == (4.0, 5.0, 6.0)
     assert struct.unpack_from(">i", out, pc._B_CONTENTS)[0] == 0x1
     assert struct.unpack_from(">I", out, pc._B_NUMSIDES)[0] == 0
     assert struct.unpack_from(">I", out, pc._B_SIDES)[0] == 0
+    assert struct.unpack_from(">I", out, pc._B_NUMVERTS)[0] == 8
+    assert struct.unpack_from(">I", out, pc._B_VERTS)[0] == 0x1234
     for k in range(6):
         assert struct.unpack_from(">i", out, pc._B_AXIAL_CFLAGS + 4 * k)[0] == 0x1
         assert struct.unpack_from(">i", out, pc._B_AXIAL_SFLAGS + 4 * k)[0] == 0x44
@@ -71,113 +71,135 @@ def test_clip_cbrush_rejects_inverted_bounds():
 def test_box_corner_verts():
     v = pc.box_corner_verts((0.0, 0.0, 0.0), (2.0, 4.0, 8.0))
     corners = [struct.unpack_from(">3f", v, 12 * i) for i in range(8)]
-    assert len(corners) == 8
-    assert set(corners) == {
-        (x, y, z) for x in (0.0, 2.0) for y in (0.0, 4.0) for z in (0.0, 8.0)
-    }
+    assert set(corners) == {(x, y, z) for x in (0.0, 2.0) for y in (0.0, 4.0) for z in (0.0, 8.0)}
 
 
 def test_boxes_overlap():
     assert pc.boxes_overlap((0, 0, 0), (1, 1, 1), (1, 1, 1), (2, 2, 2))  # touching
     assert not pc.boxes_overlap((0, 0, 0), (1, 1, 1), (2, 2, 2), (3, 3, 3))
-    assert not pc.boxes_overlap((0, 0, 0), (1, 1, 1), (0, 0, 5), (1, 1, 6))  # z apart
+    assert not pc.boxes_overlap((0, 0, 0), (1, 1, 1), (0, 0, 5), (1, 1, 6))
 
 
-def test_inline_leaf_node():
-    n = pc.inline_leaf_node(0x8030200, [3, 7])
+def test_flat_leaf_node():
+    n = pc.flat_leaf_node(0x8030200, 0x80001001, 2)
     assert struct.unpack_from(">h", n["raw"], pc._N_COUNT)[0] == 2
-    assert struct.unpack_from(">I", n["raw"], pc._N_DATA)[0] == 0xFFFFFFFF
-    assert n["brushes"] == struct.pack(">HH", 3, 7)
+    assert struct.unpack_from(">I", n["raw"], pc._N_DATA)[0] == 0x80001001
+    assert n["brushes"] is None
     with pytest.raises(pc.ClipError):
-        pc.inline_leaf_node(0, [])
+        pc.flat_leaf_node(0, 0, 0)
 
 
-# -- fast: a synthetic clipMap node ----------------------------------------------------------
+# -- fast: a synthetic clipMap (flat pool, no Rewrite) ---------------------------------------
+
+#: A VIRTUAL-block base for the synthetic flat pool's pointers.
+_POOL_MEM = 0x1000
+_POOL_PTR = ((4 << pc._OFFSET_BLOCK_SHIFT) | _POOL_MEM) + 1
 
 
-def synthetic_clipmap(leaf_boxes):
-    """A minimal clipMap node: one empty kd-tree node, the given leaf boxes all
-    rooted at it, and no brushes."""
+def synthetic(leaf_boxes, flat, nodes, roots):
+    """Build a clipMap node by hand. ``flat`` is the leafBrushes pool (list of
+    brush indices). ``nodes`` are (count, contents, data_or_inline) where
+    data_or_inline is a pool byte-offset for a flat leaf, 'inline:[idx...]' for an
+    inline leaf, or ('split', child0, child1) for a split. ``roots`` gives each
+    leaf's root node index. Enough to exercise the walker, footprint and check."""
+    inline_max = max((max(s[2]) for s in nodes if s[0] != "split" and isinstance(s[2], list)),
+                     default=-1)
+    nbrush = max(max(flat, default=-1), inline_max) + 1
     header = bytearray(0x14C)
-    struct.pack_into(">I", header, 0x30, len(leaf_boxes))  # numLeafs
-    struct.pack_into(">I", header, 0x38, 1)  # leafbrushNodesCount
+    struct.pack_into(">H", header, pc._H_NUM_BRUSHES, nbrush)
+    struct.pack_into(">I", header, pc._H_NUM_LEAFS, len(leaf_boxes))
+    struct.pack_into(">I", header, pc._H_LBN_COUNT, len(nodes))
+    struct.pack_into(">I", header, pc._H_NUM_LEAFBRUSHES, len(flat))
     leafs = bytearray()
-    for lo, hi in leaf_boxes:
+    for (lo, hi), root in zip(leaf_boxes, roots, strict=True):
         rec = bytearray(pc.CLEAF_SIZE)
         struct.pack_into(">3f", rec, pc._L_MINS, *lo)
         struct.pack_into(">3f", rec, pc._L_MAXS, *hi)
-        struct.pack_into(">i", rec, pc._L_LEAFBRUSHNODE, 0)
+        struct.pack_into(">i", rec, pc._L_LEAFBRUSHNODE, root)
         leafs += rec
-    empty = {"_t": "cLeafBrushNode_s", "raw": bytes(pc.CLEAFBRUSHNODE_SIZE), "brushes": None}
+    node_dicts = []
+    for spec in nodes:
+        r = bytearray(pc.CLEAFBRUSHNODE_SIZE)
+        brushes = None
+        if spec[0] == "split":
+            _, c0, c1 = spec
+            struct.pack_into(">h", r, pc._N_COUNT, 0)
+            struct.pack_into(">H", r, pc._N_CHILD0, c0)
+            struct.pack_into(">H", r, pc._N_CHILD1, c1)
+        else:
+            count, contents, data = spec
+            struct.pack_into(">h", r, pc._N_COUNT, count)
+            struct.pack_into(">i", r, pc._N_CONTENTS, contents)
+            if isinstance(data, list):  # inline
+                struct.pack_into(">I", r, pc._N_DATA, pc._PTR_INLINE)
+                brushes = b"".join(struct.pack(">H", b) for b in data)
+            else:  # pool byte offset
+                ptr = ((4 << pc._OFFSET_BLOCK_SHIFT) | (_POOL_MEM + data)) + 1
+                struct.pack_into(">I", r, pc._N_DATA, ptr)
+        node_dicts.append({"_t": "cLeafBrushNode_s", "raw": bytes(r), "brushes": brushes})
     return {
         "_t": "clipMap_t",
         "header": bytes(header),
-        "brushes": b"",
+        "brushes": pc.clip_cbrush((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)) * nbrush,
         "leafs": bytes(leafs),
-        "leafbrush_nodes": [empty],
-        "leafbrushes": b"",
-        "brush_verts": b"",
+        "leafbrush_nodes": node_dicts,
+        "leafbrushes": b"".join(struct.pack(">H", b) for b in flat),
+        "brush_verts": None,
     }
 
 
-def test_synthetic_add_attaches_and_is_reachable():
-    cm = pc.ClipMap(synthetic_clipmap([((-100, -100, -100), (100, 100, 100)),
-                                       ((200, 200, 200), (300, 300, 300))]))
-    idx = pc.add_clip(cm, (0.0, 0.0, 0.0), (10.0, 10.0, 10.0))
-    assert idx == 0
-    assert cm.num_brushes == 1
-    assert cm.reachable_brushes(0) == {0}  # overlaps leaf 0
-    assert cm.reachable_brushes(1) == set()  # not leaf 1
+def test_walker_flat_split_inline():
+    # leaf 0 -> split -> two flat leaves; leaf 1 -> one flat leaf; leaf 2 -> inline.
+    flat = [5, 7, 9]  # pool entries at byte 0, 2, 4
+    nodes = [
+        ("split", 1, 2),          # 0
+        (1, 0x1, 0),              # 1: flat, pool offset 0 -> brush 5
+        (2, 0x1, 2),              # 2: flat, pool offset 2 -> brushes 7, 9
+        (1, 0x1, 4),              # 3: flat, pool offset 4 -> brush 9
+        (1, 0x1, [11]),           # 4: inline -> brush 11
+    ]
+    cm = pc.ClipMap(synthetic(
+        [((0, 0, 0), (1, 1, 1)), ((0, 0, 0), (1, 1, 1)), ((0, 0, 0), (1, 1, 1))],
+        flat, nodes, roots=[0, 3, 4],
+    ))
+    assert cm.reachable_brushes(0) == {5, 7, 9}
+    assert cm.reachable_brushes(1) == {9}
+    assert cm.reachable_brushes(2) == {11}
 
 
-def test_synthetic_second_add_extends_the_same_leaf():
-    cm = pc.ClipMap(synthetic_clipmap([((-100, -100, -100), (100, 100, 100))]))
-    pc.add_clip(cm, (0.0, 0.0, 0.0), (10.0, 10.0, 10.0))
-    pc.add_clip(cm, (1.0, 1.0, 1.0), (5.0, 5.0, 5.0))
-    assert cm.num_brushes == 2
-    assert cm.reachable_brushes(0) == {0, 1}
-    assert cm.lbn_count == 2  # one new inline node, shared by both brushes
+def test_check_flags_inline_under_world_leaf():
+    # A single flat leaf (fine) vs an inline leaf under a world leaf (the bug).
+    good = pc.ClipMap(synthetic([((0, 0, 0), (1, 1, 1))], [3], [(1, 0x1, 0)], roots=[0]))
+    assert pc.check_world_leaf_refs(good) == []
+    bad = pc.ClipMap(synthetic([((0, 0, 0), (1, 1, 1))], [3], [(1, 0x1, [3])], roots=[0]))
+    problems = pc.check_world_leaf_refs(bad)
+    assert problems and "inline" in problems[0]
 
 
-def test_synthetic_move_reattaches_across_leaves():
-    cm = pc.ClipMap(synthetic_clipmap([((-100, -100, -100), (100, 100, 100)),
-                                       ((200, 200, 200), (300, 300, 300))]))
-    idx = pc.add_clip(cm, (0.0, 0.0, 0.0), (10.0, 10.0, 10.0))
-    pc.move_clip(cm, idx, (250.0, 250.0, 250.0), (260.0, 260.0, 260.0))
-    assert cm.brush(idx).mins == (250.0, 250.0, 250.0)
-    assert cm.reachable_brushes(0) == set()  # detached from leaf 0
-    assert cm.reachable_brushes(1) == {idx}  # attached to leaf 1
+def test_check_flags_out_of_pool_run():
+    # A flat leaf node whose run runs off the end of the pool.
+    bad = pc.ClipMap(synthetic([((0, 0, 0), (1, 1, 1))], [3], [(2, 0x1, 2)], roots=[0]))
+    problems = pc.check_world_leaf_refs(bad)
+    assert problems and "pool" in problems[0]
 
 
-def test_synthetic_remove_renumbers():
-    cm = pc.ClipMap(synthetic_clipmap([((-100, -100, -100), (100, 100, 100))]))
-    pc.add_clip(cm, (0.0, 0.0, 0.0), (10.0, 10.0, 10.0))  # brush 0
-    pc.add_clip(cm, (1.0, 1.0, 1.0), (5.0, 5.0, 5.0))  # brush 1
-    pc.remove_clip(cm, 0)
-    assert cm.num_brushes == 1
-    # the surviving brush (was 1) is renumbered to 0 and still reachable
-    assert cm.reachable_brushes(0) == {0}
-    assert cm.brush(0).mins == (1.0, 1.0, 1.0)
-
-
-def test_synthetic_footprint_and_cluster():
-    cm = pc.ClipMap(synthetic_clipmap([((-100, -100, -100), (100, 100, 100))]))
-    a = pc.add_clip(cm, (0.0, 0.0, 0.0), (10.0, 10.0, 10.0))
-    b = pc.add_clip(cm, (2.0, 2.0, 2.0), (6.0, 6.0, 6.0))
-    pc.add_clip(cm, (50.0, 50.0, 0.0), (60.0, 60.0, 10.0))  # outside the footprint
+def test_clips_in_footprint():
+    # three clip brushes; footprint contains the first two.
+    node = synthetic([((0, 0, 0), (1, 1, 1))], [], [], roots=[0])
+    node["brushes"] = (
+        pc.clip_cbrush((0.0, 0.0, 0.0), (10.0, 10.0, 10.0))
+        + pc.clip_cbrush((2.0, 2.0, 2.0), (6.0, 6.0, 6.0))
+        + pc.clip_cbrush((50.0, 50.0, 0.0), (60.0, 60.0, 10.0))
+    )
+    h = bytearray(node["header"])
+    struct.pack_into(">H", h, pc._H_NUM_BRUSHES, 3)
+    node["header"] = bytes(h)
+    cm = pc.ClipMap(node)
+    assert cm.num_brushes == 3
     inside = pc.clips_in_footprint(cm, (-1.0, -1.0, -1.0), (11.0, 11.0, 11.0), within=True)
-    assert set(inside) == {a, b}
-    pc.move_cluster(cm, [a, b], (0.0, 0.0, 20.0))
-    assert cm.brush(a).mins == (0.0, 0.0, 20.0)
-    assert cm.brush(b).mins == (2.0, 2.0, 22.0)
-
-
-def test_synthetic_disable_zeroes_contents():
-    cm = pc.ClipMap(synthetic_clipmap([((-100, -100, -100), (100, 100, 100))]))
-    idx = pc.add_clip(cm, (0.0, 0.0, 0.0), (10.0, 10.0, 10.0))
-    pc.disable_clip(cm, idx)
-    assert cm.brush(idx).contents == 0
-    assert cm.reachable_brushes(0) == {idx}  # still referenced, but non-solid
+    assert set(inside) == {0, 1}
+    overlap = pc.clips_in_footprint(cm, (-1.0, -1.0, -1.0), (11.0, 11.0, 11.0), within=False)
+    assert set(overlap) == {0, 1}
 
 
 # -- zones -----------------------------------------------------------------------------------
@@ -192,11 +214,10 @@ def find_zone(name: str) -> Path | None:
 
 
 def clipmap_node(xf) -> dict:
-    assets = [a for a in xf.assets if a.type in (AssetType.COL_MAP_MP, AssetType.COL_MAP_SP)]
-    return assets[0].data
+    return [a for a in xf.assets if a.type in (AssetType.COL_MAP_MP, AssetType.COL_MAP_SP)][0].data
 
 
-def open_clip(name: str):
+def open_clip(name: str) -> bytes:
     path = find_zone(name)
     if path is None:
         pytest.skip(f"{name}.ff is not on this machine")
@@ -205,22 +226,25 @@ def open_clip(name: str):
 
 @pytest.mark.zones
 @pytest.mark.slow
-def test_stock_add_clip_round_trips_and_is_reachable():
-    """The required stock test: add a clip box to a stock clipMap, rewrite, and
-    the zone reparses exactly with the brush reachable from the leaves it was
-    attached to."""
+def test_stock_add_clip_round_trips_pool_backed_and_checks_clean():
+    """Add a clip to a stock clipMap, rewrite, and the zone reparses exactly with
+    the brush referenced through the flat pool (not inline) and reachable from the
+    leaves it was attached to; the world-leaf reference check is clean."""
     content = open_clip("mp_nuked")
     rw = Rewrite(content)
-    cm = pc.ClipMap(clipmap_node(rw.xfile))
+    cm = pc.ClipMap(clipmap_node(rw.xfile), rewrite=rw)
     before = cm.num_brushes
     idx = pc.add_clip(cm, (-20.0, -20.0, 40.0), (20.0, 20.0, 120.0))
-    result = rw.build(check=True)
-    back = parse(result.content)
+    back = parse(rw.build(check=True).content)
     assert back.problems() == []
     cmb = pc.ClipMap(clipmap_node(back))
     assert cmb.num_brushes == before + 1
+    assert pc.check_world_leaf_refs(cmb) == []
     reaching = [L for L in range(cmb.num_leafs) if idx in cmb.reachable_brushes(L)]
     assert reaching, "added clip is reachable from no leaf"
+    # the added brush owns its verts, pointing into the brushVerts pool
+    assert cmb.brush(idx).numverts == 8
+    assert back.resolve(cmb.brush(idx).verts_ptr) is not None
 
 
 @pytest.mark.zones
@@ -237,30 +261,49 @@ def test_stock_added_cbrush_is_byte_identical_to_an_axial_brush():
 
 @pytest.mark.zones
 @pytest.mark.slow
-def test_stock_move_and_disable_cluster_round_trip():
+def test_stock_move_and_remove_round_trip():
     content = open_clip("mp_nuked")
     rw = Rewrite(content)
-    cm = pc.ClipMap(clipmap_node(rw.xfile))
-    axial = [i for i in range(min(cm.num_brushes, 300)) if cm.brush(i).numsides == 0][:3]
-    before = {i: cm.brush(i).mins for i in axial}
-    pc.move_cluster(cm, axial, (0.0, 0.0, 64.0))
-    pc.disable_clip(cm, axial[0])
-    result = rw.build(check=True)
-    back = parse(result.content)
+    cm = pc.ClipMap(clipmap_node(rw.xfile), rewrite=rw)
+    idx = pc.add_clip(cm, (-20.0, -20.0, 40.0), (20.0, 20.0, 120.0))
+    pc.move_clip(cm, idx, (100.0, 100.0, 40.0), (140.0, 140.0, 120.0))
+    other = pc.add_clip(cm, (-200.0, -200.0, 40.0), (-160.0, -160.0, 120.0))
+    pc.remove_clip(cm, other)
+    back = parse(rw.build(check=True).content)
     assert back.problems() == []
     cmb = pc.ClipMap(clipmap_node(back))
-    assert cmb.brush(axial[1]).mins == pc._add3(before[axial[1]], (0.0, 0.0, 64.0))
-    assert cmb.brush(axial[0]).contents == 0
+    assert pc.check_world_leaf_refs(cmb) == []
+    assert cmb.brush(idx).mins == (100.0, 100.0, 40.0)
+    assert cmb.brush(other).contents == 0  # removed = disabled in place
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_stock_cluster_footprint_and_move():
+    content = open_clip("mp_nuked")
+    rw = Rewrite(content)
+    cm = pc.ClipMap(clipmap_node(rw.xfile), rewrite=rw)
+    a = pc.add_clip(cm, (0.0, 0.0, 40.0), (20.0, 20.0, 60.0))
+    b = pc.add_clip(cm, (5.0, 5.0, 45.0), (15.0, 15.0, 55.0))
+    cluster = pc.clips_in_footprint(cm, (-1.0, -1.0, 39.0), (21.0, 21.0, 61.0), within=True)
+    assert a in cluster and b in cluster
+    pc.move_cluster(cm, [a, b], (0.0, 0.0, 100.0))
+    back = parse(rw.build(check=True).content)
+    assert back.problems() == []
+    cmb = pc.ClipMap(clipmap_node(back))
+    assert pc.check_world_leaf_refs(cmb) == []
+    assert cmb.brush(a).mins == (0.0, 0.0, 140.0)
+    assert cmb.brush(b).mins == (5.0, 5.0, 145.0)
 
 
 @pytest.mark.zones
 @pytest.mark.slow
 @pytest.mark.skipif(not os.environ.get("OPENT5_ELF") and not env.path_of("OPENT5_ELF"),
                     reason="the oracle needs t5mp.elf (OPENT5_ELF)")
-def test_stock_add_clip_passes_the_oracle(tmp_path):
-    """The emulated game loader accepts a stock zone with a clip added: consumes
-    it exactly, every block ends at the header, and every offset / alias pointer
-    the product parser reads is converted to the same value, each inside its block."""
+def test_stock_add_clip_passes_the_oracle():
+    """The emulated game loader accepts a stock zone with a clip added and the
+    world-leaf reference check is clean. The check catches the inline-under-world-
+    leaf structure that crashed p_propclip even though the loader accepts it."""
     import sys
 
     root = Path(__file__).resolve().parents[1]
@@ -271,13 +314,12 @@ def test_stock_add_clip_passes_the_oracle(tmp_path):
 
     content = open_clip("mp_nuked")
     rw = Rewrite(content)
-    cm = pc.ClipMap(clipmap_node(rw.xfile))
+    cm = pc.ClipMap(clipmap_node(rw.xfile), rewrite=rw)
     pc.add_clip(cm, (-20.0, -20.0, 40.0), (20.0, 20.0, 120.0))
     edited = rw.build(check=True).content
 
     tr = TracingEmu(edited)
-    consumed = tr.run()
-    assert consumed == len(edited)
+    assert tr.run() == len(edited)
     header = struct.unpack_from(">9I", edited, 0)
     final = tr.final_positions()
     blocks = list(header[2:9])
@@ -298,3 +340,4 @@ def test_stock_add_clip_passes_the_oracle(tmp_path):
     assert set(product) == set(loader)
     assert all(loader[k] == product[k] for k in product)
     assert outside == 0
+    assert pc.check_world_leaf_refs(pc.ClipMap(clipmap_node(x))) == []
