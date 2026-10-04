@@ -131,7 +131,9 @@ def cmd_gen(args) -> int:
     outdir.mkdir(parents=True, exist_ok=True)
     t, boxes, counts = _gen(args)
     map_path = outdir / f"{args.name}.map"
-    map_path.write_text(mapwriter.map_text(t, boxes), newline="\r\n")
+    map_path.write_text(
+        mapwriter.map_text(t, boxes, light_grid=args.light_grid), newline="\r\n"
+    )
     (outdir / "preview_top.png").write_bytes(preview.write(preview.top_view(t)))
     (outdir / "preview_angle.png").write_bytes(preview.write(preview.angle_view(t)))
     tex = write_textures(outdir, args.seed, args.px)
@@ -190,8 +192,11 @@ def cmd_build(args) -> int:
     # Write the map into --work, then run testmap's exact three steps via a shimmed write_map.
     work_dir = testmap._wsl(args.work)
     work_dir.mkdir(parents=True, exist_ok=True)
-    (work_dir / f"{args.name}.map").write_text(mapwriter.map_text(t, boxes), newline="\r\n")
-    testmap.map_text = lambda **kw: mapwriter.map_text(t, boxes)  # build() calls write_map()
+    (work_dir / f"{args.name}.map").write_text(
+        mapwriter.map_text(t, boxes, light_grid=args.light_grid), newline="\r\n"
+    )
+    # build() calls write_map(), which calls this shimmed map_text()
+    testmap.map_text = lambda **kw: mapwriter.map_text(t, boxes, light_grid=args.light_grid)
     report = testmap.build(args.name, args.game, args.work, Path(args.out))
     report["raw_assets"] = raw_files
     report["game_files"] = sorted(report.get("game_files", []) + raw_files)
@@ -278,6 +283,7 @@ def main(argv=None) -> int:
         c.add_argument("--nz", type=int, default=32)
         c.add_argument("--block", type=int, default=64)
         c.add_argument("--px", type=int, default=64, help="texture size (multiple of 16)")
+        c.add_argument("--light-grid", type=int, default=3, help="N x N primary light grid")
         c.add_argument("--name", default="mp_opent5blocks")
         c.add_argument("--no-water", action="store_true", help="omit the water plane")
         c.add_argument("--no-caves", action="store_true", help="omit the carved caves")
@@ -317,7 +323,14 @@ def main(argv=None) -> int:
 
     args = p.parse_args(argv)
     # convert reuses the gen defaults for grid/name it does not define
-    defaults = (("name", "mp_opent5blocks"), ("block", 64), ("nx", 40), ("ny", 40), ("nz", 32))
+    defaults = (
+        ("name", "mp_opent5blocks"),
+        ("block", 64),
+        ("nx", 40),
+        ("ny", 40),
+        ("nz", 32),
+        ("light_grid", 3),
+    )
     for attr, default in defaults:
         if not hasattr(args, attr):
             setattr(args, attr, default)

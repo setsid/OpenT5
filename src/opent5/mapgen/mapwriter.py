@@ -294,7 +294,7 @@ def light_grid_brush(t: Terrain) -> list[str]:
     return _axis_brush((x0 + 8, y0 + 8, zlo), (x1 - 8, y1 - 8, zhi), LIGHT_GRID, 64)
 
 
-def map_text(t: Terrain, boxes: list[Box], scale: int | None = None) -> str:
+def map_text(t: Terrain, boxes: list[Box], scale: int | None = None, light_grid: int = 3) -> str:
     """The whole ``.map`` (CRLF added on write)."""
     scale = scale if scale is not None else t.block
     lines = ["iwmap 4", '"000_Global" flags  active', '"The Map" flags ', "// entity 0", "{"]
@@ -311,7 +311,9 @@ def map_text(t: Terrain, boxes: list[Box], scale: int | None = None) -> str:
     lines.append(f"// brush {b}")
     lines += light_grid_brush(t)
     lines.append("}")
-    ents = spawn_entities(t) + primary_lights(t) + compass_corners(t) + path_nodes(t)
+    ents = (
+        spawn_entities(t) + primary_lights(t, grid=light_grid) + compass_corners(t) + path_nodes(t)
+    )
     for i, e in enumerate(ents, 1):
         lines.append(f"// entity {i}")
         lines.append("{")
