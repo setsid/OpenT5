@@ -9,7 +9,7 @@ The version is bumped to 0.2.0 locally. Review, then push and release yourself.
 ## Invariants
 
 - Fast suite: 794 passed, 272 deselected, 48 s.
-- Full suite (slow included): see the line at the end of this file.
+- Full suite (slow included): 1084 passed, 0 failed, 19 m.
 - All 178 zones round-trip byte-identically (`tools/rewrite_all.py`, 178/178).
 - Both exe smoke tests pass on the final 0.2.0 exe: 109 view checks 0 failed, and
   the update check accepts a good release and rejects a tampered one.
@@ -133,4 +133,6 @@ Needs a device run:
 
 ## Full suite result
 
-(appended at the close of the session)
+1084 passed, 0 failed in 19 m 05 s, at the final HEAD, against the retail
+stand-in. Lint clean. The night is complete bar the two parked items that need
+you (the loader process and confirming the shaded viewer on your machine).
