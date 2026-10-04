@@ -372,3 +372,18 @@ searches instant.
 
 The first search builds the cache (about a minute for 178 zones); later ones are
 instant. Details: docs/search-index.md.
+
+## texpack
+
+Batch-replace a zone's textures from a folder of images named after the images
+they replace (naming rule and map-file format in docs/texture-pack.md).
+
+    opent5 texpack list ZONE [--template FILE] [--replaceable]
+    opent5 texpack apply ZONE PACKDIR -o OUTDIR [--map FILE] [--resize]
+        [--allow-shared] [--dry-run]
+
+`list` dumps a zone's image names and can write a map template. `apply` replaces
+matching images and writes OUTDIR/<zone>.ff (and <zone>.pak when streamed images
+changed), verified; `--dry-run` previews the mapping. Shared-pak parts are left
+alone unless `--allow-shared`. Per-file failures are reported; only a failed save
+verification fails the command. All take `--json`.

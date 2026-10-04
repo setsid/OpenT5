@@ -32,6 +32,8 @@ from opent5.index.cli import COMMANDS as INDEX_COMMANDS
 from opent5.index.cli import register as register_index
 from opent5.patch import cmd_patch, text_patch
 from opent5.patch import register as register_patch
+from opent5.texpack import cmd_texpack, text_texpack
+from opent5.texpack import register as register_texpack
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
 
@@ -794,6 +796,7 @@ COMMANDS = {
     "rebuild": (cmd_rebuild, text_rebuild),
     "convert": (cmd_convert, text_convert),
     "patch": (cmd_patch, text_patch),
+    "texpack": (cmd_texpack, text_texpack),
 }
 COMMANDS.update(INDEX_COMMANDS)
 
@@ -939,6 +942,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     register_patch(sub)
+    register_texpack(sub)
     register_index(sub, parents=[common])
     return parser
 
