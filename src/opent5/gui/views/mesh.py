@@ -8,8 +8,10 @@ any GPU. Edge density shades itself: busy areas read brighter, as in a
 wireframe drawn with additive blending. While the mouse drags, a fixed random
 subset of the edges is drawn; the full set comes back on release.
 
-Mouse: left drag orbits, right or middle drag pans, the wheel zooms. F frames
-everything, Home resets the camera.
+Mouse: left drag orbits, middle drag pans, the wheel zooms to the cursor. Hold
+the right button to fly (mouse-look, WASD to move, Q/E down/up, Shift faster, the
+wheel sets the fly speed). Double click a surface to focus it, F frames the
+focus, Home frames the whole scene.
 """
 
 from __future__ import annotations
@@ -47,6 +49,14 @@ KIND_TITLES = {
     "model": "Model",
 }
 COLLISION_MODES = ("Brushes and triangles", "Brushes", "Triangles")
+HELP_LINES = (
+    "LMB orbit   MMB pan   wheel zoom to cursor",
+    "hold RMB to fly: WASD move, Q/E down/up, Shift faster, wheel sets speed",
+    "double click to focus   F frame focus   Home frame all   H hide help",
+)
+_FLY_KEYS = frozenset(
+    (Qt.Key.Key_W, Qt.Key.Key_A, Qt.Key.Key_S, Qt.Key.Key_D, Qt.Key.Key_Q, Qt.Key.Key_E)
+)
 
 
 # -- maths -----------------------------------------------------------------------------------
@@ -82,6 +92,11 @@ class Camera:
         up = np.cross(right, forward)
         eye = self.target - forward * self.distance
         return eye, right, up, forward
+
+    def look_from(self, eye, target) -> None:
+        """Aim the camera at ``target`` from ``eye``, leaving the eye in place."""
+        self.yaw, self.pitch, self.distance = look_angles(eye, target)
+        self.target = np.asarray(target, np.float64)
 
 
 def focal(height: int) -> float:
@@ -198,12 +213,103 @@ def nice_step(extent: float) -> float:
     return float(2 ** max(0, math.floor(math.log2(extent / 16.0))))
 
 
+# -- camera maths (pure, so they can be unit tested without a window) -------------------------
+
+
+def cursor_ray(cam: Camera, px: float, py: float, w: int, h: int):
+    """World-space ray (origin at the eye, unit direction) through a screen pixel.
+
+    The pixel is in the same coordinates the render uses; the direction does not
+    depend on the device-pixel ratio, so logical widget coordinates are fine."""
+    eye, right, up, forward = cam.basis()
+    f = focal(h)
+    dx = (px - w / 2.0) / f
+    dy = (h / 2.0 - py) / f
+    d = right * dx + up * dy + forward
+    return eye, d / np.linalg.norm(d)
+
+
+def dolly_to_ray(eye, forward, distance: float, ray_dir, factor: float, min_dist: float):
+    """Zoom towards (or away from) the point under the cursor.
+
+    ``factor`` is the new pivot distance as a fraction of the old (``< 1`` zooms
+    in). The eye slides along ``ray_dir`` so the world point under the cursor
+    keeps its place on screen. The pivot distance is floored at ``min_dist``: once
+    there, zooming in keeps advancing the eye, so the pivot is pushed forward along
+    the view direction and the camera passes through rather than stalling.
+    Returns ``(new_target, new_distance)``."""
+    cosang = float(ray_dir @ forward)
+    if cosang <= 1e-4:  # cursor ray almost perpendicular to the view: dolly straight ahead
+        ray_dir, cosang = forward, 1.0
+    t = distance / cosang
+    new_eye = eye + ray_dir * (t * (1.0 - factor))
+    new_distance = max(distance * factor, min_dist)
+    return new_eye + forward * new_distance, new_distance
+
+
+def pan_delta(right, up, distance: float, focal_px: float, dx: float, dy: float):
+    """World-space pivot shift for a drag of ``(dx, dy)`` pixels. Scaled by the
+    pivot depth and the focal length, so the same drag moves the pivot the same
+    apparent amount at any distance."""
+    scale = distance / max(focal_px, 1.0)
+    return -right * (dx * scale) + up * (dy * scale)
+
+
+def frame_distance(radius: float, fov_deg: float, aspect: float) -> float:
+    """Pivot distance that fits a sphere of ``radius`` comfortably in the view."""
+    half = math.radians(fov_deg) / 2.0
+    if aspect < 1.0:  # a tall, narrow viewport is limited by its width
+        half = math.atan(math.tan(half) * aspect)
+    return max(radius, 1.0) / math.sin(half) * 0.85
+
+
+def look_angles(eye, target):
+    """``(yaw, pitch, distance)`` for an orbit camera at ``eye`` looking at ``target``."""
+    v = np.asarray(target, np.float64) - np.asarray(eye, np.float64)
+    distance = float(np.linalg.norm(v))
+    if distance < 1e-6:
+        return 0.0, 0.0, 1.0
+    f = v / distance
+    pitch = math.asin(max(-1.0, min(1.0, -float(f[2]))))
+    yaw = math.atan2(-float(f[1]), -float(f[0]))
+    return yaw, pitch, distance
+
+
+def ray_mesh_hit(origin, direction, points, triangles):
+    """Nearest point where a ray meets the mesh, or ``None``. Vectorised
+    Moeller-Trumbore over every triangle at once."""
+    if triangles is None or not len(triangles):
+        return None
+    p = np.asarray(points, np.float64)
+    tri = np.asarray(triangles, np.int64).reshape(-1, 3)
+    v0, v1, v2 = p[tri[:, 0]], p[tri[:, 1]], p[tri[:, 2]]
+    e1, e2 = v1 - v0, v2 - v0
+    o = np.asarray(origin, np.float64)
+    d = np.asarray(direction, np.float64)
+    pv = np.cross(d, e2)
+    det = np.einsum("ij,ij->i", e1, pv)
+    eps = 1e-7
+    ok = np.abs(det) > eps
+    inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
+    tv = o - v0
+    u = inv * np.einsum("ij,ij->i", tv, pv)
+    qv = np.cross(tv, e1)
+    v = inv * (qv @ d)
+    t = inv * np.einsum("ij,ij->i", e2, qv)
+    hit = ok & (u >= -eps) & (v >= -eps) & (u + v <= 1.0 + eps) & (t > eps)
+    if not hit.any():
+        return None
+    nearest = int(np.argmin(np.where(hit, t, np.inf)))
+    return o + d * float(t[nearest])
+
+
 class Renderer:
     """Holds a mesh's edges and renders frames into QImages."""
 
     def __init__(self):
         self.points = np.zeros((0, 3), np.float32)
         self.edges = np.zeros((0, 2), np.int64)
+        self.tris = np.zeros((0, 3), np.int64)  # kept for cursor picking
         self.drag_edges = self.edges
         self.grid_points = np.zeros((0, 3), np.float32)
         self.grid_edges = np.zeros((0, 2), np.int64)
@@ -215,6 +321,7 @@ class Renderer:
 
     def set_mesh(self, positions: np.ndarray, triangles: np.ndarray) -> None:
         self.points = np.ascontiguousarray(positions, np.float32)
+        self.tris = np.asarray(triangles, np.int64).reshape(-1, 3)
         self.edges = unique_edges(triangles)
         if len(self.edges) > DRAG_EDGES:
             rng = np.random.default_rng(5)
@@ -384,14 +491,25 @@ class MeshCanvas(QWidget):
         self._key = None
         self._drag = None
         self._dragging = False
+        self.show_help = True
+        self._focus = None  # last point picked by a double click, or None
         self._settle = QTimer(self)
         self._settle.setSingleShot(True)
         self._settle.setInterval(120)
         self._settle.timeout.connect(self._end_drag)
+        # fly mode: held while the right button is down
+        self._flying = False
+        self.fly_speed = 512.0
+        self._fly_keys: set = set()
+        self._fly_last = 0.0
+        self._fly_timer = QTimer(self)
+        self._fly_timer.setInterval(16)
+        self._fly_timer.timeout.connect(self._fly_step)
 
     def set_mesh(self, positions, triangles, title: str) -> None:
         self.renderer.set_mesh(positions, triangles)
         self.counts = (len(positions), len(triangles), len(self.renderer.edges))
+        self.fly_speed = max(self._scene_diag() * 0.4, 16.0)
         self.title = title
         self._scene = None  # the shaded scene is rebuilt for the new mesh
         self._scene_uploaded = False
@@ -425,23 +543,42 @@ class MeshCanvas(QWidget):
         self._key = None
         self.update()
 
-    def frame_all(self, focus: bool = False) -> None:
-        r = self.renderer
-        lo, hi = r.focus_bounds if focus else r.frame_bounds
-        centre = (lo + hi) / 2.0
-        radius = max(float(np.linalg.norm(hi - lo)) / 2.0, 1.0)
-        self.camera.target = centre
+    def _scene_diag(self) -> float:
+        lo, hi = self.renderer.bounds
+        return float(np.linalg.norm(hi - lo))
+
+    def frame(self, lo, hi) -> None:
+        """Reposition the camera so the bounds ``(lo, hi)`` fill the view, without
+        changing the view angles."""
+        lo, hi = np.asarray(lo, np.float64), np.asarray(hi, np.float64)
+        radius = float(np.linalg.norm(hi - lo)) / 2.0
         aspect = max(self.width(), 1) / max(self.height(), 1)
-        half = math.radians(FOV_DEG) / 2.0
-        if aspect < 1.0:
-            half = math.atan(math.tan(half) * aspect)
-        self.camera.distance = radius / math.sin(half) * 0.85
+        self.camera.target = (lo + hi) / 2.0
+        self.camera.distance = frame_distance(radius, FOV_DEG, aspect)
         self.invalidate()
         self.camera_changed.emit()
+
+    def frame_focus(self) -> None:
+        """Frame the focused point (set by a double click) or, failing that, the
+        dense core of the mesh."""
+        if self._focus is not None:
+            half = max(self._scene_diag() * 0.06, 8.0)
+            self.frame(self._focus - half, self._focus + half)
+        else:
+            self.frame(*self.renderer.focus_bounds)
+
+    def frame_scene(self) -> None:
+        """Frame the whole mesh."""
+        self.frame(*self.renderer.bounds)
+
+    def frame_all(self, focus: bool = False) -> None:
+        lo, hi = self.renderer.focus_bounds if focus else self.renderer.frame_bounds
+        self.frame(lo, hi)
 
     def reset_camera(self) -> None:
         self.camera.yaw = math.radians(35.0)
         self.camera.pitch = math.radians(30.0)
+        self._focus = None
         self.frame_all(focus=True)
 
     def _shaded_ready(self) -> bool:
@@ -508,11 +645,32 @@ class MeshCanvas(QWidget):
         for line in lines:
             p.drawText(8, y, line)
             y += fm.height()
+        help_top = self._paint_help(p) if self.show_help else self.height()
         if self.renderer.grid and not shaded:
             step = self.renderer.grid_step
-            p.drawText(8, self.height() - 8, f"grid {step:g} units")
+            p.setFont(theme.mono_font(8))
+            p.setPen(QColor(t.text_dim))
+            p.drawText(8, help_top - 6, f"grid {step:g} units")
         self._paint_gizmo(p)
         p.end()
+
+    def _paint_help(self, p: QPainter) -> int:
+        """Draw the controls hint in the bottom-left corner. Returns its top y."""
+        t = theme.current()
+        p.setFont(theme.mono_font(7))
+        fm = p.fontMetrics()
+        width = max(fm.horizontalAdvance(line) for line in HELP_LINES) + 12
+        block = fm.height() * len(HELP_LINES) + 8
+        top = self.height() - block - 6
+        back = QColor(t.base)
+        back.setAlpha(170)
+        p.fillRect(6, top, width, block, back)
+        p.setPen(QColor(t.text_dim))
+        y = top + 4 + fm.ascent()
+        for line in HELP_LINES:
+            p.drawText(12, y, line)
+            y += fm.height()
+        return top
 
     def _paint_gizmo(self, p: QPainter) -> None:
         t = theme.current()
@@ -534,6 +692,8 @@ class MeshCanvas(QWidget):
     def mousePressEvent(self, e) -> None:
         self._drag = (e.position(), e.buttons())
         self.setFocus()
+        if e.button() == Qt.MouseButton.RightButton:
+            self._start_fly()
 
     def mouseMoveEvent(self, e) -> None:
         if self._drag is None:
@@ -542,13 +702,21 @@ class MeshCanvas(QWidget):
         d = e.position() - last
         self._drag = (e.position(), e.buttons())
         c = self.camera
-        if e.buttons() & Qt.MouseButton.LeftButton:
+        buttons = e.buttons()
+        if buttons & Qt.MouseButton.LeftButton:
             c.yaw -= d.x() * 0.008
             c.pitch = max(-1.55, min(1.55, c.pitch + d.y() * 0.008))
-        elif e.buttons() & (Qt.MouseButton.RightButton | Qt.MouseButton.MiddleButton):
+        elif buttons & Qt.MouseButton.RightButton:  # fly: look around in place
+            eye, _r, _u, _f = c.basis()
+            c.yaw -= d.x() * 0.006
+            c.pitch = max(-1.55, min(1.55, c.pitch + d.y() * 0.006))
+            _e2, _r2, _u2, forward = c.basis()
+            c.target = eye + forward * c.distance
+        elif buttons & Qt.MouseButton.MiddleButton:  # pan
             _eye, right, up, _f = c.basis()
-            scale = c.distance / focal(max(self.height(), 1))
-            c.target = c.target - right * d.x() * scale + up * d.y() * scale
+            c.target = c.target + pan_delta(
+                right, up, c.distance, focal(max(self.height(), 1)), d.x(), d.y()
+            )
         else:
             return
         self._dragging = True
@@ -556,30 +724,104 @@ class MeshCanvas(QWidget):
         self.invalidate()
         self.camera_changed.emit()
 
-    def mouseReleaseEvent(self, _e) -> None:
+    def mouseReleaseEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.RightButton:
+            self._stop_fly()
         self._drag = None
         self._settle.start(10)
 
+    def mouseDoubleClickEvent(self, e) -> None:
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        eye, d = cursor_ray(self.camera, e.position().x(), e.position().y(),
+                            self.width(), self.height())  # fmt: skip
+        hit = ray_mesh_hit(eye, d, self.renderer.points, self.renderer.tris)
+        if hit is None:
+            return
+        self._focus = np.asarray(hit, np.float64)
+        self.camera.look_from(eye, hit)
+        self.invalidate()
+        self.camera_changed.emit()
+
+    def _start_fly(self) -> None:
+        self._flying = True
+        self._fly_last = time.perf_counter()
+        self._fly_timer.start()
+
+    def _stop_fly(self) -> None:
+        self._flying = False
+        self._fly_timer.stop()
+        self._fly_keys.clear()
+        self._dragging = False
+        self.invalidate()
+
+    def _fly_step(self) -> None:
+        now = time.perf_counter()
+        dt = min(now - self._fly_last, 0.1)
+        self._fly_last = now
+        keys = self._fly_keys
+        fb = (Qt.Key.Key_W in keys) - (Qt.Key.Key_S in keys)
+        lr = (Qt.Key.Key_D in keys) - (Qt.Key.Key_A in keys)
+        ud = (Qt.Key.Key_E in keys) - (Qt.Key.Key_Q in keys)
+        if not (fb or lr or ud):
+            return
+        from PySide6.QtWidgets import QApplication
+
+        _eye, right, _up, forward = self.camera.basis()
+        move = forward * fb + right * lr + np.array([0.0, 0.0, 1.0]) * ud
+        n = float(np.linalg.norm(move))
+        if n < 1e-9:
+            return
+        fast = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+        step = self.fly_speed * (3.0 if fast else 1.0) * dt
+        self.camera.target = self.camera.target + move / n * step
+        self._dragging = True
+        self.invalidate()
+        self.camera_changed.emit()
+
     def _end_drag(self) -> None:
+        if self._flying:
+            return
         if self._drag is None or not self._drag[1]:
             self._dragging = False
             self.invalidate()
 
     def wheelEvent(self, e) -> None:
         steps = e.angleDelta().y() / 120.0
-        self.camera.distance = max(1.0, self.camera.distance * (0.85**steps))
+        if self._flying:  # the wheel sets the fly speed, not the zoom
+            self.fly_speed = max(1.0, self.fly_speed * (1.25**steps))
+            self.camera_changed.emit()
+            return
+        eye, d = cursor_ray(self.camera, e.position().x(), e.position().y(),
+                            self.width(), self.height())  # fmt: skip
+        _e2, _r, _u, forward = self.camera.basis()
+        min_dist = max(self._scene_diag() * 5e-4, 1.0)
+        target, dist = dolly_to_ray(eye, forward, self.camera.distance, d, 0.8**steps, min_dist)
+        self.camera.target, self.camera.distance = target, dist
         self._dragging = True
         self._settle.start()
         self.invalidate()
         self.camera_changed.emit()
 
     def keyPressEvent(self, e) -> None:
-        if e.key() == Qt.Key.Key_F:
-            self.frame_all()
-        elif e.key() == Qt.Key.Key_Home:
-            self.reset_camera()
+        k = e.key()
+        if k == Qt.Key.Key_F:
+            self.frame_focus()
+        elif k == Qt.Key.Key_Home:
+            self.frame_scene()
+        elif k == Qt.Key.Key_H:
+            self.show_help = not self.show_help
+            self.update()
+        elif k in _FLY_KEYS and self._flying:
+            if not e.isAutoRepeat():
+                self._fly_keys.add(k)
         else:
             super().keyPressEvent(e)
+
+    def keyReleaseEvent(self, e) -> None:
+        if not e.isAutoRepeat():
+            self._fly_keys.discard(e.key())
+        super().keyReleaseEvent(e)
 
     def resizeEvent(self, e) -> None:
         self.invalidate()
@@ -607,7 +849,7 @@ class MeshView(AssetView):
         self.shaded_button.setToolTip("Shaded, textured (GPU) instead of wireframe")
         self.depth_button = self._toggle("Depth cue", True, self._set_depth)
         self.grid_button = self._toggle("Grid", True, self._set_grid)
-        self.models_button = self._toggle("Static models", False, self._set_models)
+        self.models_button = self._toggle("Static models", True, self._set_models)
         self.models_button.setToolTip("Place the world's static models (props)")
         self.models_button.setVisible(False)
         self.mode = QComboBox(bar)
@@ -616,8 +858,8 @@ class MeshView(AssetView):
         self.mode.currentIndexChanged.connect(self._apply_mode)
         self.frame_button = QToolButton(bar)
         self.frame_button.setText("Frame all")
-        self.frame_button.setToolTip("Frame all (F)")
-        self.frame_button.clicked.connect(lambda: self.canvas.frame_all())
+        self.frame_button.setToolTip("Frame the whole scene (Home)")
+        self.frame_button.clicked.connect(lambda: self.canvas.frame_scene())
         self.info = QLabel("", bar)
         self.info.setObjectName("AssetMeta")
         for w in (self.shaded_button, self.depth_button, self.grid_button,
@@ -643,14 +885,14 @@ class MeshView(AssetView):
         lay.addWidget(bar)
         lay.addWidget(holder, 1)
 
-        self._frame_action = QAction("Frame all", self)
+        self._frame_action = QAction("Frame focus", self)
         self._frame_action.setShortcut(QKeySequence("F"))
         self._frame_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        self._frame_action.triggered.connect(lambda: self.canvas.frame_all())
-        self._reset_action = QAction("Reset camera", self)
+        self._frame_action.triggered.connect(lambda: self.canvas.frame_focus())
+        self._reset_action = QAction("Frame all", self)
         self._reset_action.setShortcut(QKeySequence("Home"))
         self._reset_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        self._reset_action.triggered.connect(lambda: self.canvas.reset_camera())
+        self._reset_action.triggered.connect(lambda: self.canvas.frame_scene())
         self.addAction(self._frame_action)
         self.addAction(self._reset_action)
         self._modes = False

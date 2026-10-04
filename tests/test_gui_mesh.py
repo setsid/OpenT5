@@ -76,6 +76,7 @@ def test_nuked_geometry():
     assert (coll.groups < 0).sum() == 7492
     view = mv.MeshView()
     view.resize(640, 480)
+    view.models_button.setChecked(False)  # the plain world, without its static models
     view.load_sync(doc, "world")
     assert view.canvas.counts[1] == 117181
 
@@ -135,11 +136,13 @@ def test_world_view_offers_static_models_only_for_worlds():
     view = mv.MeshView()
     assert view.models_button.isHidden()
     view._done(view._generation, MeshData(CUBE_POS, CUBE_TRIS, label="cube"))
-    assert view._world_kind("world") == "world"
-    view.models_button.blockSignals(True)
-    view.models_button.setChecked(True)
-    view.models_button.blockSignals(False)
+    # static models default to on, so a world first shows with its props placed
+    assert view.models_button.isChecked()
     assert view._world_kind("world") == "world_models"
+    view.models_button.blockSignals(True)
+    view.models_button.setChecked(False)
+    view.models_button.blockSignals(False)
+    assert view._world_kind("world") == "world"
     assert view._world_kind("collision") == "collision"
 
 

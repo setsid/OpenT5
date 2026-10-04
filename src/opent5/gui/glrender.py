@@ -155,6 +155,8 @@ class ShadedRenderer:
         self._gltextures: dict[int, object] = {}
         self._scene: Scene | None = None
         self._loc = {}
+        self._fbo = None  # reused across frames, rebuilt only when the size changes
+        self._fbo_size = (0, 0)
 
     def available(self) -> bool:
         return self._ensure_context()
@@ -254,9 +256,14 @@ class ShadedRenderer:
         if self._scene is None or not self._make_current():
             return None
         w, h = max(1, int(w)), max(1, int(h))
-        fbo = QOpenGLFramebufferObject(
-            w, h, QOpenGLFramebufferObject.Attachment.CombinedDepthStencil
-        )
+        if self._fbo is None or self._fbo_size != (w, h):
+            if self._fbo is not None:
+                self._fbo.release()
+            self._fbo = QOpenGLFramebufferObject(
+                w, h, QOpenGLFramebufferObject.Attachment.CombinedDepthStencil
+            )
+            self._fbo_size = (w, h)
+        fbo = self._fbo
         if not fbo.bind():
             return None
         glf = self._ctx.functions()
