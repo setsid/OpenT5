@@ -377,6 +377,40 @@ class Shooter:
             self.global_search()
         if self.wanted("25_create_patch") or self.wanted("26_apply_patch"):
             self.patch_dialogs()
+        if self.wanted("27_error"):
+            self.error_dialog()
+        if self.wanted("28_search_empty"):
+            self.search_empty()
+
+    def error_dialog(self) -> None:
+        """A backend failure shown with its expected / found / offset pulled out, in both
+        themes (the save / parse / edit error dialog)."""
+        from opent5.gui.dialogs import ErrorDialog
+
+        message = (
+            "stringtable mp/killstreaktable.csv: expected 12 columns in every row, "
+            "found 11 in row 7 at offset 0x1a4f0"
+        )
+        for t in ("dark", "light"):
+            self.theme(t)
+            d = ErrorDialog("Save failed", "Could not save mp_nuked_edited.ff.", message, self.win)
+            d.show()
+            self.shot(f"27_error_{t}", d)
+            d.close()
+        self.theme("dark")
+
+    def search_empty(self) -> None:
+        """The zone Search panel's empty state, before any query has been run."""
+        patch = self.page("patch_mp")
+        if patch is None:
+            return
+        win = self.win
+        win.show_search()
+        win.search.query.clear()
+        win.search.run()
+        settle(self.app, 0.1)
+        self.shot("28_search_empty_dark")
+        win.bottom.hide()
 
     def global_search(self) -> None:
         """The cross-zone search panel with results grouped by zone, in both themes. The

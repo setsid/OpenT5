@@ -21,7 +21,7 @@ from opent5.xfile.constants import AssetType as T  # noqa: E402
 
 APP = QApplication.instance() or QApplication([])
 
-from opent5.gui import backend, icons, palette, panels, theme, tree  # noqa: E402
+from opent5.gui import backend, dialogs, icons, palette, panels, theme, tree  # noqa: E402
 from opent5.gui.views import code, highlight  # noqa: E402
 
 
@@ -290,6 +290,42 @@ def test_diff_lines_of_an_image_show_its_detail():
         "pak: x.pak entry 3 (8x8)",
     ]
     assert panels.diff_lines(backend.Change(5, "image", {}, {}, detail="inline"))[1:] == []
+
+
+def test_parse_error_extracts_expected_found_offset():
+    p = dialogs.parse_error("asset 5 (image): expected an image of (128, 256, 4), found (256, 512)")
+    assert p["expected"] == "an image of (128, 256, 4)" and p["found"] == "(256, 512)"
+    p = dialogs.parse_error("pak entry 3: expected 1024 bytes at 0x2a00, found 512")
+    assert p["found"] == "512" and p["offset"] == "0x2a00"
+    p = dialogs.parse_error("expected the patch magic at offset 0, found b'XXXX'")
+    assert p["offset"] == "0" and p["found"] == "b'XXXX'"
+    # a message with no structure leaves the parts out (the full message still shows)
+    assert dialogs.parse_error("something went wrong") == {}
+
+
+def test_error_dialog_shows_the_parts_and_the_full_message():
+    msg = "DDS fourCC: expected DXT1/DXT3/DXT5, found b'XXXX' at 0x54"
+    d = dialogs.ErrorDialog("Save failed", "Could not save foo.ff.", msg)
+    from PySide6.QtWidgets import QLabel, QPlainTextEdit
+
+    labels = [w.text() for w in d.findChildren(QLabel)]
+    assert "Expected" in labels and "Found" in labels and "Offset" in labels
+    assert any("DXT1/DXT3/DXT5" in t for t in labels)  # the expected value
+    body = d.findChild(QPlainTextEdit)
+    assert body is not None and body.toPlainText() == msg  # nothing lost
+
+
+def test_search_panel_empty_state(doc):
+    p = panels.SearchPanel()
+    p.set_doc(doc)
+    assert p.empty.isVisibleTo(p) and not p.view.isVisibleTo(p)
+    p.query.setText("speed")
+    p.run()
+    assert p.view.isVisibleTo(p) and not p.empty.isVisibleTo(p)
+    p.query.setText("no_such_token_here")
+    p.run()
+    assert p.empty.isVisibleTo(p) and not p.view.isVisibleTo(p)
+    assert "No matches" in p.empty.text()
 
 
 def test_zone_opens_with_tree_and_search():

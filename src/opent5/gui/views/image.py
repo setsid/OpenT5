@@ -545,11 +545,14 @@ class ImageView(AssetView):
         resize = False
         if size != (w, h):
             if self.data.info.get("pixels") != "pak":
-                QMessageBox.warning(
-                    self,
+                from opent5.gui.dialogs import ErrorDialog
+
+                ErrorDialog(
                     "Import image",
+                    f"{path.name} does not match the image's size.",
                     f"{path.name}: expected {w} x {h}, found {size[0]} x {size[1]}.",
-                )
+                    self,
+                ).exec()
                 return False
             if not self.ask_resize((w, h), size):
                 return False
@@ -560,7 +563,9 @@ class ImageView(AssetView):
             else:
                 self.doc.replace_image(self.ref, payload)
         except EditError as exc:
-            QMessageBox.warning(self, "Import image", str(exc))
+            from opent5.gui.dialogs import ErrorDialog
+
+            ErrorDialog("Import image", f"Could not import {path.name}.", str(exc), self).exec()
             return False
         self.edited.emit()
         if resize:

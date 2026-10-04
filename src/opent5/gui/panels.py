@@ -127,23 +127,41 @@ class SearchPanel(QWidget):
         self.view.setColumnWidth(2, 110)
         self.view.activated.connect(self._activated)
         self.view.doubleClicked.connect(self._activated)
+        self.empty = QLabel(self.DEFAULT_EMPTY)
+        self.empty.setObjectName("EmptyState")
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty.setWordWrap(True)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addWidget(bar)
         lay.addWidget(self.view, 1)
+        lay.addWidget(self.empty, 1)
+        self.view.hide()
         self.query.returnPressed.connect(self.run)
+
+    DEFAULT_EMPTY = (
+        "Search this zone's asset names and contents (scripts, stringtable cells and "
+        "localize values). Type a query and press Enter."
+    )
+
+    def _show_hits(self, hits: list[SearchHit], empty_text: str | None = None) -> None:
+        self.model.set_hits(hits)
+        self.view.setVisible(bool(hits))
+        self.empty.setVisible(not hits)
+        if not hits:
+            self.empty.setText(empty_text or self.DEFAULT_EMPTY)
 
     def set_doc(self, doc: ZoneDoc | None) -> None:
         if doc is not self.doc:
             self.doc = doc
-            self.model.set_hits([])
+            self._show_hits([])
             self.summary.setText("")
 
     def run(self) -> list[SearchHit]:
         text = self.query.text()
         if self.doc is None or not text:
-            self.model.set_hits([])
+            self._show_hits([])
             self.summary.setText("")
             return []
         hits = self.doc.search(
@@ -152,7 +170,7 @@ class SearchPanel(QWidget):
             contents=self.contents.isChecked(),
             case=self.case.isChecked(),
         )
-        self.model.set_hits(hits)
+        self._show_hits(hits, f'No matches for "{text}" in this zone.')
         assets = len({h.ref.key for h in hits})
         self.summary.setText(f"{len(hits)} matches in {assets} assets" if hits else "no matches")
         return hits

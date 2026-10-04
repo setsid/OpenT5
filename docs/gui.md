@@ -35,7 +35,9 @@ any file inside the zone folders configured in `.env`.
 - **Asset header and view bar** (right). These show the asset's name, type, list index,
   size and zone offset, then one button for each view the asset offers.
 - **Bottom panel** (Ctrl+J), with three tabs: **Search** (within the open zone),
-  **Changes**, and **All Zones** (the cross-zone search, below).
+  **Changes**, and **All Zones** (the cross-zone search, below). Each carries an empty state
+  when it has nothing to show: Search before a query (and when a query finds nothing),
+  Changes with no edits, and All Zones before its first search.
 - **Status bar.** It shows the cursor or selection in the current view, then the zone
   name, the asset counts, whether the zone is signed and how many changes it has, and the
   backend.
@@ -91,6 +93,10 @@ by its own counts.
   no longer matches this file. It will load only on a client with the signature check
   patched out."
 - Closing a zone or the window with unsaved edits asks first.
+- **Error dialogs.** When the backend refuses an edit or a save, or a zone cannot be parsed
+  (`EditError` and the parse / save failures, which all state expected vs found and the
+  offset), the window shows a clear dialog that pulls the expected value, the found value and
+  the offset out above the full message, rather than a bare one-line warning.
 
 ## Searching every zone
 
@@ -205,6 +211,8 @@ into `out/screenshots/`, which git ignores. It takes about 35 s:
 | `24_global_search_dark`, `24_global_search_light` | the All Zones search panel, results grouped by zone |
 | `25_create_patch_dark` | the create-mod-patch result dialog |
 | `26_apply_patch_dark` | the apply-mod-patch result dialog |
+| `27_error_dark`, `27_error_light` | a backend failure (open, save, edit or patch) with its expected, found and offset pulled out |
+| `28_search_empty_dark` | the zone Search panel's empty state before a query |
 
 ## Tests
 
@@ -222,7 +230,8 @@ custom views. `test_gui_mesh.py` also covers the shaded renderer: the texture-so
 build, a textured quad rendered through OpenGL (skipped where no GL context is available),
 the wireframe fallback when GL is missing, and, slow-marked, the shaded Nuketown world.
 `test_gui_core.py` covers the per-type icons and the tree's thumbnail scaling and lazy
-requests. They are plain pytest with an offscreen QApplication (pytest-qt is not used); the
+requests, the error dialog (the expected / found / offset parser and that the full message
+is kept), and the Search panel's empty state. They are plain pytest with an offscreen QApplication (pytest-qt is not used); the
 fast ones take a few seconds in total.
 `tests/test_gui_search.py` covers the cross-zone search panel: the results tree grouped by
 zone, a double-click emitting an open request, and `run_search` calling the `opent5.index`

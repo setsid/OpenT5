@@ -1,7 +1,8 @@
-"""About, save report and keyboard shortcut dialogs."""
+"""About, save report, error and keyboard shortcut dialogs."""
 
 from __future__ import annotations
 
+import re
 import sys
 
 from PySide6 import __version__ as PYSIDE_VERSION
@@ -36,6 +37,74 @@ def _val(text: str, wrap: bool = False) -> QLabel:
     v.setWordWrap(wrap)
     v.setMinimumHeight(v.fontMetrics().height() + 2)
     return v
+
+
+def parse_error(message: str) -> dict[str, str]:
+    """Pull the expected value, the found value and the offset out of a backend error
+    message. The backend states errors as "... expected X, found Y (at <offset>)"
+    (RULES.md: errors state expected vs found and the offset), so this lifts those parts
+    out to show them plainly. Whatever is not recognised is left to the full message."""
+    text = " ".join(message.split())
+    out: dict[str, str] = {}
+    exp = re.search(r"expected (.+?)(?:,? (?:but )?found |$)", text, re.IGNORECASE)
+    if exp:
+        out["expected"] = exp.group(1).strip().rstrip(".")
+    found = re.search(
+        r"found (.+?)(?: at offset \S+| at 0x[0-9a-fA-F]+| in the DDS| in row \d+|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if found and found.group(1).strip():
+        out["found"] = found.group(1).strip().rstrip(".")
+    off = re.search(r"(?:at offset |at |offset )(0x[0-9a-fA-F]+|\d+)\b", text, re.IGNORECASE)
+    if off:
+        out["offset"] = off.group(1)
+    return out
+
+
+class ErrorDialog(QDialog):
+    """A backend failure shown clearly: the expected value, the found value and the offset
+    pulled out above the full message, rather than a bare one-line warning. Used for open,
+    save, edit and patch errors (``EditError`` and the parse / save failures)."""
+
+    def __init__(self, title: str, heading: str, message: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        head = QLabel(heading)
+        head.setWordWrap(True)
+        f = head.font()
+        f.setPointSize(f.pointSize() + 1)
+        head.setFont(f)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 12)
+        lay.setSpacing(10)
+        lay.addWidget(head)
+        parts = parse_error(message)
+        rows = [
+            (k, parts[v])
+            for k, v in (("Expected", "expected"), ("Found", "found"), ("Offset", "offset"))
+            if v in parts
+        ]
+        if rows:
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(14)
+            grid.setVerticalSpacing(3)
+            for i, (k, v) in enumerate(rows):
+                grid.addWidget(_key(k), i, 0, Qt.AlignmentFlag.AlignTop)
+                grid.addWidget(_val(v, wrap=True), i, 1)
+            grid.setColumnStretch(1, 1)
+            lay.addLayout(grid)
+            lay.addWidget(_key("Details"))
+        box = QPlainTextEdit(message)
+        box.setObjectName("ReportBody")
+        box.setReadOnly(True)
+        box.setFont(theme.mono_font())
+        box.setMaximumHeight(160)
+        lay.addWidget(box)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+        self.resize(620, 0)
 
 
 class AboutDialog(QDialog):

@@ -36,6 +36,7 @@ from opent5.gui.dialogs import (
     AboutDialog,
     ApplyPatchResultDialog,
     CreatePatchResultDialog,
+    ErrorDialog,
     SaveReportDialog,
     ShortcutsDialog,
 )
@@ -300,7 +301,7 @@ class MainWindow(QMainWindow):
         self.a_save_as = A("File", "Save As...", self.save_as, "Ctrl+Shift+S", "save")
         self.a_create_patch = A("File", "Create Mod Patch...", self.create_patch)
         self.a_apply_patch = A("File", "Apply Mod Patch...", self.apply_patch)
-        self.a_quit = A("File", "Quit", self.close, QKeySequence.StandardKey.Quit)
+        self.a_quit = A("File", "Quit", self.close, "Ctrl+Q")
         self.a_undo = A("Edit", "Undo", self.undo, "Ctrl+Z", "undo")
         self.a_redo = A("Edit", "Redo", self.redo, ["Ctrl+Shift+Z", "Ctrl+Y"], "redo")
         self.a_search = A("Search", "Search in Zone", self.show_search, "Ctrl+Shift+F", "search")
@@ -522,7 +523,7 @@ class MainWindow(QMainWindow):
         if not loading.cancelled:
             self._drop_tab(self.tabs.indexOf(loading))
         self.message(f"Could not open {path.name}")
-        QMessageBox.warning(self, "Could not open zone", f"{path}\n\n{err}")
+        self.show_error("Could not open zone", f"Could not open {path.name}.", f"{path}\n\n{err}")
 
     def _drop_tab(self, index: int) -> None:
         w = self.tabs.widget(index)
@@ -739,6 +740,14 @@ class MainWindow(QMainWindow):
         if timeout:
             QTimer.singleShot(timeout, lambda: self.st_message.setText(""))
 
+    def show_error(self, title: str, heading: str, message: str) -> None:
+        """Show a backend failure with its expected / found / offset pulled out."""
+        dialog = ErrorDialog(title, heading, message, self)
+        if self.modal_reports:
+            dialog.exec()
+        else:
+            dialog.show()
+
     # -- editing --------------------------------------------------------------------------
 
     def undo(self) -> None:
@@ -833,7 +842,7 @@ class MainWindow(QMainWindow):
         def failed(err):
             finish()
             self.message("Save failed")
-            QMessageBox.warning(self, "Save failed", err)
+            self.show_error("Save failed", f"Could not save {path.name}.", err)
 
         task.signals.progress.connect(step)
         task.signals.done.connect(done)
@@ -998,7 +1007,9 @@ class MainWindow(QMainWindow):
 
     def _patch_failed(self, err: str) -> None:
         self.message("Patch failed")
-        QMessageBox.warning(self, "Patch could not be completed", err)
+        self.show_error(
+            "Patch could not be completed", "The mod patch could not be completed.", err
+        )
 
     def _patch_created(self, result) -> None:
         self.message(f"Patch built: {len(result.changes)} asset(s), {result.patch_bytes:,} bytes")
@@ -1263,7 +1274,9 @@ def guard_edit_errors(fn):
         try:
             return fn(*args, **kwargs)
         except EditError as exc:
-            QMessageBox.warning(QApplication.activeWindow(), "Edit refused", str(exc))
+            ErrorDialog(
+                "Edit refused", "The edit was refused.", str(exc), QApplication.activeWindow()
+            ).exec()
             return None
 
     return wrapper
