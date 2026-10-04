@@ -108,7 +108,10 @@ def convert_map(
     foreign = Rewrite(pc_content, platform=pcmod.PC)
     problems = foreign.xfile.problems()
     if problems:
-        raise ConvertError("PC zone does not parse exactly: " + "; ".join(problems[:3]))
+        raise ConvertError(
+            "PC zone does not parse exactly, so the converter will not write a zone it cannot "
+            "reproduce (no output written): " + "; ".join(problems[:3])
+        )
     report["pc"] = {
         "content_bytes": len(pc_content),
         "assets": [[a.index, a.type_name, a.name] for a in foreign.xfile.assets],
