@@ -134,73 +134,16 @@ spread of `mp_tdm_spawn` (TDM) and `mp_dm_spawn` (FFA) on flat surface cells; tw
 origins for the compass; and a `node_pathnode` grid on walkable cells by default, so Domination
 and the other team-based modes do not stall at load.
 
-Status (verified here): the PC build runs. cod2map, cod2rad and linker_pc all return 0 for the
-generated map. `blockmap convert` does not yet parse the PC zone exactly: its gfx_map RUNTIME
-block is 0x780 short of the header. This is a PC-parse gap in the gfx_map RUNTIME handler
-(convert/pc.py), exposed by the blocky map's terrain and nine-light structure, not present on the
-box (which parses exactly). It is unrelated to ropes: col_map and game_map both parse exactly, and
-every gfx_map RUNTIME reserve size is captured, so the 0x780 is an alignment or sizing subtlety in
-one gfx_map array for this map's counts. Parked until found; the earlier converted blocky zone was
-produced with a wrong rope stride that happened to mask the gap and should not be trusted. The
-generator side (map, materials, sealing, lighting, path nodes) is correct and compiles.
+Status (verified here): the pipeline runs end to end for a one-light map. cod2map, cod2rad and
+linker_pc all return 0, and `blockmap convert` parses the PC zone exactly, converts onto mp_nuked
+with 0 pointers unresolved, verifies, and passes the emulated loader. The earlier PC gfx_map RUNTIME
+shortfall was `surfaceCastsSunShadow` sized as 4 * surface_vis instead of 4 * static_surfaces
+(convert/pc.py); the box could not reveal it (its surface_vis is close to its static_surfaces and
+128-byte alignment absorbed the difference), a terrain map with hundreds of surfaces did. Fixed.
 
-## 5. Conversion and offline validation
-
-`tools/blockmap.py convert PC_MAP.ff -o OUTDIR [--base mp_nuked]` drives the committed converter
-`opent5.convert.mapzone.convert_map`, passing the block textures as `overrides`. The converter is
-ready for this map: its signature already accepts `overrides`, `name`, `image_roots`,
-`force_materials` and baked lighting (docs/convert.md 11, 13); new materials (none of the block
-materials exist in mp_nuked) go through `materials.py` with the techset remapped by name. The one
-thing it cannot do without the PC build is read the PC material/techset structure, which lives in
-`PC_MAP.ff`. So the conversion is blocked only by the PC build (the launcher loader, section 4),
-not by the converter. `blockmap convert` wires both forms: the mp_nuked replacement
-(`out/demo/m_blocks/`) and the own-name zone (`--name`, `--copy-pak`, its own compass,
-`out/demo/m_blocks_named/`).
-
-Offline validation done here (no console, no emulator beyond the committed loader path, no
-network):
-
-| Check | Result |
-|---|---|
-| Determinism | same seed gives byte-identical grid and `.map` sha1 (`gen` twice) |
-| Mesh coverage | every solid/water cell in exactly one brush, no overlaps |
-| Counts vs limits | 2778 / 65535 brushes, 6207 / 65535 surfaces (section 2) |
-| Texture DXT round-trip | mean RGB error about 2 of 255; water has alpha |
-| `.map` well-formed | brace-balanced, worldspawn + all spawn classes + light grid + skybox |
-| Tests | `tests/test_mapgen.py`, 20 passing; `test_no_network` clean; ruff clean |
-
-Not validated here (needs the PC build first, then a device run): the compiled PC `.ff`, the PS3
-conversion, the emulated loader walk, and rendering.
-
-## 6. Previews
-
-`gen` writes `preview_top.png` (plan, north up, height-shaded) and `preview_angle.png` (isometric,
-back to front). Looked at for seed 1: the plan shows green hills, blue ponds with sandy shores,
-dark-green tree canopies and the grey cobble village with two brown hut roofs; the isometric view
-shows the same as blocky 3D terrain with trees standing above the hills and the village on a flat
-pad. Hills, trees, water and village are all clearly visible.
-
-## 7. Files created and open items
-
-New files created in the Steam game folder (all `mp_opent5blocks*`): 11 materials
-`raw/materials/mp_opent5blocks_<tile>`, 11 colour maps `raw/images/mp_opent5blocks_<tile>_c.iwi`,
-`zone_source/mp_opent5blocks.csv`, and `raw/maps/mp/mp_opent5blocks.{d3dbsp,d3dprt,d3dpoly,grid_auto}`
-(the BSP is currently the v31 from `cod2map.exe` alone; the launcher v45 BSP and the linked
-`zone/English/mp_opent5blocks.ff` are not yet produced, section 4). Nothing else in the game
-folder was changed.
-
-Open items / gaps for the lead:
-
-- The LinkerMod loader is wedged: `launcher_ldr.exe` + `cod2map.dll` fail with "Access is denied."
-  / EXITCODE 5 for every map (a trivial box too), while `cod2map.exe` alone works. A protected
-  `launcher-x64.exe` (PID 12280, session 0) cannot be killed by this user. Clear that process (or
-  the security policy blocking DLL injection), then re-run `blockmap build` and `blockmap convert`;
-  everything else is in place.
-- (historic) The PC Mod Tools were first thought absent; they are present at
-  `.../Call of Duty Black Ops/bin/`. The remaining blocker is the loader above, not the tools.
-- The block materials, their colour-map IWIs and the sky material are registered (section 4);
-  `cod2map.exe` resolves them all and seals the map, so this is done, pending the loader.
-- Texture scale in the `.map` (one tile per block) is set to the block size and is INFERRED; the
-  exact UV wants a device render to confirm the blocky tiling.
-- Water is a plain textured slab with a water-looking material; a true engine water surface
-  (reflection, fog volume) is not modelled.
+A smaller residual remains for terrain maps with **many shadow-casting lights** (16 to 80 bytes,
+alignment-entangled, needs deeper work), so the blocky generator is held to one light for now; such
+a map loads but is dim toward the edges. Converting a map with many lights still fails loudly (it
+is never written). The linker also prints two harmless errors (missing assetlist/code_post_gfx_mp.csv
+and common_mp.csv for the ignore zones); the box build prints the same and converts fine, so they do
+not affect the result.

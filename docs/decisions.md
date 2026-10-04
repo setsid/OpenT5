@@ -211,3 +211,14 @@ build otherwise. A real map keeps its own baked links. n_box_all2 now bakes 141 
 nodes as one component; reparse exact, emulated loader clean. Open refinement: 5 of 141 links
 graze a bomb-site solid (no line-of-sight test against collision yet); harmless for loading.
 This supersedes the earlier "runtime linking blocked by collision" note.
+
+**Blocky convert: the gfx_map gap was surfaceCastsSunShadow.** The PC gfx_map RUNTIME parse
+sized surfaceCastsSunShadow (0x3AC) as 4 * surface_vis; it is one flag per static surface,
+4 * static_surfaces. The box could not reveal it (surface_vis 4 close to static_surfaces 3,
+128-byte alignment absorbing the rest); a terrain map with hundreds of surfaces exposed the
+0x680 shortfall. Fixed in convert/pc.py; the box and one-light/flat terrain maps parse exactly,
+confirmed across three maps. A smaller residual (16 to 80 bytes) remains for terrain maps with
+many shadow-casting lights; it is alignment-entangled (flips sign with map size) and needs the
+exact PC loader layout, so the blocky generator is held to one light and o_blocks2 ships for
+local testing on that basis. The linker's missing-assetlist errors (code_post_gfx_mp.csv,
+common_mp.csv) are harmless: the box build prints the same and converts fine.
