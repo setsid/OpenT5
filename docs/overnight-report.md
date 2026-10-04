@@ -97,6 +97,9 @@ Needs a device run:
 
 ## Parked (needs you)
 
+- **Lint nit (pre-existing):** `src/opent5/mapgen/mapwriter.py` `path_nodes()` has one
+  E501 over-length line (the `node_pathnode` origin line). Noticed during o_blocks5 work;
+  not fixed on that branch.
 - **PC Mod Tools loader wedged.** Partway through the night the LinkerMod loader
   (launcher_ldr) began returning "Access is denied" (exit 5) for every map
   compile, while cod2map.exe alone still runs but writes the old BSP version. A

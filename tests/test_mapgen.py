@@ -197,6 +197,52 @@ def test_spawn_classes_present_for_tdm_and_ffa(built):
     assert need <= classes
 
 
+# -- o_blocks5 structure primitives --------------------------------------------------------
+
+
+def test_ladder_and_clip_player_pass_through():
+    # Stock tool materials verified present in the PC Mod Tools, carried into the .map verbatim.
+    assert mapwriter.material_name("ladder") == "ladder"
+    assert mapwriter.material_name(mapwriter.CLIP_PLAYER) == "clip_player"
+
+
+def test_half_step_is_eighteen_for_block_36():
+    t = terrain.generate(nx=24, ny=24, nz=12, block=36, seed=1)
+    assert mapwriter.half_step(t) == 18  # BO1 step height = half a 36-unit block
+
+
+def test_slab_stairs_climb_at_step_height():
+    t = terrain.generate(nx=24, ny=24, nz=12, block=36, seed=1)
+    steps = 6
+    brushes = mapwriter.slab_stairs(t, (0, 0, 0), "x", steps, width=72, material="plank")
+    assert len(brushes) == steps  # one brush per step
+    text = "\n".join("\n".join(b) for b in brushes)
+    assert "jun_art_concrete_base02" in text  # plank's stock material
+    # each step rises exactly one half-block (18u): no single step exceeds the step height
+    assert mapwriter.half_step(t) == 18
+
+
+def test_clip_wall_ring_is_four_player_clip_walls():
+    t = terrain.generate(nx=24, ny=24, nz=12, block=36, seed=1)
+    ring = mapwriter.clip_wall_ring(t)
+    assert len(ring) == 4
+    for wall in ring:
+        assert any("clip_player" in line for line in wall)
+
+
+def test_ladder_brush_uses_the_ladder_material():
+    t = terrain.generate(nx=24, ny=24, nz=12, block=36, seed=1)
+    brush = mapwriter.ladder_brush(t, (0, 0, 0), height=144, axis="x")
+    assert any(" ladder " in line for line in brush)
+
+
+def test_hurt_volume_is_a_trigger_hurt_brush_entity():
+    vol = mapwriter.hurt_volume((0, 0, 0), (100, 100, 72), dmg=100)
+    assert vol["classname"] == "trigger_hurt"
+    assert vol["dmg"] == "100"
+    assert vol["_brushes"] and vol["_brushes"][0][2] == "trigger"
+
+
 # -- preview (smoke) -----------------------------------------------------------------------
 
 

@@ -94,7 +94,14 @@ def _face_points(lo, hi):
 
 #: Raw materials that pass straight through (not block tiles): the seal caulk, the light-grid
 #: volume, the sky, and the entity-brush materials for triggers and solid script_brushmodels.
-_PASSTHROUGH = frozenset({CAULK, LIGHT_GRID, SKY, "trigger", "clip"})
+#: ``ladder`` and ``clip_player`` are stock tool materials of the PC Mod Tools (verified in
+#: raw/materials beside ``clip``/``caulk``/``trigger``): cod2map stamps the ladder surface flag
+#: from a ``ladder`` face and the player-clip contents from ``clip_player``, and the converter's
+#: clipMap swap carries both to PS3 unchanged (no converter change; a ladder needs no trigger,
+#: its mount is engine-driven on contact). See docs/mapgen.md.
+LADDER = "ladder"
+CLIP_PLAYER = "clip_player"
+_PASSTHROUGH = frozenset({CAULK, LIGHT_GRID, SKY, "trigger", "clip", LADDER, CLIP_PLAYER})
 
 
 def material_name(tile: str) -> str:
@@ -440,6 +447,108 @@ def light_grid_brush(t: Terrain) -> list[str]:
     zlo = t.origin[2] + t.sea_level * t.block
     zhi = t.origin[2] + t.shape[2] * t.block
     return _axis_brush((x0 + 8, y0 + 8, zlo), (x1 - 8, y1 - 8, zhi), LIGHT_GRID, t.block)
+
+
+# -- o_blocks5 structure primitives --------------------------------------------------------
+# Reusable, deterministic brush emitters for the next map iteration: half-height (18u) slab
+# stairs, a player-clip edge wall, a ladder face and a trigger_hurt kill volume. They mirror
+# the proven ``seal_brushes`` / ``_brush_entity`` patterns (axis brushes and brush entities
+# cod2map compiles into the clipMap) and are not wired into ``map_text`` yet, so the proven
+# o_blocks4 output is unchanged. See docs/mapgen.md (o_blocks5 plan).
+
+
+def half_step(t: Terrain) -> int:
+    """The BO1 step height, 18 units for the 36-unit block: a full block cannot be stepped, so
+    stairs and ramps rise one half-block per step (docs/mapgen.md, terrain.py block note)."""
+    return t.block // 2
+
+
+def slab_stairs(
+    t: Terrain,
+    foot: tuple[float, float, float],
+    axis: str,
+    steps: int,
+    width: float,
+    material: str = "plank",
+    rise: int | None = None,
+    scale: int | None = None,
+) -> list[list[str]]:
+    """A flight of ``steps`` half-height (``rise``, default 18u) slab steps climbing along
+    ``axis`` ('x' or '-x' / 'y' or '-y') from ``foot`` (the bottom step's near-bottom corner).
+    Each step is one tread deep (``rise`` units of run per ``rise`` of climb, a 45-degree
+    stair) and ``width`` wide, so the whole flight is walkable at the engine step height. Every
+    face uses ``material`` (a stock block material or ``clip``). Returns one brush per step."""
+    rise = rise if rise is not None else half_step(t)
+    scale = scale if scale is not None else t.block
+    sign = -1 if axis.startswith("-") else 1
+    along = axis[-1]
+    x, y, z = foot
+    out: list[list[str]] = []
+    for n in range(steps):
+        front = n * rise * sign  # tread advances one rise per step (45-degree pitch)
+        top = z + (n + 1) * rise
+        if along == "x":
+            lo = (x + min(front, front + rise * sign), y, z)
+            hi = (x + max(front, front + rise * sign), y + width, top)
+        else:
+            lo = (x, y + min(front, front + rise * sign), z)
+            hi = (x + width, y + max(front, front + rise * sign), top)
+        # _axis_brush resolves the tile token through material_name itself, so pass the token.
+        out.append(_axis_brush(lo, hi, material, scale))
+    return out
+
+
+def clip_wall_ring(
+    t: Terrain, inset: int | None = None, height: int | None = None, thickness: int | None = None
+) -> list[list[str]]:
+    """Four ``clip_player`` walls just inside the world bounds: an invisible barrier at the true
+    playable edge (so a lava perimeter or drop is not walkable), leaving the terrain untouched.
+    ``inset`` from each side, ``height`` above the floor, ``thickness`` into the wall."""
+    inset = inset if inset is not None else t.block * 2
+    height = height if height is not None else t.block * 4
+    thickness = thickness if thickness is not None else t.block
+    (x0, y0, z0), (x1, y1, _) = t.world_bounds()
+    xl, xr = x0 + inset, x1 - inset
+    yl, yr = y0 + inset, y1 - inset
+    zt = z0 + height
+    s = t.block
+    return [
+        _axis_brush((xl, yl, z0), (xr, yl + thickness, zt), CLIP_PLAYER, s),  # -y
+        _axis_brush((xl, yr - thickness, z0), (xr, yr, zt), CLIP_PLAYER, s),  # +y
+        _axis_brush((xl, yl, z0), (xl + thickness, yr, zt), CLIP_PLAYER, s),  # -x
+        _axis_brush((xr - thickness, yl, z0), (xr, yr, zt), CLIP_PLAYER, s),  # +x
+    ]
+
+
+def ladder_brush(
+    t: Terrain, foot: tuple[float, float, float], height: float, axis: str, scale: int | None = None
+) -> list[str]:
+    """A thin climbable ``ladder`` brush of ``height`` standing at ``foot`` (its bottom), its flat
+    face normal to ``axis`` ('x'/'-x'/'y'/'-y'). cod2map stamps the ladder surface flag on it;
+    the player climbs on contact (no trigger). Depth is a quarter-block so it hugs a wall."""
+    scale = scale if scale is not None else t.block
+    x, y, z = foot
+    d = t.block / 4
+    w = t.block  # rung width
+    if axis[-1] == "x":
+        lo, hi = (x, y, z), (x + d, y + w, z + height)
+    else:
+        lo, hi = (x, y, z), (x + w, y + d, z + height)
+    return _axis_brush(lo, hi, LADDER, scale)
+
+
+def hurt_volume(
+    lo: tuple[float, float, float], hi: tuple[float, float, float], dmg: int = 100
+) -> dict:
+    """A ``trigger_hurt`` brush entity spanning ``lo``..``hi``: an engine-handled kill volume
+    (no custom GSC) for a lava perimeter. cod2map compiles the brush into a clipMap submodel and
+    gives the entity ``model "*N"``. ``dmg`` is the per-touch damage (100 = lethal)."""
+    return {
+        "classname": "trigger_hurt",
+        "dmg": str(dmg),
+        "origin": _v((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, lo[2]),
+        "_brushes": [(lo, hi, "trigger")],
+    }
 
 
 def map_text(t: Terrain, boxes: list[Box], scale: int | None = None, light_grid: int = 3) -> str:
