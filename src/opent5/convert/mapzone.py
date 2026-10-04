@@ -20,7 +20,7 @@ from pathlib import Path
 
 from opent5.container.fastfile import OFFSET_ZONE_NAME, ZONE_NAME_SIZE
 from opent5.container.zone import Zone
-from opent5.convert import compass, mapname, smodels, world
+from opent5.convert import compass, mapname, pathlinks, smodels, world
 from opent5.convert import entities as ent
 from opent5.convert import lighting as lit
 from opent5.convert import materials as mats
@@ -228,18 +228,21 @@ def convert_map(
     world.convert_com(pcom)
     world.convert_game(pgame)
     world.convert_clip(pclip)
-    # Path nodes: Domination and the other team-based modes stall at load on a map with no
-    # path-node connectivity (docs/research/box-objectives-cd.md 4, fixD proved it). The map
-    # generators emit a node_pathnode grid by default so cod2map compiles one; warn here when
-    # a converted map arrives with none, so the stall is not a surprise on device.
+    # Path-node links: cod2map does not connect the nodes and the stock Connect Paths step runs
+    # the PC game, so a generated map's PathData has no links. The retail engine does not link at
+    # load; it reads the baked links, so an unlinked map drops with "Path nodes are not
+    # connected." Bake the links here, in the stock format, as one connected component. A real
+    # map keeps its own baked links (pathlinks.has_links).
     node_count = struct.unpack_from(">I", pgame["header"], 4)[0]
-    report["path_nodes"] = node_count
-    if node_count == 0:
-        report["notes"].append(
-            "path nodes: the map has 0 (GameWorldMp nodeCount); Domination and the other "
-            "team-based modes will stall at load. Place node_pathnode entities and recompile "
-            "(tools/testmap.py and the blocky generator do this by default)."
-        )
+    report["path_nodes"] = {"nodes": node_count}
+    if node_count:
+        if pathlinks.has_links(pgame):
+            report["path_nodes"]["links"] = "kept (the map's own)"
+        else:
+            try:
+                report["path_nodes"] = pathlinks.generate(pgame)
+            except ValueError as e:
+                raise ConvertError(str(e)) from e
     model_words = smodels.model_words(bx)
     sres = smodels.convert_static_models(taken, model_words, foreign.xfile)
     clip_models = smodels.repoint_clip(pclip, model_words, foreign.xfile)
