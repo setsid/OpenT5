@@ -123,3 +123,21 @@ blocky geometry (many brushes, caves, or the water slab) rather than the grid or
 lightmap. Next: capture cod2rad's real output (run cod2rad.exe outside the loader,
 or find its log), or build a variant without water and caves to isolate it. The
 generator and textures are sound and committed; only the cod2rad bake fails.
+
+**Blocky-map cod2rad: cause isolated, not fully fixed.** Correction first: the
+earlier "wedged loader, PID 12280" was a misdiagnosis. PID 12280 is WinFsp (a
+filesystem service), unrelated to the Mod Tools; the loader was never wedged by
+it. The "Access is denied" seen was transient (a brief file lock after a crash).
+The real, persistent failure is cod2rad crashing (exit -1, no output through the
+loader) on the blocky map. Bisection: the map bakes fine with a stock material
+(jun_art_concrete_base02, exit 0) but crashes with the cloned mp_opent5blocks_*
+materials, at every size and with water/caves/trees/hills removed. So the
+geometry, grid, lightmap spec and the whole generator/pipeline are sound; cod2rad
+rejects the cloned materials (or their copied colour-map IWI). Adding the tools'
+~-g colour-map marker to the clone did not fix it, so it is deeper than the name
+(the copied IWI's validity, or a field in the cloned material binary cod2rad
+reads during the bake). Next step for a working blocky map with custom art:
+either make the material/IWI clone cod2rad-valid, or compile with per-block-type
+stock materials and apply the custom pixel art through the converter's forced
+map-own overrides. Added generator toggles (--no-water/--no-caves/--flat, commit
+eaf1704) that made the bisection possible and are useful in their own right.

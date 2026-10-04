@@ -106,8 +106,16 @@ Needs a device run:
   Morning: clear the process or restart, then run the staged commands.
   - fixC/fixD: scratchpad integ/fixCD.sh, or the commands in docs/demo-box-full.md
     section 7.
-  - blocky map: `blockmap build mp_opent5blocks` then `blockmap convert`
-    (docs/mapgen.md).
+  - blocky map: cause isolated (see below), not yet a working demo.
+
+**Blocky map cod2rad crash (diagnosed).** cod2rad crashes (exit -1) baking the
+blocky map. Bisected: it bakes with a stock material but not with the cloned
+mp_opent5blocks_* materials, at any size and with water/caves/hills removed, so
+the geometry and pipeline are fine and the cloned materials (or their copied
+colour-map IWI) are the cause. The ~-g colour-map marker alone did not fix it.
+Next: make the material/IWI clone cod2rad-valid, or use per-type stock materials
+with forced converter overrides for the custom art. (The earlier "wedged loader
+PID 12280" was a misread: that is WinFsp, unrelated; the loader works.)
 
 ## Needs you (decisions / action)
 
