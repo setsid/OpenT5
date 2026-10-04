@@ -197,3 +197,17 @@ reserve exactly at 0xC74, so PC rope_t is 0xC74. The blocky map's 0x780 RUNTIME 
 separate, pre-existing gap in the gfx_map RUNTIME parse (convert/pc.py), not ropes; the rope
 bump masked it by coincidence (32 x 0x3C) and broke the box. The blocky convert is parked on
 that gfx_map gap; the earlier o_blocks zone was built with the wrong stride and is not trusted.
+
+**Path nodes: the engine reads baked links; we bake them in the converter.** Device control
+confirmed every box build (fixD, n_box_all, n_box_all2 dense) fails the same way with
+"Path nodes are not connected", retail mp_nuked loads on the same setup. So it is not a
+regression: every generated map ships 0 stored links, cod2map does not author them, and the
+stock Connect Paths step runs the PC game (g_connectpaths, linker_pc.dll), which our pipeline
+cannot. The retail engine does not link at load; it reads the baked links, so an unlinked map
+is all islands. The converter (convert/pathlinks.py) now bakes the links in the stock format
+(pathlink_s per node, totalLinkCount, inline Links pointer, bidirectional, true distance),
+linking by distance and widening until the graph is one connected component, and fails the
+build otherwise. A real map keeps its own baked links. n_box_all2 now bakes 141 links over 80
+nodes as one component; reparse exact, emulated loader clean. Open refinement: 5 of 141 links
+graze a bomb-site solid (no line-of-sight test against collision yet); harmless for loading.
+This supersedes the earlier "runtime linking blocked by collision" note.
