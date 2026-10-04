@@ -227,3 +227,27 @@ Device test:
   (mp_nuked's own entity string) and make those brush-model triggers spawn.
 - Problem 2: the bomb-site models and all static props have no collision (same as
   k_box_full). Fix: carry stock-style xmodel prop collision through the converter.
+
+## n_box_all: the three fixes combined (offline-proven, device pending)
+
+After the fixC (S&D) and fixD (Domination) device runs, all three converter/generator
+fixes are built into one box, `out/demo/n_box_all/mp_nuked.ff`
+(sha1 4f6eb890f69ef61193fb29b225a8285b162485e2), copied to the desktop with a checklist.
+
+- **S&D plant triggers.** The box's bomb sites now carry the exact stock mp_nuked bombzone
+  entity set, read from mp_nuked's own map_ents: per site two trigger_use_touch triggers
+  (plant with script_bombmode_original + script_label, defuse), the bomb script_model with a
+  script_exploder chaining them, and two solid script_brushmodels. Radius triggers (fixC)
+  showed the objectives but gave no plant prompt; the brush-model use triggers restore it.
+- **Prop and bomb-site collision.** cod2map gives a misc_model no collision even though it
+  sits in the clipMap static model list (confirmed: the box has 8 static models and no prop
+  collision on device). A stock map clips its props with brushes; the box now wraps each prop
+  and bomb site in a worldspawn clip box, compiled into the BSP as cbrushes.
+- **Path nodes by default.** The node_pathnode grid is emitted by default; cod2map compiles
+  it into the GameWorldMp path data (converted nodeCount 25), the connectivity fixD proved
+  Domination needs.
+
+Offline proof: reparse exact (0 of 53242 pointers unresolved), verify OK, emulated loader
+consumes exactly (same_values 53242/53242, 0 targets outside their block), 12 gametypes
+ready, GameWorldMp nodeCount 25, clip brushes compiled in. The device checklist confirms the
+plant prompt, the prop/site collision and the Domination load together.
