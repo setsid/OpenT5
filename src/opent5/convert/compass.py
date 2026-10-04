@@ -237,11 +237,13 @@ def append_asset(xfile, asset_type: int, node: dict, name: str):
     return asset
 
 
-def add_to_zone(xfile, stock_xfile, map_name: str, base_name: str, gfx: dict, nw, se):
+def add_to_zone(xfile, stock_xfile, map_name: str, base_name: str, gfx: dict, nw, se,
+                override_rgba=None):
     """Render the compass of ``gfx`` between the corners, and add ``compass_map_<map>``
     (material, its image inline) to ``xfile``, cloned from the stock
     ``compass_map_<base>`` of ``stock_xfile`` (code_post_gfx_mp). Returns (material node,
-    RGBA image, report)."""
+    RGBA image, report). ``override_rgba``: a ready SIZE x SIZE RGBA (the map's own coloured
+    top-down) to use as the image instead of the grey geometry render."""
     import hashlib
 
     from opent5.convert.world import ConvertError
@@ -262,8 +264,17 @@ def add_to_zone(xfile, stock_xfile, map_name: str, base_name: str, gfx: dict, nw
             "holds no reference to it for the compass material"
         )
     word = bytes(donor.data["header"][0x70:0x74])
-    positions, triangles, _ = world_triangles(gfx)
-    rgba = render(positions, triangles, nw, se)
+    if override_rgba is not None:
+        rgba = np.asarray(override_rgba)
+        if rgba.shape != (SIZE, SIZE, 4):
+            raise ConvertError(
+                f"compass override: expected {SIZE}x{SIZE} RGBA, found {rgba.shape}"
+            )
+        source = "map top-down (override)"
+    else:
+        positions, triangles, _ = world_triangles(gfx)
+        rgba = render(positions, triangles, nw, se)
+        source = "gfx geometry render"
     image = compass_image(name, rgba)
     node = compass_material(name, stock, word, donor.data["technique_set"], image)
     asset = append_asset(xfile, AssetType.MATERIAL, node, name)
@@ -280,6 +291,7 @@ def add_to_zone(xfile, stock_xfile, map_name: str, base_name: str, gfx: dict, nw
             "bytes": len(image["pixels"]),
             "sha1": hashlib.sha1(image["pixels"]).hexdigest(),
             "drawn_pixels": int((rgba[:, :, 3] > 0).sum()),
+            "source": source,
         },
         "north_west": list(nw),
         "south_east": list(se),

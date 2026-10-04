@@ -65,6 +65,28 @@ def top_view(t: Terrain, px: int = 10) -> np.ndarray:
     return img
 
 
+def compass_view(t: Terrain, size: int = 512) -> np.ndarray:
+    """A square top-down of the terrain coloured by the top cell's material, oriented for the
+    in-game compass (``opent5.convert.compass.render``): image row runs with decreasing world
+    x, column with decreasing world y. Used as the converted map's minimap so it matches the
+    terrain rather than showing Nuketown. Opaque (alpha 255)."""
+    nx, ny, nz = t.shape
+    base = np.zeros((nx, ny, 3), np.uint8)
+    for i in range(nx):
+        for j in range(ny):
+            m, k = _top_cell(t, i, j)
+            if m == AIR:
+                continue
+            shade = 0.6 + 0.4 * (k / max(1, nz - 1))
+            base[i, j] = np.clip(np.array(_COLOUR.get(m, (200, 0, 200)), np.float32) * shade, 0, 255)
+    ri = np.rint((1 - np.arange(size) / (size - 1)) * (nx - 1)).astype(int)  # row -> i (x down)
+    cj = np.rint((1 - np.arange(size) / (size - 1)) * (ny - 1)).astype(int)  # col -> j (y down)
+    img = np.zeros((size, size, 4), np.uint8)
+    img[..., 3] = 255
+    img[:, :, :3] = base[ri][:, cj]
+    return img
+
+
 def angle_view(t: Terrain, px: int = 7) -> np.ndarray:
     nx, ny, nz = t.shape
     half = px // 2

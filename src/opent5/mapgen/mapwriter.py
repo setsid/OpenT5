@@ -92,10 +92,15 @@ def _face_points(lo, hi):
     }
 
 
+#: Raw materials that pass straight through (not block tiles): the seal caulk, the light-grid
+#: volume, the sky, and the entity-brush materials for triggers and solid script_brushmodels.
+_PASSTHROUGH = frozenset({CAULK, LIGHT_GRID, SKY, "trigger", "clip"})
+
+
 def material_name(tile: str) -> str:
-    """Material name used in the ``.map`` for a tile (``caulk``, the grid and sky pass
-    through; every block face maps to its stock ``blockout_test_*`` material)."""
-    if tile in (CAULK, LIGHT_GRID, SKY):
+    """Material name used in the ``.map`` for a tile (caulk, the grid, sky, trigger and clip
+    pass through; every block face maps to its stock ``blockout_test_*`` material)."""
+    if tile in _PASSTHROUGH:
         return tile
     return STOCK_MATERIAL[tile]
 
@@ -160,6 +165,17 @@ def _pick(t: Terrain, cols: list[tuple[int, int]], fx: float, fy: float) -> tupl
 def _origin(t: Terrain, i: int, j: int, dz: int = 8) -> tuple[float, float, float]:
     x, y, _ = t.cell_centre_world(i, j, 0)
     return (x, y, _surface_world_z(t, i, j) + dz)
+
+
+def _brush_entity(classname: str, centre, size: float, height: float, material: str, keys: dict):
+    """A brush entity: a ``size`` x ``size`` x ``height`` box standing on ``centre`` (its z is the
+    box bottom), every face ``material`` (``trigger`` for triggers, ``clip`` for solid
+    script_brushmodels). cod2map compiles the brushes into a clipMap submodel and gives the entity
+    a ``model "*N"``. The brushes live under ``_brushes`` and ``map_text`` emits them."""
+    x, y, z = centre
+    h = size / 2
+    lo, hi = (x - h, y - h, z), (x + h, y + h, z + height)
+    return {"classname": classname, **keys, "_brushes": [(lo, hi, material)]}
 
 
 def spawn_entities(t: Terrain) -> list[dict]:
@@ -241,64 +257,73 @@ def objective_entities(t: Terrain) -> list[dict]:
                 "script_gameobjectname": "dom",
             }
         )
-    # Search & Destroy: two bomb sites on the +x (defender) side. Each is the chain the sd
-    # script walks unchecked (patch_mp sd.gsc bombs 466-502): a plant trigger (targetname
-    # "bombzone") targeting the bomb visual, the visual targeting the defuse trigger.
+    # Search & Destroy: two bomb sites on the +x (defender) side, each the stock mp_nuked
+    # five-entity set (tools/testmap.py objective_entities): a trigger_use_touch plant trigger
+    # ("bombzone", script_bombmode_original + script_label, targeting the bomb), a second
+    # trigger_use_touch defuse trigger, the bomb script_model chaining the two by target with
+    # script_exploder, and two solid script_brushmodels. The plant/defuse triggers are brush
+    # models so _gameobjects::createUseObject gives a hold-to-use plant prompt (a radius trigger
+    # shows the objective but no prompt). cod2map compiles the brushes into the clipMap.
+    exploders = {"a": 7121, "b": 7152}
     for label, fy in (("a", -0.4), ("b", 0.4)):
         i, j = _pick(t, cols, 0.42, fy)
-        ox, oy, oz = _origin(t, i, j, dz=0)
+        c = _origin(t, i, j, dz=0)
         ents.append(
-            {
-                "classname": "trigger_radius_use",
-                "origin": _v(ox, oy, oz),
-                "targetname": "bombzone",
-                "target": f"bombzone_{label}_auto1",
-                "script_gameobjectname": "bombzone",
-                "script_bombmode_original": "1",
-                "script_label": f"_{label}",
-                "radius": radius(i, j),
-                "height": f"{t.block * 3:g}",
-            }
+            _brush_entity(
+                "trigger_use_touch", c, 96, 96, "trigger",
+                {
+                    "targetname": "bombzone",
+                    "script_gameobjectname": "bombzone",
+                    "target": f"bombzone_{label}_auto1",
+                    "script_bombmode_original": "1",
+                    "script_label": f"_{label}",
+                },
+            )
+        )
+        ents.append(
+            _brush_entity(
+                "trigger_use_touch", c, 96, 96, "trigger",
+                {"targetname": f"bombzone_{label}_auto2", "script_gameobjectname": "bombzone"},
+            )
         )
         ents.append(
             {
                 "classname": "script_model",
-                "origin": _v(ox, oy, oz + 2),
+                "origin": _v(c[0], c[1], c[2] + 2),
                 "angles": "0 90 0",
                 "model": "p_glo_bomb_stack",
                 "targetname": f"bombzone_{label}_auto1",
                 "target": f"bombzone_{label}_auto2",
                 "script_gameobjectname": "bombzone",
+                "script_exploder": str(exploders[label]),
                 "spawnflags": "5",
             }
         )
         ents.append(
-            {
-                "classname": "trigger_radius_use",
-                "origin": _v(ox, oy, oz),
-                "targetname": f"bombzone_{label}_auto2",
-                "script_gameobjectname": "bombzone",
-                "radius": radius(i, j),
-                "height": f"{t.block * 3:g}",
-            }
+            _brush_entity(
+                "script_brushmodel", c, 56, 14, "clip",
+                {"script_gameobjectname": "bombzone", "spawnflags": "1"},
+            )
         )
-    # The attackers' plantable bomb and its pickup trigger, on the -x side.
+        ents.append(
+            _brush_entity(
+                "script_brushmodel", (c[0], c[1], c[2] + 14), 56, 14, "clip",
+                {"script_gameobjectname": "bombzone", "spawnflags": "1"},
+            )
+        )
+    # The attackers' plantable bomb and its pickup trigger (brush), on the -x side.
     i, j = _pick(t, cols, -0.42, 0.0)
-    ox, oy, oz = _origin(t, i, j, dz=0)
+    c = _origin(t, i, j, dz=0)
     ents.append(
-        {
-            "classname": "trigger_radius",
-            "origin": _v(ox, oy, oz),
-            "targetname": "sd_bomb_pickup_trig",
-            "script_gameobjectname": "sd",
-            "radius": radius(i, j),
-            "height": f"{t.block * 3:g}",
-        }
+        _brush_entity(
+            "trigger_multiple", c, 48, 48, "trigger",
+            {"targetname": "sd_bomb_pickup_trig", "script_gameobjectname": "sd"},
+        )
     )
     ents.append(
         {
             "classname": "script_model",
-            "origin": _v(ox, oy, oz + 2),
+            "origin": _v(c[0], c[1], c[2] + 2),
             "angles": "0 270 0",
             "model": "prop_suitcase_bomb",
             "targetname": "sd_bomb",
@@ -444,6 +469,9 @@ def map_text(t: Terrain, boxes: list[Box], scale: int | None = None, light_grid:
     for i, e in enumerate(ents, 1):
         lines.append(f"// entity {i}")
         lines.append("{")
-        lines += [f'"{k}" "{v}"' for k, v in e.items()]
+        lines += [f'"{k}" "{v}"' for k, v in e.items() if k != "_brushes"]
+        for bi, (lo, hi, mat) in enumerate(e.get("_brushes", ())):
+            lines.append(f"// brush {bi}")
+            lines += _axis_brush(lo, hi, mat, scale)
         lines.append("}")
     return "\n".join(lines) + "\n"

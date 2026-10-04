@@ -241,6 +241,11 @@ def cmd_convert(args) -> int:
     force = True
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
+    # The in-game minimap is the map's own coloured top-down, so it matches the terrain rather
+    # than Nuketown. Regenerate the terrain deterministically (same seed and grid as the build)
+    # and render it in the compass orientation; pass it as the compass image override.
+    t = terrain.generate(nx=args.nx, ny=args.ny, nz=args.nz, block=args.block, seed=args.seed)
+    compass_rgba = preview.compass_view(t)
     result = convert_map(
         pc.read_bytes(),
         base,
@@ -249,6 +254,7 @@ def cmd_convert(args) -> int:
         image_roots=(),
         force_materials=force,
         overrides=overrides,
+        compass_image=compass_rgba,
     )
     target = outdir / f"{result.zone_name}.ff"
     target.write_bytes(result.fastfile)
@@ -278,12 +284,12 @@ def main(argv=None) -> int:
 
     def gen_opts(c):
         c.add_argument("--seed", type=int, default=1)
-        c.add_argument("--nx", type=int, default=56)
-        c.add_argument("--ny", type=int, default=56)
+        c.add_argument("--nx", type=int, default=144)
+        c.add_argument("--ny", type=int, default=144)
         c.add_argument("--nz", type=int, default=18)
         c.add_argument("--block", type=int, default=36)
         c.add_argument("--px", type=int, default=64, help="texture size (multiple of 16)")
-        c.add_argument("--light-grid", type=int, default=4, help="N x N primary light grid")
+        c.add_argument("--light-grid", type=int, default=5, help="N x N primary light grid")
         c.add_argument("--name", default="mp_opent5blocks")
         c.add_argument("--no-water", action="store_true", help="omit the water plane")
         c.add_argument("--no-caves", action="store_true", help="omit the carved caves")
@@ -326,10 +332,10 @@ def main(argv=None) -> int:
     defaults = (
         ("name", "mp_opent5blocks"),
         ("block", 36),
-        ("nx", 56),
-        ("ny", 56),
+        ("nx", 144),
+        ("ny", 144),
         ("nz", 18),
-        ("light_grid", 4),
+        ("light_grid", 5),
     )
     for attr, default in defaults:
         if not hasattr(args, attr):
