@@ -109,8 +109,11 @@ def brush_lines(lo, hi, materials: dict[str, str] | str, scale: int = 256) -> li
 @dataclass
 class Entity:
     keys: dict[str, str]
-    #: brushes (lo, hi) in world coordinates, all faces ``trigger``
+    #: brushes (lo, hi) in world coordinates
     brushes: list[tuple] = field(default_factory=list)
+    #: material on every face of this entity's brushes (``trigger`` for triggers, a solid
+    #: like ``clip`` for script_brushmodel collision)
+    brush_material: str = "trigger"
 
 
 def _v(*xs) -> str:
@@ -123,6 +126,16 @@ def trigger(classname: str, centre, size, height, **keys) -> Entity:
     h = size / 2
     lo, hi = (x - h, y - h, z), (x + h, y + h, z + height)
     return Entity({"classname": classname, **keys}, [(lo, hi)])
+
+
+def solid_brush(classname: str, centre, size, height, material: str = "clip", **keys) -> Entity:
+    """A solid brush entity (e.g. ``script_brushmodel``): a box ``size`` x ``size`` x
+    ``height`` on ``centre``, every face ``material`` (``clip`` is invisible player
+    collision). cod2map writes it as a clipMap submodel ``"model" "*N"`` like a trigger."""
+    x, y, z = centre
+    h = size / 2
+    lo, hi = (x - h, y - h, z), (x + h, y + h, z + height)
+    return Entity({"classname": classname, **keys}, [(lo, hi)], brush_material=material)
 
 
 def point(classname: str, origin, yaw: float | None = None, **keys) -> Entity:
@@ -159,6 +172,22 @@ def room_brushes(
     return out
 
 
+#: Half-extents (hx, hy, hz) of a ``clip`` box per prop, keyed by model. cod2map turns a
+#: ``misc_model`` into a draw-only static model with no collision (docs/convert.md 12), so a
+#: stock map clips its props with brushes compiled into the BSP; the box does the same, a
+#: worldspawn ``clip`` box around each prop (demo-box-models.md).
+PROP_CLIP = {
+    "p_glo_sandbag": (26, 26, 20),
+    "p_us_mailbox": (14, 14, 28),
+    "mp_nuked_fence": (64, 6, 40),
+    "p_glo_cardboardbox_4": (18, 18, 20),
+    "p_dest_trashcan_metal": (14, 14, 26),
+    "p_glo_potted_plant_01": (14, 14, 28),
+    "p_jun_wood_stack": (28, 20, 20),
+    "p_glo_barricade_wood_barb": (34, 10, 26),
+}
+
+
 def prop_entities(half: int) -> list[Entity]:
     s = half / 512
     return [
@@ -173,6 +202,17 @@ def prop_entities(half: int) -> list[Entity]:
         )
         for model, (x, y), yaw in PROPS
     ]
+
+
+def prop_clip_brushes(half: int) -> list[list[str]]:
+    """A worldspawn ``clip`` box around each prop so cod2map gives it collision."""
+    s = half / 512
+    out = []
+    for model, (x, y), _yaw in PROPS:
+        hx, hy, hz = PROP_CLIP.get(model, (24, 24, 40))
+        cx, cy = x * s, y * s
+        out.append(brush_lines((cx - hx, cy - hy, 0), (cx + hx, cy + hy, hz), "clip", 64))
+    return out
 
 
 #: Start spawn classes per side (west: allies / attackers, east: axis / defenders).
@@ -252,9 +292,15 @@ def objective_entities(half: int, sd_radius: bool = False) -> list[Entity]:
             return radius_trigger(radius_class[classname], centre, size / 2, height, **keys)
         return trigger(classname, centre, size, height, **keys)
 
-    # sd and dem: two bomb sites on the defenders' (east) side. Trigger, visual, defuse
-    # trigger chained by target, all tagged "bombzone" (allowed by sd and dem).
-    for label, y in (("a", -320), ("b", 320)):
+    # sd and dem: two bomb sites on the defenders' (east) side, each the exact five-entity
+    # set stock mp_nuked carries (its own map_ents, read with `opent5 extract`): a
+    # trigger_use_touch plant trigger (targetname "bombzone", script_label, targeting the
+    # bomb), a second trigger_use_touch (the defuse trigger, the "_auto2" name), the bomb
+    # script_model chaining the two by target, and two solid script_brushmodels. All tagged
+    # "bombzone" (allowed by sd and dem). The plant/defuse triggers are brush models so that
+    # _gameobjects::createUseObject makes a hold-to-use plant prompt (radius triggers show
+    # the objective but give no prompt; docs/research/box-objectives-cd.md, fixC).
+    for label, y, exploder in (("a", -320, 7121), ("b", 320, 7152)):
         c = at(288, y)
         out.append(
             obj_trigger(
@@ -263,21 +309,10 @@ def objective_entities(half: int, sd_radius: bool = False) -> list[Entity]:
                 96,
                 96,
                 targetname="bombzone",
-                target=f"bombzone_{label}_visual",
+                script_gameobjectname="bombzone",
+                target=f"bombzone_{label}_auto1",
+                script_bombmode_original="1",
                 script_label=f"_{label}",
-                script_gameobjectname="bombzone",
-            )
-        )
-        out.append(
-            point(
-                "script_model",
-                c,
-                90,
-                model="p_glo_bomb_stack",
-                targetname=f"bombzone_{label}_visual",
-                target=f"bombzone_{label}_defuse",
-                script_gameobjectname="bombzone",
-                spawnflags="5",
             )
         )
         out.append(
@@ -286,8 +321,37 @@ def objective_entities(half: int, sd_radius: bool = False) -> list[Entity]:
                 c,
                 96,
                 96,
-                targetname=f"bombzone_{label}_defuse",
+                targetname=f"bombzone_{label}_auto2",
                 script_gameobjectname="bombzone",
+            )
+        )
+        out.append(
+            point(
+                "script_model",
+                (c[0], c[1], 2),
+                90,
+                model="p_glo_bomb_stack",
+                targetname=f"bombzone_{label}_auto1",
+                target=f"bombzone_{label}_auto2",
+                script_gameobjectname="bombzone",
+                script_exploder=str(exploder),
+                spawnflags="5",
+            )
+        )
+        # the two solid brush models: the physical bomb-site object (collision).
+        out.append(
+            solid_brush(
+                "script_brushmodel", c, 56, 14, script_gameobjectname="bombzone", spawnflags="1"
+            )
+        )
+        out.append(
+            solid_brush(
+                "script_brushmodel",
+                (c[0], c[1], 14),
+                56,
+                14,
+                script_gameobjectname="bombzone",
+                spawnflags="1",
             )
         )
     # sd: the bomb on the attackers' side.
@@ -490,12 +554,15 @@ def map_text(
     light_grid: bool = False,
     props: bool = False,
     sd_radius: bool = False,
-    path_nodes: bool = False,
+    path_nodes: bool = True,
 ) -> str:
     """The whole ``.map`` (CRLF line ends are added by ``write_map``)."""
     lines = ["iwmap 4", '"000_Global" flags  active', '"The Map" flags ', "// entity 0", "{"]
     lines += [f'"{k}" "{v}"' for k, v in WORLDSPAWN]
-    for i, b in enumerate(room_brushes(half, height, material=wall, light_grid=light_grid)):
+    world_brushes = list(room_brushes(half, height, material=wall, light_grid=light_grid))
+    if props:
+        world_brushes += prop_clip_brushes(half)
+    for i, b in enumerate(world_brushes):
         lines.append(f"// brush {i}")
         lines += b
     lines.append("}")
@@ -531,7 +598,7 @@ def map_text(
         lines += [f'"{k}" "{v}"' for k, v in e.keys.items()]
         for j, (lo, hi) in enumerate(e.brushes):
             lines.append(f"// brush {j}")
-            lines += brush_lines(lo, hi, "trigger", 64)
+            lines += brush_lines(lo, hi, e.brush_material, 64)
         lines.append("}")
     return "\n".join(lines) + "\n"
 
@@ -708,9 +775,9 @@ def main(argv=None) -> int:
             help="SD / bombzone objective triggers as radius triggers (fixC, box-objectives-cd.md)",
         )
         c.add_argument(
-            "--path-nodes",
+            "--no-path-nodes",
             action="store_true",
-            help="a node_pathnode grid over the floor (fixD, box-objectives-cd.md)",
+            help="omit the node_pathnode grid (on by default: fixD, box-objectives-cd.md)",
         )
     args = p.parse_args(argv)
     kw = {
@@ -721,7 +788,7 @@ def main(argv=None) -> int:
         "light_grid": args.full or args.light_grid,
         "props": args.full or args.props,
         "sd_radius": args.sd_radius,
-        "path_nodes": args.path_nodes,
+        "path_nodes": not args.no_path_nodes,
     }
     if args.cmd == "write":
         write_map(Path(args.out), **kw)

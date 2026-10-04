@@ -87,7 +87,7 @@ def test_sd_and_dem_rules(box):
     ents, cm = box
     two = [*ents, {"classname": "script_model", "targetname": "sd_bomb", "model": "x"}]
     assert any("getEnt needs exactly one" in t for t in _missing(two, cm, "sd"))
-    no_defuse = _without(ents, targetname="bombzone_a_defuse")
+    no_defuse = _without(ents, targetname="bombzone_a_auto2")
     assert any("defuse trigger" in t for t in _missing(no_defuse, cm, "sd"))
     assert any("defuse trigger" in t for t in _missing(no_defuse, cm, "dem"))
     walk_in = copy.deepcopy(ents)
@@ -138,7 +138,7 @@ def test_dom_ctf_sab_koth_rules(box):
             break
     assert any("inside no radiotrigger" in t for t in _missing(moved, cm, "koth"))
     assert en.check(moved, "koth").warnings  # bounds unknown without the brush models
-    assert any("brush model *13, the clipMap has 13" in t for t in _missing(ents, cm[:13], "koth"))
+    assert any("brush model *17, the clipMap has 17" in t for t in _missing(ents, cm[:17], "koth"))
 
 
 def test_map_text_and_layout():
