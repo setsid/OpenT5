@@ -1,27 +1,28 @@
 # Recipe: what cod2map does to the clipMap when a clip brush is added
 
-Status: OFFLINE ROOT CAUSE FOUND; DEVICE PROOF PENDING A CACHE-CLEARED RETEST.
+Status: RESOLVED. `opent5.convert.propclip.add_clip_bsp` (an appended clip attached to the
+BSP leaf a trace reaches) is the working collision foundation. Device confirmed with the
+cache cleared: p_clip_a is SOLID at the test spot (invisible wall by the yellow house). It
+lives on `fix/clip-trace-miss` and is the foundation the editor's Phase 2 is built on.
 
-CAVEAT (RPCS3 FIOS disc cache): BO1 under RPCS3 caches the decrypted disc in
-`dev_hdd1\caches\BLES01031_BLES01031\cache.dat` (~1.68 GB). Copy-Item preserves a file's
-mtime, so staging an older-dated build never invalidated the cache and RPCS3 served a
-STALE mp_nuked. This was proven by o_blocks5: its staged file is a correct blocky map
-(verified offline, `tools/verify_staged_map.py`), yet it rendered as Nuketown until the
-cache was cleared. Therefore every earlier device result on a Nuketown-based build is
-UNRELIABLE, including p_clip_a's "walked through" and p_propclip2's "no crash": a stale
-cache is indistinguishable from the build under test. Do NOT treat "append past numBrushes
-breaks collision" as proven. It is a HYPOTHESIS supported only by the offline evidence
-below (which is cache-independent). Staging protocol from now on: close RPCS3, clear or
-rename the BLES01031 cache folder, copy, set the file's LastWriteTime to now, and include
-a visible in-map marker so a stale load is obvious.
+CORRECTION - the "append past numBrushes / brushVerts contiguity" theory was WRONG. The
+earlier "no collision" results (p_clip_a, p_propclip2) were an RPCS3 FIOS disc-cache
+artifact, not real walk-throughs: BO1 caches the decrypted disc in
+`dev_hdd1\caches\BLES01031_BLES01031\cache.dat` (~1.68 GB), and Copy-Item preserves mtime,
+so an older-dated build never invalidated the cache and RPCS3 served a stale mp_nuked (the
+same cache made the correct o_blocks5 render as Nuketown until it was cleared). With the
+cache cleared and a fresh mtime, even the padded brushVerts append (one running-count
+"mismatch") is SOLID, so the contiguity difference does NOT by itself break collision (the
+engine honours the stored verts pointer). Decision nonetheless: Phase 2 uses the
+CONTIGUOUS append (`append_verts_contiguous`, `fix/clip-trace-recipe`) as the foundation,
+so our output matches retail's brushVerts running-count invariant exactly rather than
+relying on the engine tolerating a gap. The full cod2map-style brush-array rebuild is not
+needed - appending at the end with contiguous verts is sufficient.
 
-What is cache-independent and still holds: the brushVerts running-count contiguity fact
-(retail and p_clip_move: 0 mismatches; p_clip_a: exactly 1 mismatch at the appended
-brush). The converter's padded pool append violated that invariant; the fix in
-`opent5.convert.propclip.add_clip_bsp` (contiguous brushVerts append) makes our output
-match retail's invariant and is a correctness improvement regardless of the device result.
-It is staged as p_clip_add. The user is retesting p_clip_a with the cache cleared to
-establish whether an appended clip genuinely fails before p_clip_add is read as the fix.
+Staging protocol (mandatory from now on): close RPCS3; clear or rename the BLES01031 cache
+folder; copy the build; set its LastWriteTime to now; include a visible in-map marker so a
+stale load is obvious. Offline, `tools/verify_staged_map.py` confirms a staged .ff is the
+intended map before it ships.
 
 Goal (original): read off what the real compiler changes in the clipMap when a clip
 brush is added, compare it to `add_clip_bsp`, and find why a converter-added clip was
