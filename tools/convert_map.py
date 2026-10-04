@@ -131,13 +131,20 @@ def cmd_oracle(args) -> dict:
     # Structural clipMap check: a world-leaf brush list read as an inline pointer,
     # or a pool run out of bounds, crashes the engine's world collision though the
     # loader and the pointer counts above pass (this caught the p_propclip crash).
-    from opent5.convert.propclip import ClipMap, check_world_leaf_refs
+    from opent5.convert.propclip import (
+        ClipMap,
+        check_leaf_contents_masks,
+        check_world_leaf_refs,
+    )
     from opent5.xfile.constants import AssetType
 
     clip_problems: list[str] = []
+    mask_problems: list[str] = []
     for asset in x.assets:
         if asset.type in (AssetType.COL_MAP_MP, AssetType.COL_MAP_SP):
-            clip_problems += check_world_leaf_refs(ClipMap(asset.data))
+            cm = ClipMap(asset.data)
+            clip_problems += check_world_leaf_refs(cm)
+            mask_problems += check_leaf_contents_masks(cm)
     return {
         "content_bytes": len(content),
         "consumed": consumed,
@@ -152,6 +159,8 @@ def cmd_oracle(args) -> dict:
         "targets_outside_their_block": outside,
         "clipmap_world_leaf_problems": len(clip_problems),
         "clipmap_world_leaf_detail": clip_problems[:5],
+        "clipmap_leaf_contents_problems": len(mask_problems),
+        "clipmap_leaf_contents_detail": mask_problems[:5],
         "assets": len(tr.assets),
         "seconds": round(time.time() - t0, 1),
         "sha1_content": hashlib.sha1(content).hexdigest(),

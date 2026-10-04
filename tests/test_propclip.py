@@ -183,6 +183,28 @@ def test_check_flags_out_of_pool_run():
     assert problems and "pool" in problems[0]
 
 
+def _set_leaf_brush_contents(node: dict, leaf: int, contents: int) -> None:
+    leafs = bytearray(node["leafs"])
+    struct.pack_into(">i", leafs, leaf * pc.CLEAF_SIZE + pc._L_BRUSH_CONTENTS, contents)
+    node["leafs"] = bytes(leafs)
+
+
+def test_contents_mask_check_flags_a_non_subset_brush():
+    # One flat leaf lists brush 0 (default contents 0x08030200). With the leaf and
+    # node contents not covering those bits, a trace early-outs: flagged. With them
+    # OR'd in, clean.
+    node = synthetic([((0, 0, 0), (1, 1, 1))], [0], [(1, 0x1, 0)], roots=[0])
+    bad = pc.ClipMap(node)
+    problems = pc.check_leaf_contents_masks(bad)
+    assert problems and "subset" in problems[0]
+    # now make both masks cover the brush's contents
+    _set_leaf_brush_contents(node, 0, pc.PLAYER_CLIP_CONTENTS)
+    r = bytearray(node["leafbrush_nodes"][0]["raw"])
+    struct.pack_into(">i", r, pc._N_CONTENTS, pc.PLAYER_CLIP_CONTENTS)
+    node["leafbrush_nodes"][0]["raw"] = bytes(r)
+    assert pc.check_leaf_contents_masks(pc.ClipMap(node)) == []
+
+
 def test_clips_in_footprint():
     # three clip brushes; footprint contains the first two.
     node = synthetic([((0, 0, 0), (1, 1, 1))], [], [], roots=[0])
@@ -275,6 +297,37 @@ def test_stock_move_and_remove_round_trip():
     assert pc.check_world_leaf_refs(cmb) == []
     assert cmb.brush(idx).mins == (100.0, 100.0, 40.0)
     assert cmb.brush(other).contents == 0  # removed = disabled in place
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_stock_add_clip_bsp_is_reachable_from_its_centre_leaf():
+    """A clip added with ``add_clip_bsp`` is referenced from the exact BSP leaf a
+    trace descends to at its centre, so a trace there hits it. The leaf- and
+    node-contents masks cover the clip's contents (``check_leaf_contents_masks``
+    is clean), and the structure round-trips. ``add_clip`` (empty-leaf attachment)
+    does not make the centre leaf reach the brush; the BSP variant does. This is
+    the fix for the clip that was structurally valid on device yet never hit."""
+    content = open_clip("mp_nuked")
+    rw = Rewrite(content)
+    node = clipmap_node(rw.xfile)
+    cm = pc.ClipMap(node, rewrite=rw)
+    loc = pc.BspLocator.from_xfile(rw.xfile, node)
+    mins, maxs = (174.0, -77.0, 0.0), (234.0, -17.0, 120.0)
+    centre = tuple((mins[k] + maxs[k]) / 2 for k in range(3))
+    centre_leaf = loc.locate(centre)
+    # the old empty-leaf attachment leaves the centre leaf not reaching the brush
+    old_idx = pc.add_clip(cm, mins, maxs)
+    assert old_idx not in cm.reachable_brushes(centre_leaf)
+    # the BSP attachment does; add_clip_bsp also asserts this internally
+    idx = pc.add_clip_bsp(cm, loc, mins, maxs)
+    assert idx in cm.reachable_brushes(centre_leaf)
+    back = parse(rw.build(check=True).content)
+    assert back.problems() == []
+    cmb = pc.ClipMap(clipmap_node(back))
+    assert pc.check_world_leaf_refs(cmb) == []
+    assert pc.check_leaf_contents_masks(cmb) == []
+    assert idx in cmb.reachable_brushes(centre_leaf)
 
 
 @pytest.mark.zones

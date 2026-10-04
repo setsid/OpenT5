@@ -41,11 +41,22 @@ leaf node (+0x8 pointing into the pool). The editor drives this through
 ``ClipMap`` so appends to the pool and the ``brushVerts`` tail resolve (the
 Rewrite's ``append_identities``), call the operations, then ``Rewrite.build``.
 
-Attaching to the exact BSP leaf for a point needs the cNode tree and the shared
-plane pool (another asset); instead the leaf boxes the parse carries are used
-(attach to every attachable leaf the clip overlaps, else the zero-volume
-catch-all). Over-inclusion is harmless: a brush's own bounds gate the hit.
-Leaves already holding cod2map brushes are not merged into.
+Which leaves to reference the brush from is the whole game. The first device
+clip was byte-valid, loader-clean and oracle-clean yet no trace ever hit it: it
+was attached only to *empty* leaves (``add_clip`` / ``_attach_targets``), but a
+trace at a prop descends the cNode BSP to the populated cod2map leaf that spans
+that spot, and that leaf never listed the brush. So the clip must be referenced
+from the exact world leaf a trace reaches. ``BspLocator`` walks the cNode tree
+and the shared plane pool (resolved off the first node's plane pointer) to point-
+locate the box's centre and corners, and ``add_clip_bsp`` / ``move_clip_bsp``
+merge the brush into those leaves (``merge_brush_into_leaf``), OR-ing the clip's
+contents into each leaf's ``brushContents`` and the listing node's ``contents``
+so the trace does not early-out, then assert the brush is reachable from its
+centre leaf. Use the ``*_bsp`` operations for a free-standing prop clip.
+
+``add_clip`` / ``move_clip`` (empty-leaf attachment) are kept only for the
+synthetic-clipMap tests and as a fallback when no BSP is available; on a real map
+they place a clip no trace reaches, so the editor uses the ``*_bsp`` path.
 """
 
 from __future__ import annotations
@@ -79,6 +90,15 @@ _L_BRUSH_CONTENTS = 0x04
 _L_MINS = 0x0C
 _L_MAXS = 0x18
 _L_LEAFBRUSHNODE = 0x24
+
+#: ``cNode_t`` (0x8) offsets: a plane pointer and two signed child indices
+#: (negative child ``c`` is leaf ``-1 - c``; non-negative is a node index).
+CNODE_SIZE = 0x08
+_CN_PLANE = 0x00
+_CN_CHILDREN = 0x04
+
+#: ``cplane_s`` (0x14): normal (vec3) then dist (f32).
+CPLANE_SIZE = 0x14
 
 #: ``clipMap_t`` header count fields.
 _H_NUM_LEAFS = 0x30
@@ -267,12 +287,47 @@ class ClipMap:
     def append_verts(self, mins: Vec3, maxs: Vec3) -> int:
         """Append a brush's eight corner verts to the ``brushVerts`` pool; returns
         the pointer for the brush's +0x58 field. Returns 0 when the clipMap has no
-        brushVerts pool (no brushes carry verts)."""
+        brushVerts pool (no brushes carry verts).
+
+        PADDED append (the parked path): leaves one boundary element so the returned
+        pointer resolves to the appended tail. This breaks brushVerts contiguity, so
+        it is kept only for the synthetic tests; the device fix uses
+        ``append_verts_contiguous`` (see its note)."""
         if self.node.get("brush_verts") is None:
             return 0
         ptr = self._append_pool("brush_verts", box_corner_verts(mins, maxs), 12)
         self._hset(_H_NUM_BRUSHVERTS, len(self.node["brush_verts"]) // 12)
         return ptr
+
+    def append_verts_contiguous(self, mins: Vec3, maxs: Vec3) -> int:
+        """Append a brush's eight corner verts to ``brushVerts`` with NO boundary
+        pad, keeping the pool strictly contiguous in brush-index order.
+
+        cod2map lays ``brushVerts`` out so that each brush's verts sit at the running
+        sum of the earlier brushes' vert counts (verified on retail mp_nuked: 0
+        mismatches across 5890 brushes), and the engine addresses a brush's collision
+        verts by that running count, not by the stored ``verts`` pointer. The padded
+        append (``append_verts`` / ``_append_pool``) inserts one unused vec3 at the
+        pool's old end to keep the returned pointer off the allocation boundary; that
+        one element shifts the appended brush off its running-count position, so the
+        engine reads the pad (zeros) instead of the brush's corners and the brush
+        collides with nothing. This is the cause of the p_clip_a walk-through on
+        device (p_clip_a had a 12-byte gap at the appended brush; p_clip_move, which
+        rewrites verts in place, had none and was solid).
+
+        So the verts go at the pool's old end with no gap, and the returned pointer is
+        the running-count position. Because an immediately following allocation
+        (``uinds``) begins at that boundary, the Rewrite resolves this pointer to that
+        neighbour rather than to the appended bytes; that is harmless because the
+        engine ignores the stored pointer for collision verts (it uses the running
+        count), and the appended bytes themselves are contiguous and correct."""
+        if self.node.get("brush_verts") is None:
+            return 0
+        block, mem = self._orig_alloc("brush_verts")
+        inner = len(self.node["brush_verts"])  # old end = the new brush's running-count position
+        self.node["brush_verts"] = self.node["brush_verts"] + box_corner_verts(mins, maxs)
+        self._hset(_H_NUM_BRUSHVERTS, len(self.node["brush_verts"]) // 12)
+        return ((block << _OFFSET_BLOCK_SHIFT) | ((mem + inner) & _OFFSET_MASK)) + 1
 
     # brushes ------------------------------------------------------------------------------
 
@@ -696,3 +751,217 @@ def _walk_nodes(cm: ClipMap, root: int, seen: set[int] | None = None) -> list[in
             if rel:
                 out += _walk_nodes(cm, root + rel, seen)
     return out
+
+
+def check_leaf_contents_masks(cm: ClipMap) -> list[str]:
+    """Trace-skip problems: the engine's world trace early-outs on a leaf, and on
+    a leaf-brush node, when the collision mask it is tracing for shares no bit with
+    the leaf's ``brushContents`` / the node's ``contents``. So for a brush to be
+    hit through a leaf, the brush's own contents bits must be a subset of both the
+    ``cLeaf.brushContents`` of every leaf that reaches it and the ``contents`` of
+    the leaf-brush node that lists it. cod2map keeps this true for every stock
+    brush (verified on mp_nuked: 0 violations across 14730 reachable pairs); an
+    edit that references a clip from a leaf/node without OR-ing the clip's contents
+    in leaves the brush present but never hit. Empty when the clipMap is safe."""
+    problems: list[str] = []
+    for leaf in range(cm.num_leafs):
+        lbc = struct.unpack_from(
+            ">i", cm.node["leafs"], leaf * CLEAF_SIZE + _L_BRUSH_CONTENTS
+        )[0]
+        for node_index in _walk_nodes(cm, cm.leaf_root(leaf)):
+            if cm.node_count(node_index) <= 0:
+                continue
+            ncont = struct.unpack_from(">i", cm._node(node_index), _N_CONTENTS)[0]
+            for b in cm.node_brush_list(node_index):
+                if not 0 <= b < cm.num_brushes:
+                    continue
+                bc = cm.brush(b).contents
+                if bc & ~lbc:
+                    problems.append(
+                        f"leaf {leaf}: brush {b} contents {bc:#010x} is not a subset of "
+                        f"the leaf's brushContents {lbc & 0xFFFFFFFF:#010x}; the trace "
+                        "early-outs and never tests it"
+                    )
+                if bc & ~ncont:
+                    problems.append(
+                        f"leaf {leaf}: brush {b} contents {bc:#010x} is not a subset of "
+                        f"leaf node {node_index} contents {ncont & 0xFFFFFFFF:#010x}"
+                    )
+    return problems
+
+
+# -- BSP point location and leaf-correct attachment ------------------------------------------
+
+
+class BspLocator:
+    """Point-locates the clipMap's ``cNode_t`` BSP so a clip is referenced from the
+    *exact* world leaf a trace descends to, not merely from an empty leaf whose box
+    overlaps (which is what ``add_clip`` does, and why the first device clip was
+    structurally valid yet never hit: the leaf a trace reaches at a prop is a
+    populated cod2map leaf, and ``add_clip`` skips those). Needs the ``cNode_t``
+    array (``node['nodes']``) and the shared plane pool, which lives in a separate
+    allocation; ``from_xfile`` resolves it off the first node's plane pointer."""
+
+    def __init__(self, nodes_bytes: bytes, planes_bytes: bytes, plane_offset_of):
+        self._nodes = nodes_bytes
+        self._planes = planes_bytes
+        self._plane_offset_of = plane_offset_of
+        self._count = len(nodes_bytes) // CNODE_SIZE
+
+    @classmethod
+    def from_xfile(cls, xf, node: dict) -> "BspLocator":
+        nodes_bytes = node["nodes"]
+        if not nodes_bytes:
+            raise ClipError("clipMap has no cNode_t BSP to locate against")
+        first_ptr = struct.unpack_from(">I", nodes_bytes, _CN_PLANE)[0]
+        target = xf.resolve(first_ptr)
+        if target is None or target.node is None:
+            raise ClipError("cannot resolve the clipMap plane pool for BSP location")
+        planes_bytes = target.node[target.key]
+
+        def plane_offset_of(ptr: int) -> int:
+            t = xf.resolve(ptr)
+            if t is None:
+                raise ClipError(f"unresolved plane pointer {ptr:#010x}")
+            return t.within
+
+        return cls(nodes_bytes, planes_bytes, plane_offset_of)
+
+    def _plane(self, ptr: int) -> tuple[Vec3, float]:
+        o = self._plane_offset_of(ptr)
+        normal = struct.unpack_from(">3f", self._planes, o)
+        dist = struct.unpack_from(">f", self._planes, o + 12)[0]
+        return normal, dist
+
+    def locate(self, point: Vec3) -> int | None:
+        """The world-leaf index the point falls in, or ``None`` if the walk runs
+        away (a malformed tree)."""
+        ni = 0
+        for _ in range(4 * self._count + 8):
+            ptr = struct.unpack_from(">I", self._nodes, ni * CNODE_SIZE + _CN_PLANE)[0]
+            c0, c1 = struct.unpack_from(">hh", self._nodes, ni * CNODE_SIZE + _CN_CHILDREN)
+            normal, dist = self._plane(ptr)
+            on_front = (
+                normal[0] * point[0] + normal[1] * point[1] + normal[2] * point[2] - dist
+            ) >= 0
+            child = c0 if on_front else c1
+            if child < 0:
+                return -1 - child
+            ni = child
+        return None
+
+    def leaves_for_box(self, mins: Vec3, maxs: Vec3) -> list[int]:
+        """Every world leaf the box's centre and eight corners land in (deduped):
+        the leaves a trace through the box can reach. Corners are pulled a hair
+        inward so a face exactly on a splitting plane resolves to the inside
+        leaf."""
+        eps = 0.125
+        lo = tuple(mins[k] + eps for k in range(3))
+        hi = tuple(maxs[k] - eps for k in range(3))
+        pts = [
+            ((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2),
+            (lo[0], lo[1], lo[2]), (lo[0], lo[1], hi[2]), (lo[0], hi[1], lo[2]),
+            (lo[0], hi[1], hi[2]), (hi[0], lo[1], lo[2]), (hi[0], lo[1], hi[2]),
+            (hi[0], hi[1], lo[2]), (hi[0], hi[1], hi[2]),
+        ]
+        out: list[int] = []
+        for p in pts:
+            leaf = self.locate(p)
+            if leaf is not None and leaf not in out:
+                out.append(leaf)
+        return out
+
+
+def merge_brush_into_leaf(cm: ClipMap, leaf: int, brush_index: int, contents: int) -> None:
+    """Add ``brush_index`` to the brushes a trace tests in ``leaf``, the cod2map
+    way (through the flat ``leafBrushes`` pool), merging into a leaf that already
+    holds cod2map brushes. The leaf's whole reachable set is collapsed into one
+    fresh flat leaf node listing that set plus the new brush, and the leaf's root
+    is repointed at it. Collapsing a kd sub-tree to a flat list is safe: every
+    brush still gates on its own bounds, the test just visits them all. The leaf's
+    ``brushContents`` and the node's contents are OR'd with ``contents`` so the
+    trace does not early-out (see ``check_leaf_contents_masks``)."""
+    reachable = cm.reachable_brushes(leaf)
+    union = sorted(reachable | {brush_index})
+    root = cm.leaf_root(leaf)
+    node_contents = contents
+    if root > 0:
+        node_contents |= struct.unpack_from(">i", cm._node(root), _N_CONTENTS)[0]
+    if root > 0 and cm.node_count(root) > 0:
+        cm.set_flat_node(root, node_contents, union)
+        cm._mine.add(root)
+    else:
+        node_index = cm.append_flat_node(node_contents, union)
+        cm.set_leaf_root(leaf, node_index)
+    cm.or_leaf_contents(leaf, contents)
+
+
+def add_clip_bsp(
+    cm: ClipMap,
+    locator: BspLocator,
+    mins: Vec3,
+    maxs: Vec3,
+    contents: int = PLAYER_CLIP_CONTENTS,
+    surface_flags: int = PLAYER_CLIP_SURFACE,
+) -> int:
+    """Add an axis-aligned clip brush and reference it from the exact world
+    leaf(s) a trace through its box reaches (``BspLocator``), so it is actually
+    hit, then assert the brush is reachable from the box centre's leaf. Use this,
+    not ``add_clip``, for a free-standing prop clip; raises ``ClipError`` if the
+    box reaches no leaf or the post-attach reachability check fails.
+
+    The verts are appended contiguously (``append_verts_contiguous``): an appended
+    brush's verts must sit at the running-count position cod2map uses, or the engine
+    reads the wrong bytes and the brush does not collide (the p_clip_a cause)."""
+    leaves = locator.leaves_for_box(mins, maxs)
+    if not leaves:
+        raise ClipError("clip box locates to no world leaf (outside the BSP)")
+    verts_ptr = cm.append_verts_contiguous(mins, maxs)
+    numverts = 8 if verts_ptr else 0
+    brush_index = cm.append_brush(
+        clip_cbrush(mins, maxs, contents, surface_flags, verts_ptr, numverts)
+    )
+    for leaf in leaves:
+        merge_brush_into_leaf(cm, leaf, brush_index, contents)
+    _assert_reachable(cm, locator, brush_index, mins, maxs)
+    return brush_index
+
+
+def move_clip_bsp(cm: ClipMap, locator: BspLocator, brush_index: int, mins: Vec3, maxs: Vec3) -> None:
+    """Move a clip brush to new bounds and re-reference it from the world leaf(s)
+    the new box reaches. Drops it from every leaf node it is currently in, rewrites
+    the ``cbrush_t`` and its verts, then merges it into the new leaves and asserts
+    reachability."""
+    br = cm.brush(brush_index)
+    if br.numsides:
+        raise ClipError(f"brush {brush_index} is not axis-aligned (has {br.numsides} sides)")
+    leaves = locator.leaves_for_box(mins, maxs)
+    if not leaves:
+        raise ClipError("moved clip box locates to no world leaf (outside the BSP)")
+    _detach(cm, brush_index, set())
+    cm.set_brush_bytes(
+        brush_index,
+        clip_cbrush(mins, maxs, br.contents, _surface_of(cm, brush_index),
+                    verts_ptr=br.verts_ptr, numverts=br.numverts),
+    )
+    if br.numverts and br.verts_ptr:
+        cm.set_brush_verts(brush_index, box_corner_verts(mins, maxs))
+    for leaf in leaves:
+        merge_brush_into_leaf(cm, leaf, brush_index, br.contents)
+    _assert_reachable(cm, locator, brush_index, mins, maxs)
+
+
+def _assert_reachable(cm: ClipMap, locator: BspLocator, brush_index: int, mins: Vec3, maxs: Vec3) -> None:
+    """Fail loudly if the just-attached brush is not reachable from the leaf its
+    centre locates to: the editor places clips in open space, so the centre leaf is
+    the trace leaf, and a miss here is the bug that made the first device clip
+    invisible to traces."""
+    centre = tuple((mins[k] + maxs[k]) / 2 for k in range(3))
+    leaf = locator.locate(centre)
+    if leaf is None:
+        raise ClipError(f"clip {brush_index} centre {centre} locates to no leaf")
+    if brush_index not in cm.reachable_brushes(leaf):
+        raise ClipError(
+            f"clip {brush_index} is not reachable from its centre leaf {leaf}; "
+            "a trace there would not hit it"
+        )
