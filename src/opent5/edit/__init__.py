@@ -8,6 +8,7 @@ report = doc.save("out/mp_nuked.ff")       # verified; report.problems is empty
 
 from opent5.edit.document import Document, check_target, game_folders
 from opent5.edit.geometry import Mesh
+from opent5.edit.mapedit import EditSession, MapObject
 from opent5.edit.types import (
     SHARE_MODES,
     SIGNATURE_NOTE,
@@ -29,7 +30,9 @@ __all__ = [
     "Change",
     "Document",
     "EditError",
+    "EditSession",
     "ImageData",
+    "MapObject",
     "Mesh",
     "SaveReport",
     "SearchHit",
