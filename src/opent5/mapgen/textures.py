@@ -26,6 +26,7 @@ TILE_NAMES = (
     "leaves",
     "water",
     "cobble",
+    "lava",
 )
 
 BASE = 16  # native pixel-art resolution
@@ -196,6 +197,22 @@ def _cobble(seed):
     return t
 
 
+def _lava(seed):
+    rng = _rng("lava", seed)
+    t = _fill(BASE, BASE, (210, 70, 20))  # molten orange body
+    _speckle(t, rng, 22)
+    # bright yellow-white hot cracks and a few darker crusted patches
+    for _ in range(22):
+        y, x = rng.integers(0, BASE, 2)
+        t[y, x, :3] = (255, 208, 90)
+    for _ in range(10):
+        y, x = rng.integers(0, BASE - 1, 2)
+        t[y : y + 2, x : x + 1, :3] = (120, 28, 12)
+    for y in range(2, BASE, 5):  # glowing horizontal flow lines
+        t[y, :, :3] = (255, 150, 40)
+    return t
+
+
 _DRAW = {
     "grass_top": _grass_top,
     "grass_side": _grass_side,
@@ -208,6 +225,7 @@ _DRAW = {
     "leaves": _leaves,
     "water": _water,
     "cobble": _cobble,
+    "lava": _lava,
 }
 
 

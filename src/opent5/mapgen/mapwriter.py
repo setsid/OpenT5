@@ -37,6 +37,13 @@ STOCK_MATERIAL = {
     "leaves": "blockout_test_concrete",
     "water": "us_art_wall_vinylsiding_white",
     "cobble": "pent_art_wall_creampaint02",
+    # o_blocks5 lava: a bright flat stand-in (the install has no self-illum techset, so true
+    # emissive cannot bake; the kill is a trigger_hurt volume). A genuine 12th material was tried
+    # (a_art_wall_hall_clean) but its normal/spec images are not loose, so the converter cannot
+    # resolve them; the only convert-safe materials are the eight loose blockout_test colour maps,
+    # all already used. o_blocks5 runs with trees off, so the log_side material (blockout_test_metal)
+    # is free: lava reuses it with the lava-orange override. Do not enable trees with lava.
+    "lava": "blockout_test_metal",
 }
 #: Colour-map image name of each tile's stock material (read from the PC material binaries):
 #: the key the converter overrides with the generated art.
@@ -52,6 +59,7 @@ STOCK_COLORMAP = {
     "leaves": "~-gblockout_average_test_c",
     "water": "~-gus_art_wall_vinylsiding_white_c",
     "cobble": "~-gpent_art_wall_creampaint02_c",
+    "lava": "~-gblockout_metal_test_c",  # reuses log_side's material (trees off), lava-orange art
 }
 #: The sky faces reuse Nuketown's skybox material: it already exists in the PC tools and in the
 #: mp_nuked base zone, so the converter reuses it by name (no new sky asset). cod2map marks these
@@ -551,6 +559,70 @@ def hurt_volume(
     }
 
 
+def structure_brushes(t: Terrain, scale: int | None = None) -> list[list[str]]:
+    """For every o_blocks5 building: an external 18u slab staircase up to its roof on the door
+    side, and a climbable ladder on the opposite wall. Returns worldspawn brushes."""
+    scale = scale if scale is not None else t.block
+    b = t.block
+    ox, oy, oz = t.origin
+    rise = half_step(t)
+    out: list[list[str]] = []
+    for s in t.structures:
+        wx0, wy0 = ox + s["x0"] * b, oy + s["y0"] * b
+        wx1, wy1 = ox + s["x1"] * b, oy + s["y1"] * b
+        ground = oz + s["base"] * b
+        lad_h = oz + (s["roof"] + 1) * b - ground  # ground to roof top
+        steps = max(1, round(lad_h / rise))
+        run = steps * rise
+        side = s["door_side"]
+        if side in ("xmin", "xmax"):
+            width = min(2 * b, wy1 - wy0)
+            ymid = (wy0 + wy1) / 2 - width / 2
+            cy = (wy0 + wy1) / 2 - b / 2
+            if side == "xmax":
+                foot, axis, lx = (wx1 + run, ymid, ground), "-x", wx0 - b / 4
+            else:
+                foot, axis, lx = (wx0 - run, ymid, ground), "x", wx1
+            out += slab_stairs(t, foot, axis, steps, width, scale=scale)
+            out.append(ladder_brush(t, (lx, cy, ground), lad_h, "x", scale))
+        else:
+            width = min(2 * b, wx1 - wx0)
+            xmid = (wx0 + wx1) / 2 - width / 2
+            cx = (wx0 + wx1) / 2 - b / 2
+            if side == "ymax":
+                foot, axis, ly = (xmid, wy1 + run, ground), "-y", wy0 - b / 4
+            else:
+                foot, axis, ly = (xmid, wy0 - run, ground), "y", wy1
+            out += slab_stairs(t, foot, axis, steps, width, scale=scale)
+            out.append(ladder_brush(t, (cx, ly, ground), lad_h, "y", scale))
+    return out
+
+
+def lava_clip_brushes(t: Terrain) -> list[list[str]]:
+    """A player-clip wall just inside the lava ring (the true playable edge)."""
+    if not t.lava_ring:
+        return []
+    return clip_wall_ring(t, inset=(t.lava_ring + 1) * t.block, height=t.block * 6)
+
+
+def lava_hurt_entities(t: Terrain) -> list[dict]:
+    """Four trigger_hurt volumes framing the lava perimeter (the centre stays safe)."""
+    if not t.lava_ring:
+        return []
+    b = t.block
+    oz = t.origin[2]
+    (x0, y0, z0), (x1, y1, _) = t.world_bounds()
+    band = t.lava_ring * b
+    ztop = oz + (t.sea_level + 8) * b
+    frames = [
+        ((x0, y0, z0), (x0 + band, y1, ztop)),
+        ((x1 - band, y0, z0), (x1, y1, ztop)),
+        ((x0 + band, y0, z0), (x1 - band, y0 + band, ztop)),
+        ((x0 + band, y1 - band, z0), (x1 - band, y1, ztop)),
+    ]
+    return [hurt_volume(lo, hi, dmg=100) for lo, hi in frames]
+
+
 def map_text(t: Terrain, boxes: list[Box], scale: int | None = None, light_grid: int = 3) -> str:
     """The whole ``.map`` (CRLF added on write)."""
     scale = scale if scale is not None else t.block
@@ -565,12 +637,18 @@ def map_text(t: Terrain, boxes: list[Box], scale: int | None = None, light_grid:
         lines.append(f"// brush {b}")
         lines += shell
         b += 1
+    # o_blocks5 worldspawn structure brushes: slab stairs, ladders and the lava player-clip wall.
+    for extra in structure_brushes(t, scale) + lava_clip_brushes(t):
+        lines.append(f"// brush {b}")
+        lines += extra
+        b += 1
     lines.append(f"// brush {b}")
     lines += light_grid_brush(t)
     lines.append("}")
     ents = (
         spawn_entities(t)
         + objective_entities(t)
+        + lava_hurt_entities(t)
         + primary_lights(t, grid=light_grid)
         + compass_corners(t)
         + path_nodes(t)

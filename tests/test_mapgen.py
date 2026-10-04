@@ -184,10 +184,12 @@ def test_material_and_colormap_names():
     assert mapwriter.material_name("grass_top") == "blockout_test_fabric01"
     assert mapwriter.material_name("caulk") == "caulk"
     assert mapwriter.colormap_name("dirt") == "~-gblockout_concrete_med_test_c"
-    # distinct material and colour map per tile (so each gets its own art override)
-    tiles = mapwriter.STOCK_MATERIAL
-    assert len(set(tiles.values())) == len(tiles)
-    assert len(set(mapwriter.STOCK_COLORMAP.values())) == len(mapwriter.STOCK_COLORMAP)
+    # distinct material and colour map per tile, except lava which intentionally reuses the
+    # (unused, trees-off) log_side material so it stays convert-safe (see mapwriter STOCK_MATERIAL).
+    mats = {k: v for k, v in mapwriter.STOCK_MATERIAL.items() if k != "lava"}
+    assert len(set(mats.values())) == len(mats)
+    cmaps = {k: v for k, v in mapwriter.STOCK_COLORMAP.items() if k != "lava"}
+    assert len(set(cmaps.values())) == len(cmaps)
 
 
 def test_spawn_classes_present_for_tdm_and_ffa(built):
@@ -241,6 +243,45 @@ def test_hurt_volume_is_a_trigger_hurt_brush_entity():
     assert vol["classname"] == "trigger_hurt"
     assert vol["dmg"] == "100"
     assert vol["_brushes"] and vol["_brushes"][0][2] == "trigger"
+
+
+# -- o_blocks5 full assembly ---------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def o5():
+    return terrain.generate(nx=48, ny=48, nz=18, block=36, seed=1, trees=False, o5=True)
+
+
+def test_o5_has_varied_terrain_buildings_and_lava(o5):
+    assert o5.counts["structures"] >= 2  # enterable buildings/towers
+    assert o5.counts["lava_cells"] > 0  # lava perimeter ring
+    assert o5.counts["ravine_cols"] > 0  # river/ravine
+    assert o5.counts["water_cells"] > 0  # the ravine is flooded
+    # real relief: more than one distinct ground height
+    assert len(set(o5.heights.flatten().tolist())) > 1
+
+
+def test_o5_floor_still_sealed(o5):
+    assert bool((o5.grid[:, :, 0] != terrain.AIR).all())  # mapwriter's seal relies on this
+
+
+def test_o5_lava_reuses_a_convert_safe_stock_material():
+    # lava reuses the (trees-off) log_side material with a lava-orange override; a genuine 12th
+    # material was not convert-safe (non-loose normal/spec images). See mapwriter STOCK_MATERIAL.
+    assert mapwriter.material_name("lava") == "blockout_test_metal"
+    assert mapwriter.colormap_name("lava") == "~-gblockout_metal_test_c"
+    assert mapwriter.colormap_name("lava") == mapwriter.colormap_name("log_side")
+
+
+def test_o5_map_text_wires_stairs_ladders_lava_and_clip(o5):
+    boxes, _ = greedy.mesh(o5)
+    text = mapwriter.map_text(o5, boxes)
+    assert text.count("{") == text.count("}")
+    assert '"classname" "trigger_hurt"' in text  # lava kill volume
+    assert " ladder " in text  # climbable ladder faces
+    assert "clip_player" in text  # the playable-edge clip wall
+    assert "blockout_test_metal" in text  # the lava block material (lava-orange override)
 
 
 # -- preview (smoke) -----------------------------------------------------------------------

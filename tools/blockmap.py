@@ -87,6 +87,7 @@ def _gen(args) -> tuple[terrain.Terrain, list, dict]:
         trees=not getattr(args, "no_trees", False),
         village=not getattr(args, "no_village", False),
         flat=getattr(args, "flat", False),
+        o5=getattr(args, "o5", False),
     )
     boxes, counts = greedy.mesh(t)
     return t, boxes, counts
@@ -244,7 +245,15 @@ def cmd_convert(args) -> int:
     # The in-game minimap is the map's own coloured top-down, so it matches the terrain rather
     # than Nuketown. Regenerate the terrain deterministically (same seed and grid as the build)
     # and render it in the compass orientation; pass it as the compass image override.
-    t = terrain.generate(nx=args.nx, ny=args.ny, nz=args.nz, block=args.block, seed=args.seed)
+    t = terrain.generate(
+        nx=args.nx, ny=args.ny, nz=args.nz, block=args.block, seed=args.seed,
+        water=not getattr(args, "no_water", False),
+        caves=not getattr(args, "no_caves", False),
+        trees=not getattr(args, "no_trees", False),
+        village=not getattr(args, "no_village", False),
+        flat=getattr(args, "flat", False),
+        o5=getattr(args, "o5", False),
+    )
     compass_rgba = preview.compass_view(t)
     result = convert_map(
         pc.read_bytes(),
@@ -296,6 +305,7 @@ def main(argv=None) -> int:
         c.add_argument("--no-trees", action="store_true", help="omit the trees")
         c.add_argument("--no-village", action="store_true", help="omit the village huts")
         c.add_argument("--flat", action="store_true", help="flat ground, no hills")
+        c.add_argument("--o5", action="store_true", help="o_blocks5: ravine, buildings, lava")
 
     g = sub.add_parser("gen")
     g.add_argument("-o", "--out", required=True)
@@ -325,6 +335,12 @@ def main(argv=None) -> int:
     cv.add_argument("--lighting", default="baked")
     cv.add_argument("--seed", type=int, default=1)
     cv.add_argument("--px", type=int, default=64)
+    cv.add_argument("--o5", action="store_true", help="o_blocks5 terrain (match the built map)")
+    cv.add_argument("--no-trees", action="store_true")
+    cv.add_argument("--no-caves", action="store_true")
+    cv.add_argument("--no-water", action="store_true")
+    cv.add_argument("--no-village", action="store_true")
+    cv.add_argument("--flat", action="store_true")
     cv.set_defaults(func=cmd_convert)
 
     args = p.parse_args(argv)

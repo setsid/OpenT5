@@ -31,6 +31,7 @@ LOG = 6
 LEAVES = 7
 PLANK = 8
 COBBLE = 9
+LAVA = 10
 
 MATERIAL_NAMES = {
     STONE: "stone",
@@ -42,9 +43,12 @@ MATERIAL_NAMES = {
     LEAVES: "leaves",
     PLANK: "plank",
     COBBLE: "cobble",
+    LAVA: "lava",
 }
-#: Opaque solids: a face between two of these is hidden.
-OPAQUE = frozenset({STONE, DIRT, GRASS, SAND, LOG, LEAVES, PLANK, COBBLE})
+#: Opaque solids: a face between two of these is hidden. Lava is a bright opaque block (the
+#: install has no self-illum techset, so it is a stand-in for emissive lava; the kill comes
+#: from a trigger_hurt volume, not the material). See docs/mapgen.md.
+OPAQUE = frozenset({STONE, DIRT, GRASS, SAND, LOG, LEAVES, PLANK, COBBLE, LAVA})
 
 
 @dataclass
@@ -57,6 +61,10 @@ class Terrain:
     village: tuple[int, int, int, int]  # x0, y0, x1, y1 in cells (flat hut area)
     seed: int = 0
     counts: dict = field(default_factory=dict)
+    #: o_blocks5 buildings: each {x0,y0,x1,y1 (cells), base (floor cell k), roof (roof cell k),
+    #: wall (wall tile), door_side}. mapwriter reads these to place stairs and ladders.
+    structures: list = field(default_factory=list)
+    lava_ring: int = 0  # width in cells of the lava perimeter ring (0 = none)
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -237,6 +245,127 @@ def _place_cover(grid: np.ndarray, heights: np.ndarray, village) -> int:
     return placed
 
 
+def _carve_ravine(grid: np.ndarray, heights: np.ndarray, seed: int, sea: int) -> int:
+    """A river/ravine running the full y extent on the -x side (clear of the central village):
+    a meandering channel cut to a bed, flooded to the sea level with sand banks. k=0 stays solid
+    so the floor seal holds. Returns the number of channel columns."""
+    nx, ny, nz = grid.shape
+    cx = nx // 4
+    halfw = max(2, nx // 16)
+    bed = 1
+    cut = 0
+    # Two land-bridge causeways keep the ground continuous across the river, so the walkable
+    # area stays one connected component for the path graph (the converter checks this). They are
+    # aligned to the path-node stride (4, from j=2) and 5 cells wide, so a node row lands on each.
+    crossings = tuple(((c - 2) // 4) * 4 + 2 for c in (ny // 3, 2 * ny // 3))
+    for j in range(ny):
+        if any(abs(j - cj) <= 2 for cj in crossings):
+            continue
+        meander = int(round(2.0 * np.sin(j / 7.0)))
+        c = cx + meander
+        for i in range(c - halfw, c + halfw + 1):
+            if not (1 <= i < nx - 1):
+                continue
+            grid[i, j, 1:] = AIR
+            grid[i, j, 0] = STONE
+            grid[i, j, bed] = SAND  # river bed
+            grid[i, j, bed + 1 : sea + 1] = WATER
+            heights[i, j] = bed + 1
+            cut += 1
+    return cut
+
+
+def _raise_building(
+    grid: np.ndarray,
+    heights: np.ndarray,
+    x0: int,
+    y0: int,
+    w: int,
+    d: int,
+    storeys: int,
+    mat: int,
+    door_side: str = "xmin",
+) -> dict:
+    """A voxel building shell: flattened pad, ``mat`` walls, cobble/plank floor, a flat roof,
+    a 2-high door gap on ``door_side`` and single-cell window/firing slits on every wall. The
+    interior is open (enter at the door, climb to the roof by the stairs/ladder mapwriter adds).
+    Returns the structure descriptor mapwriter uses to place the stairs and ladder."""
+    nx, ny, nz = grid.shape
+    pad = int(heights[x0 : x0 + w, y0 : y0 + d].max())
+    pad = max(1, pad)
+    wall_h = min(nz - 1 - pad, storeys * 3)  # ~108 units per storey
+    roof = pad + wall_h
+    for i in range(x0, x0 + w):
+        for j in range(y0, y0 + d):
+            if not (0 <= i < nx and 0 <= j < ny):
+                continue
+            grid[i, j, :pad] = np.where(np.arange(pad) >= pad - 3, DIRT, STONE)
+            grid[i, j, pad : roof + 1] = AIR
+            edge = i in (x0, x0 + w - 1) or j in (y0, y0 + d - 1)
+            if edge:
+                grid[i, j, pad:roof] = mat
+            grid[i, j, pad - 1] = mat  # floor
+            grid[i, j, roof] = mat  # flat roof
+            heights[i, j] = pad
+    # door: a 2-high opening in the middle of the chosen wall
+    midx, midy = x0 + w // 2, y0 + d // 2
+    doors = {
+        "xmin": (x0, midy),
+        "xmax": (x0 + w - 1, midy),
+        "ymin": (midx, y0),
+        "ymax": (midx, y0 + d - 1),
+    }
+    di, dj = doors[door_side]
+    grid[di, dj, pad : pad + 2] = AIR
+    # window / firing slits: a single-cell gap at head height on each wall, a couple per side
+    head = pad + 1
+    if head < roof:
+        for t in (x0 + 1, x0 + w - 2):
+            if y0 < t < y0 + d:
+                grid[t, y0, head] = AIR
+                grid[t, y0 + d - 1, head] = AIR
+        for t in (y0 + 1, y0 + d - 2):
+            if x0 < t < x0 + w:
+                grid[x0, t, head] = AIR
+                grid[x0 + w - 1, t, head] = AIR
+    return {
+        "x0": x0, "y0": y0, "x1": x0 + w, "y1": y0 + d,
+        "base": pad, "roof": roof, "wall": mat, "door_side": door_side,
+    }
+
+
+def _build_structures(grid: np.ndarray, heights: np.ndarray, seed: int, village) -> list[dict]:
+    """Two sniper towers near the team ends and a central fort, each enterable with a rooftop."""
+    nx, ny, nz = grid.shape
+    out: list[dict] = []
+    plans = [
+        (int(nx * 0.16), int(ny * 0.50) - 2, 5, 5, 2, PLANK, "xmax"),   # -x sniper tower
+        (int(nx * 0.84) - 5, int(ny * 0.50) - 2, 5, 5, 2, PLANK, "xmin"),  # +x sniper tower
+        (int(nx * 0.50) - 4, int(ny * 0.22), 8, 6, 1, STONE, "ymax"),   # central fort
+    ]
+    for x0, y0, w, d, storeys, mat, door in plans:
+        if x0 < 2 or y0 < 2 or x0 + w >= nx - 2 or y0 + d >= ny - 2:
+            continue
+        out.append(_raise_building(grid, heights, x0, y0, w, d, storeys, mat, door))
+    return out
+
+
+def _lay_lava_ring(grid: np.ndarray, heights: np.ndarray, floor_k: int, ring: int = 2) -> int:
+    """A lava moat around the playable edge: the outer ``ring`` cells become a raised lava lip
+    (opaque LAVA, a stand-in for emissive). k=0 stays solid. A trigger_hurt volume (mapwriter)
+    makes it lethal and a player-clip wall keeps players off it."""
+    nx, ny, nz = grid.shape
+    lip = min(nz - 2, floor_k + 1)
+    for i in range(nx):
+        for j in range(ny):
+            if i < ring or i >= nx - ring or j < ring or j >= ny - ring:
+                grid[i, j, :] = AIR
+                grid[i, j, 0] = STONE
+                grid[i, j, 1 : lip + 1] = LAVA
+                heights[i, j] = lip + 1
+    return ring
+
+
 def generate(
     nx: int = 56,
     ny: int = 56,
@@ -248,6 +377,7 @@ def generate(
     trees: bool = True,
     village: bool = True,
     flat: bool = False,
+    o5: bool = False,
 ) -> Terrain:
     """A deterministic :class:`Terrain` for the given seed and grid size.
 
@@ -259,7 +389,7 @@ def generate(
     # the ground reads as flat with the odd one-block rise to jump. The sea sits below the base
     # ground, so open ground is dry and walkable; water comes from a single dug pond (below).
     floor_k = 5
-    relief = max(3, (nz - floor_k) // 5)
+    relief = max(3, (nz - floor_k) // (3 if o5 else 5))  # o_blocks5 wants real hills and valleys
     ceil_k = floor_k + relief
     sea = 3  # pond surface, below the base ground top cell (floor_k - 1)
     if flat:
@@ -298,13 +428,26 @@ def generate(
                 heights[i, j] = 2
         pond_cells = int((grid == WATER).sum())
 
+    # o_blocks5 features: a river/ravine, enterable towers and a fort, and a lava perimeter.
+    # Built last so they sit on the finished ground; each keeps k=0 solid for the floor seal.
+    structures: list = []
+    lava_ring = 0
+    ravine_cols = 0
+    if o5:
+        ravine_cols = _carve_ravine(grid, heights, seed, sea)
+        structures = _build_structures(grid, heights, seed, village_box)
+        lava_ring = _lay_lava_ring(grid, heights, floor_k, ring=2)
+
     counts = {
         "caves_cells": cave_cells,
         "trees": tree_count,
         "huts": huts,
         "cover": cover_count,
         "solid_cells": int(np.isin(grid, list(OPAQUE)).sum()),
-        "water_cells": pond_cells,
+        "water_cells": int((grid == WATER).sum()) if (water or o5) else pond_cells,
+        "structures": len(structures),
+        "ravine_cols": ravine_cols,
+        "lava_cells": int((grid == LAVA).sum()),
     }
     return Terrain(
         grid=grid,
@@ -315,4 +458,6 @@ def generate(
         village=village_box,
         seed=seed,
         counts=counts,
+        structures=structures,
+        lava_ring=lava_ring,
     )
