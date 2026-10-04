@@ -110,7 +110,18 @@ LIMITS = {
 
 
 def _gen(args) -> tuple[terrain.Terrain, list, dict]:
-    t = terrain.generate(nx=args.nx, ny=args.ny, nz=args.nz, block=args.block, seed=args.seed)
+    t = terrain.generate(
+        nx=args.nx,
+        ny=args.ny,
+        nz=args.nz,
+        block=args.block,
+        seed=args.seed,
+        water=not getattr(args, "no_water", False),
+        caves=not getattr(args, "no_caves", False),
+        trees=not getattr(args, "no_trees", False),
+        village=not getattr(args, "no_village", False),
+        flat=getattr(args, "flat", False),
+    )
     boxes, counts = greedy.mesh(t)
     return t, boxes, counts
 
@@ -297,6 +308,11 @@ def main(argv=None) -> int:
         c.add_argument("--block", type=int, default=64)
         c.add_argument("--px", type=int, default=64, help="texture size (multiple of 16)")
         c.add_argument("--name", default="mp_opent5blocks")
+        c.add_argument("--no-water", action="store_true", help="omit the water plane")
+        c.add_argument("--no-caves", action="store_true", help="omit the carved caves")
+        c.add_argument("--no-trees", action="store_true", help="omit the trees")
+        c.add_argument("--no-village", action="store_true", help="omit the village huts")
+        c.add_argument("--flat", action="store_true", help="flat ground, no hills")
 
     g = sub.add_parser("gen")
     g.add_argument("-o", "--out", required=True)

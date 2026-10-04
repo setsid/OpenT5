@@ -193,13 +193,25 @@ def generate(
     nz: int = 32,
     block: int = 64,
     seed: int = 1,
+    water: bool = True,
+    caves: bool = True,
+    trees: bool = True,
+    village: bool = True,
+    flat: bool = False,
 ) -> Terrain:
-    """A deterministic :class:`Terrain` for the given seed and grid size."""
+    """A deterministic :class:`Terrain` for the given seed and grid size.
+
+    The feature flags exist to isolate what the PC tools accept: a flat, water-free,
+    cave-free map is the simplest geometry the compiler has to handle.
+    """
     grid = np.zeros((nx, ny, nz), np.uint8)
     floor_k = 4
     ceil_k = nz - 8
     sea = floor_k + max(2, (ceil_k - floor_k) // 4)
-    heights = _heightmap(nx, ny, seed, floor_k, ceil_k)
+    if flat:
+        heights = np.full((nx, ny), floor_k + 3, np.int64)
+    else:
+        heights = _heightmap(nx, ny, seed, floor_k, ceil_k)
     k = np.arange(nz)[None, None, :]
     surf = heights[:, :, None]
     # Columns: stone below, 3 dirt, grass (or sand near water) on top.
@@ -216,17 +228,18 @@ def generate(
     underwater_top = top_cell & (surf - 1 < sea)
     grid[underwater_top] = SAND
     # Water fills empty cells up to the sea level.
-    water = (grid == AIR) & (k <= sea)
-    grid[water] = WATER
+    if water:
+        water_cells = (grid == AIR) & (k <= sea)
+        grid[water_cells] = WATER
 
-    village = (nx // 2 - 9, ny // 2 - 7, nx // 2 + 9, ny // 2 + 7)
-    huts = _build_village(grid, heights, seed, village, floor_k)
-    caves = _carve_caves(grid, heights, seed)
-    trees = _place_trees(grid, heights, seed, village, sea)
+    village_box = (nx // 2 - 9, ny // 2 - 7, nx // 2 + 9, ny // 2 + 7)
+    huts = _build_village(grid, heights, seed, village_box, floor_k) if village else 0
+    cave_cells = _carve_caves(grid, heights, seed) if caves else 0
+    tree_count = _place_trees(grid, heights, seed, village_box, sea) if trees else 0
 
     counts = {
-        "caves_cells": caves,
-        "trees": trees,
+        "caves_cells": cave_cells,
+        "trees": tree_count,
         "huts": huts,
         "solid_cells": int(np.isin(grid, list(OPAQUE)).sum()),
         "water_cells": int((grid == WATER).sum()),
@@ -237,7 +250,7 @@ def generate(
         origin=(-nx * block // 2, -ny * block // 2, 0),
         sea_level=sea,
         heights=heights,
-        village=village,
+        village=village_box,
         seed=seed,
         counts=counts,
     )
