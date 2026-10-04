@@ -527,23 +527,115 @@ def objective_entities(half: int, sd_radius: bool = False) -> list[Entity]:
     return out
 
 
-def path_node_entities(half: int, cells: int = 5) -> list[Entity]:
-    """A coarse ``node_pathnode`` grid over the floor (``cells`` x ``cells``): the AI /
-    MP spawn-influence connectivity a converted map lacks (game_map_mp nodeCount 0,
-    docs/convert.md 3.6; docs/research/box-objectives-cd.md 4, fixD). cod2map auto-links
-    nodes in range (no DONT_LINK spawnflag) and writes them to the GameWorldMp PathData,
-    which the converter carries (game_map_mp, proven on PC mp_nuked's 316 nodes). Placed a
-    little above the floor; cod2map drops each to the ground."""
+def collision_boxes(half: int) -> list[tuple]:
+    """Axis-aligned solid volumes a path-node link must not cross: each prop's clip box and
+    each bomb site's solid script_brushmodels (``(x0, y0, z0, x1, y1, z1)``). The room walls
+    are the boundary; nodes are inside it. Triggers are not solid and are excluded."""
+    s = half / 512
+    boxes = []
+    for model, (x, y), _yaw in PROPS:
+        hx, hy, hz = PROP_CLIP.get(model, (24, 24, 40))
+        cx, cy = x * s, y * s
+        boxes.append((cx - hx, cy - hy, 0, cx + hx, cy + hy, hz))
+    for y in (-320, 320):
+        cx, cy = 288 * s, y * s
+        boxes.append((cx - 28, cy - 28, 0, cx + 28, cy + 28, 28))
+    return boxes
+
+
+def _in_box(x: float, y: float, z: float, box: tuple, margin: float = 0.0) -> bool:
+    x0, y0, z0, x1, y1, z1 = box
+    return (
+        x0 - margin <= x <= x1 + margin
+        and y0 - margin <= y <= y1 + margin
+        and z0 - margin <= z <= z1 + margin
+    )
+
+
+def _segment_clear(p, q, boxes: list[tuple]) -> bool:
+    """Is the horizontal node-to-node segment clear of every solid box at node height?"""
+    n = 48
+    for i in range(n + 1):
+        t = i / n
+        x = p[0] + (q[0] - p[0]) * t
+        y = p[1] + (q[1] - p[1]) * t
+        z = p[2] + (q[2] - p[2]) * t
+        if any(_in_box(x, y, z, b) for b in boxes):
+            return False
+    return True
+
+
+def path_graph(nodes: list[tuple], boxes: list[tuple], link_dist: float = 232.0):
+    """The links a map with these nodes and solids forms, and the connected components.
+    A pair links when it is within ``link_dist`` (fixD proved the engine links 232 apart) and
+    the segment between them is clear of every solid. Returns (links, components)."""
+    import math
+
+    adj = {i: set() for i in range(len(nodes))}
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            if math.dist(nodes[i][:2], nodes[j][:2]) > link_dist:
+                continue
+            if _segment_clear(nodes[i], nodes[j], boxes):
+                adj[i].add(j)
+                adj[j].add(i)
+    seen: set = set()
+    comps = []
+    for s0 in range(len(nodes)):
+        if s0 in seen:
+            continue
+        stack = [s0]
+        comp = set()
+        while stack:
+            n = stack.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            comp.add(n)
+            stack += [t for t in adj[n] if t not in seen]
+        comps.append(comp)
+    links = sum(len(a) for a in adj.values()) // 2
+    return links, comps
+
+
+def path_node_entities(half: int, cells: int = 9) -> list[Entity]:
+    """A ``node_pathnode`` grid over the floor, skipping any node that falls inside a solid
+    (a prop clip or a bomb-site brushmodel). The grid is dense (default 9 x 9, spacing well
+    under the engine's link distance) so the links route around the solids and the graph stays
+    a single connected component; ``check_path_connectivity`` verifies this at build time.
+
+    The nodes give the AI / MP spawn-influence system the connectivity a converted map lacks
+    (fixD, box-objectives-cd.md 4). cod2map does not author links (verified: a dense grid still
+    compiles with 0 links), so the engine links the nodes at load from their positions and the
+    collision; the nodes are therefore kept clear of the solids, not merely counted."""
     s = half / 512
     span = half - 48  # inside the walls
     step = 2 * span / (cells - 1)
+    boxes = collision_boxes(half)
     out = []
     for r in range(cells):
         for c in range(cells):
             x = (-span + c * step) * s
             y = (-span + r * step) * s
+            if any(_in_box(x, y, 16, b, margin=8) for b in boxes):
+                continue  # inside or touching a solid; the engine cannot stand a node there
             out.append(Entity({"classname": "node_pathnode", "origin": _v(x, y, 16)}))
     return out
+
+
+def check_path_connectivity(half: int) -> dict:
+    """The path-node graph must be a single connected component, or the engine drops the map
+    with "Path nodes are not connected." at load. Raises SystemExit otherwise."""
+    nodes = [tuple(float(v) for v in e.keys["origin"].split()) for e in path_node_entities(half)]
+    links, comps = path_graph(nodes, collision_boxes(half))
+    report = {"nodes": len(nodes), "links": links, "components": len(comps)}
+    if len(comps) != 1:
+        sizes = sorted((len(c) for c in comps), reverse=True)
+        raise SystemExit(
+            f"path nodes: {len(nodes)} nodes form {len(comps)} disconnected components "
+            f"{sizes}; the engine needs one. Add nodes or move the solids."
+        )
+    return report
 
 
 def map_text(
@@ -693,6 +785,8 @@ def _bat(game: str, line: str) -> str:
 def build(name: str, game: str, work: str, out: Path, **kw) -> dict:
     if not re.fullmatch(r"mp_[a-z0-9_]{1,20}", name) or STOCK_MAPS.match(name):
         raise SystemExit(f"map name: expected mp_ and lower case, not a stock map; found {name!r}")
+    if kw.get("path_nodes", True) and not kw.get("sd_radius"):
+        check_path_connectivity(kw.get("half", 512))
     game_dir, work_dir = _wsl(game), _wsl(work)
     if not (game_dir / "bin" / "launcher_ldr.exe").is_file():
         raise SystemExit(f"{game}: expected bin\\launcher_ldr.exe (the PC Mod Tools), found none")
