@@ -90,3 +90,49 @@ Also seen on device: the bus's BAKED LIGHTMAP SHADOW stays at the old spot as a 
 road. The editor cannot re-bake lightmaps (that is cod2rad), so a moved prop leaves its baked shadow
 behind. The editor must at least warn on moving a prop that casts a baked shadow; proper relighting
 is out of v0.3.0 scope.
+
+## Why the first clip was never hit, and the fix (p_propclip2 to p_clip_a)
+
+p_propclip2 loaded with no crash but produced no invisible wall: the added cbrush was
+byte-valid, loader-clean and oracle-clean, yet no trace hit it. Diagnosed offline against the
+pristine mp_nuked clipMap (sha1 6d5a4a0e) by point-locating the cNode BSP.
+
+The cause is leaf assignment, not the brush. `add_clip` references a new brush only from
+*attachable* leaves (leaves that hold no cod2map brushes), by leaf-AABB overlap. But a trace at
+a point descends the cNode BSP to one exact world leaf, and near any prop that leaf is a populated
+cod2map leaf, which `add_clip` skips. For the test point 204,-47 all 453 leaves whose box spans it
+are populated (0 attachable), so the brush was referenced only from empty leaves elsewhere. The
+real trace leaf there is leaf 596 (a flat leaf node listing brushes 5638, 5074, 4887, 5653); our
+brush was never in its list.
+
+Ruled out offline, each with evidence on stock mp_nuked:
+- Brush bytes: `clip_cbrush` output is byte-identical in shape to stock axial player-clip brush 82
+  (contents 0x08030200, surface 0x000440A0). Not the cause.
+- Leaf contents mask: leaf 596's brushContents is 0x18030200, which already covers the clip bits.
+  Not the cause here (but a real trace-skip class, now checked).
+- Separate arrays: T5 has no separate brushBounds/brushContents arrays; a cbrush_t carries its own
+  mins/maxs/contents. Nothing to keep in sync beyond numBrushes (already consistent).
+- Leaf assignment: the cause. The brush was in no leaf the trace reaches.
+
+Fix (`opent5.convert.propclip`): `BspLocator` walks the cNode tree and the shared plane pool
+(resolved off the first node's plane pointer; the plane pool is a separate allocation, not in the
+clip node's own dict) to point-locate the box centre and corners. `add_clip_bsp` /
+`move_clip_bsp` merge the brush into those exact leaves (`merge_brush_into_leaf`: collapse the
+leaf's reachable set to one fresh flat pool-backed node listing that set plus the new brush, repoint
+the leaf root, OR the clip contents into the leaf's brushContents and the node's contents), then
+assert the brush is reachable from its centre leaf. The BSP locator validated 40/40 random points
+inside their located leaf box.
+
+Two offline guards added so this class is caught without a device:
+- `propclip.check_leaf_contents_masks` / oracle `clipmap_leaf_contents_problems`: every reachable
+  brush's contents must be a subset of its leaf's brushContents and the listing node's contents, or
+  the trace early-outs. Stock-clean: 0 violations across 14730 reachable (leaf, brush) pairs.
+- `add_clip_bsp` / `move_clip_bsp` assert reachability from the centre leaf at edit time (the
+  attachment bug, which the contents check cannot see).
+
+Device builds staged (all reparse-exact, oracle-clean, both clip checks 0):
+- p_clip_a (sha1 93af151d): the fix, 60x60x120 box at 204,-47, stock player-clip contents,
+  referenced from leaf 596. The production path. Test first.
+- p_clip_b (sha1 d9932893): the fix with a 600x600x200 box, referenced from 6 leaves.
+- p_clip_c (sha1 5bf8620b): CONTROL, the same box added the old `add_clip` way (empty leaves).
+  Expected to stay walk-through; if a is solid and c is not, the cause is pinned to leaf assignment.
