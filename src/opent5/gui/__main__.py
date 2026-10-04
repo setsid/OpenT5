@@ -7,6 +7,31 @@ import sys
 from pathlib import Path
 
 
+def _splash(app):
+    """A solid ink card with the stacked logo centred, shown while the window is built.
+    Returns the splash (to finish once the window is up), or None if the logo is missing."""
+    from PySide6.QtGui import QColor, QPainter, QPixmap
+    from PySide6.QtWidgets import QSplashScreen
+
+    from opent5.gui import icons
+
+    logo = icons.brand_logo("stacked", 200, on_dark=True)
+    if logo.isNull():
+        return None
+    width, height = 560, 440
+    canvas = QPixmap(width, height)
+    canvas.fill(QColor("#151617"))
+    p = QPainter(canvas)
+    lw = logo.width() / logo.devicePixelRatio()
+    lh = logo.height() / logo.devicePixelRatio()
+    p.drawPixmap(int((width - lw) / 2), int((height - lh) / 2), logo)
+    p.end()
+    splash = QSplashScreen(canvas)
+    splash.show()
+    app.processEvents()
+    return splash
+
+
 def main(argv: list[str] | None = None) -> int:
     import opent5
 
@@ -54,11 +79,19 @@ def main(argv: list[str] | None = None) -> int:
         from opent5.gui import shots
 
         return shots.run(Path(args.screenshots), args.only)
+
+    # A short branded splash while the main window is built. Skipped for the headless
+    # screenshot/self-test paths, which run offscreen and must not block.
+    splash = None
+    if not args.screenshot:
+        splash = _splash(app)
     window = MainWindow()
     if args.theme:
         window._apply_theme(args.theme)
     window.resize(1440, 900)
     window.show()
+    if splash is not None:
+        splash.finish(window)
     if not args.screenshot and window.updates is not None:
         window.updates.start()
     if args.zones:

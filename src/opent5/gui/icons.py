@@ -15,7 +15,7 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, QRectF, Qt
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap
 
 from opent5.gui import theme
@@ -24,6 +24,22 @@ RESOURCES = Path(__file__).resolve().parent / "resources"
 APP_SVG = RESOURCES / "opent5.svg"
 APP_ICO = RESOURCES / "opent5.ico"
 ICO_SIZES = (16, 24, 32, 48, 64, 256)
+
+#: The brand pack (icon card and OPEN/T5 lockups, on-dark and on-light), bundled under
+#: resources/brand. These are the real logo; the procedural mark below is the fallback used
+#: only when the pack is missing (e.g. a trimmed build).
+BRAND = RESOURCES / "brand"
+#: Icon sizes present in the pack: the bold "small" variant at and below 64, the full card above.
+BRAND_ICON_PX = {
+    16: "icon/opent5-icon-small-16.png",
+    24: "icon/opent5-icon-small-24.png",
+    32: "icon/opent5-icon-small-32.png",
+    48: "icon/opent5-icon-small-48.png",
+    64: "icon/opent5-icon-small-64.png",
+    128: "icon/opent5-icon-128.png",
+    256: "icon/opent5-icon-256.png",
+    512: "icon/opent5-icon-512.png",
+}
 
 #: The mark as (x, y, w, h) rectangles. MARK_SMALL is aligned to a 16-unit grid and used
 #: at whole-pixel scales (16, 32, 48 px) so every edge lands on a pixel; MARK_LARGE is the
@@ -36,7 +52,7 @@ MARK_LARGE = [
     (2, 2, 15, 15), (47, 2, 15, 15), (2, 47, 15, 15), (47, 47, 15, 15),
     (2, 20, 15, 24), (47, 20, 15, 24), (20, 47, 24, 15), (20, 14, 24, 15),
 ]  # fmt: skip
-MARK_COLOUR = "#c4a062"
+MARK_COLOUR = "#ff5a1f"
 
 
 def _grid(size: int) -> tuple[list, int]:
@@ -96,19 +112,79 @@ def ico_bytes(pngs: list[tuple[int, bytes]]) -> bytes:
 
 
 def write_app_icon(folder: Path = RESOURCES) -> tuple[Path, Path]:
+    """Regenerate opent5.svg and opent5.ico. Uses the brand pack when present (the real icon
+    card, packed as PNG-stream ICO entries), else the procedural mark."""
     folder.mkdir(parents=True, exist_ok=True)
     svg = folder / APP_SVG.name
-    svg.write_text(app_svg())
     ico = folder / APP_ICO.name
-    ico.write_bytes(ico_bytes([(s, png_bytes(render_mark(s))) for s in ICO_SIZES]))
+    brand_svg = BRAND / "icon" / "opent5-icon.svg"
+    if brand_svg.exists():
+        svg.write_bytes(brand_svg.read_bytes())
+        entries = [(s, (BRAND / BRAND_ICON_PX[s]).read_bytes()) for s in ICO_SIZES]
+        ico.write_bytes(ico_bytes(entries))
+    else:
+        svg.write_text(app_svg())
+        ico.write_bytes(ico_bytes([(s, png_bytes(render_mark(s))) for s in ICO_SIZES]))
     return svg, ico
 
 
 def app_icon() -> QIcon:
+    """The window and taskbar icon: the real brand icon card if the pack is present,
+    else the procedural mark."""
     out = QIcon()
+    have = False
+    for px, rel in BRAND_ICON_PX.items():
+        src = BRAND / rel
+        if src.exists():
+            out.addFile(str(src), QSize(px, px))
+            have = True
+    if have:
+        return out
     for s in ICO_SIZES:
         out.addPixmap(QPixmap.fromImage(render_mark(s)))
     return out
+
+
+# -- brand lockups -------------------------------------------------------------------------
+
+_brand_cache: dict[tuple[str, int, str], QPixmap] = {}
+
+
+def _load_scaled(path: Path, height: int, ratio: float = 2.0) -> QPixmap:
+    """Load a PNG and scale it to ``height`` logical pixels, crisp on a hi-DPI display."""
+    src = QPixmap(str(path))
+    if src.isNull():
+        return src
+    out = src.scaledToHeight(
+        int(height * ratio), Qt.TransformationMode.SmoothTransformation
+    )
+    out.setDevicePixelRatio(ratio)
+    return out
+
+
+def brand_mark(height: int = 64) -> QPixmap:
+    """The icon card on its own (bone square, stencil T5), scaled to ``height`` px.
+    Falls back to the procedural mark when the pack is missing."""
+    key = ("mark", height, "")
+    if key not in _brand_cache:
+        src = BRAND / BRAND_ICON_PX[512]
+        px = _load_scaled(src, height) if src.exists() else QPixmap.fromImage(render_mark(height))
+        _brand_cache[key] = px
+    return _brand_cache[key]
+
+
+def brand_logo(kind: str = "stacked", height: int = 120, on_dark: bool | None = None) -> QPixmap:
+    """A themed logo lockup. ``kind`` is "stacked", "horizontal" or "wordmark"; the on-dark
+    or on-light art is chosen from the current theme unless ``on_dark`` is given. Returns a
+    null pixmap if the pack is missing, so callers can fall back to a text title."""
+    if on_dark is None:
+        on_dark = theme.current().name == "dark"
+    variant = "dark" if on_dark else "light"
+    key = (kind, height, variant)
+    if key not in _brand_cache:
+        src = BRAND / "logo" / f"opent5-{kind}-on-{variant}-2x.png"
+        _brand_cache[key] = _load_scaled(src, height) if src.exists() else QPixmap()
+    return _brand_cache[key]
 
 
 # -- line icons ----------------------------------------------------------------------------

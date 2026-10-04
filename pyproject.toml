@@ -20,6 +20,9 @@ opent5 = "opent5.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"opent5.gui" = ["resources/*", "resources/brand/icon/*", "resources/brand/logo/*"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]

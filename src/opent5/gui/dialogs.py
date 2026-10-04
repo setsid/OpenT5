@@ -7,7 +7,6 @@ import sys
 
 from PySide6 import __version__ as PYSIDE_VERSION
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -112,7 +111,7 @@ class AboutDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(f"About {opent5.APP_NAME}")
         mark = QLabel()
-        mark.setPixmap(QPixmap.fromImage(icons.render_mark(64)))
+        mark.setPixmap(icons.brand_mark(72))
         mark.setAlignment(Qt.AlignmentFlag.AlignTop)
         name = QLabel(f"{opent5.APP_NAME} {opent5.__version__}")
         f = name.font()

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -22,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from opent5.gui import theme
+from opent5.gui import icons, theme
 
 SPLIT, ALL = "split", "all"
 
@@ -108,13 +109,16 @@ class ProgressStrip(QWidget):
 
 
 class LoadingPage(QWidget):
-    """A zone tab while the zone is read on a worker thread: a centred panel with the
-    file name, the stage, a bar and the percentage."""
+    """A zone tab while the zone is read on a worker thread: the brand mark, then a centred
+    panel with the file name, the stage, a bar and the percentage."""
 
     def __init__(self, path, parent=None):
         super().__init__(parent)
         self.path = path
         self.cancelled = False
+        mark = QLabel()
+        mark.setPixmap(icons.brand_mark(72))
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.progress = ProgressStrip()
         self.progress.setObjectName("LoadingPanel")
         self.progress.setFixedWidth(560)
@@ -124,6 +128,8 @@ class LoadingPage(QWidget):
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay = QVBoxLayout(self)
         lay.addStretch(2)
+        lay.addWidget(mark)
+        lay.addSpacing(14)
         lay.addWidget(self.progress, 0, Qt.AlignmentFlag.AlignHCenter)
         lay.addSpacing(8)
         lay.addWidget(hint)
@@ -131,6 +137,86 @@ class LoadingPage(QWidget):
 
     def set_progress(self, stage: str, fraction: float) -> None:
         self.progress.set_progress(stage, fraction)
+
+
+class BusyOverlay(QWidget):
+    """A scrim over the whole window with a centred panel (mark, title, stage, bar), shown
+    while a long task runs so it is plain the app is working. Determinate once the task
+    reports a fraction, an animated sweep until then. Covers the widgets beneath it, so a
+    click cannot reach them while it is up."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("BusyOverlay")
+        self.panel = QWidget(self)
+        self.panel.setObjectName("LoadingPanel")
+        self.panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.panel.setFixedWidth(420)
+        self.mark = QLabel()
+        self.mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title = QLabel()
+        self.title.setObjectName("ProgressTitle")
+        self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.stage = QLabel()
+        self.stage.setObjectName("AssetMeta")
+        self.stage.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.bar = QProgressBar()
+        self.bar.setObjectName("BigProgress")
+        self.bar.setTextVisible(False)
+        lay = QVBoxLayout(self.panel)
+        lay.setContentsMargins(28, 24, 28, 22)
+        lay.setSpacing(10)
+        lay.addWidget(self.mark)
+        lay.addSpacing(4)
+        lay.addWidget(self.title)
+        lay.addWidget(self.stage)
+        lay.addWidget(self.bar)
+        self._apply_theme(theme.current())
+        theme.on_change(self._apply_theme, self)
+        self.hide()
+
+    def _apply_theme(self, _t) -> None:
+        self.mark.setPixmap(icons.brand_mark(72))
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        scrim = QColor(theme.current().window)
+        scrim.setAlpha(225)
+        p.fillRect(self.rect(), scrim)
+        p.end()
+
+    def cover(self) -> None:
+        parent = self.parentWidget()
+        if parent is not None:
+            self.setGeometry(parent.rect())
+        self.panel.adjustSize()
+        self.panel.move(
+            (self.width() - self.panel.width()) // 2,
+            (self.height() - self.panel.height()) // 2,
+        )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        self.cover()
+
+    def start(self, title: str, *, determinate: bool = False) -> None:
+        self.title.setText(title)
+        self.stage.setText("Starting" if determinate else "Working...")
+        self.bar.setRange(0, 1000 if determinate else 0)
+        if determinate:
+            self.bar.setValue(0)
+        self.cover()
+        self.raise_()
+        self.show()
+
+    def set_progress(self, stage: str, fraction: float) -> None:
+        if self.bar.maximum() == 0:
+            self.bar.setRange(0, 1000)
+        self.stage.setText(stage)
+        self.bar.setValue(int(min(max(fraction, 0.0), 1.0) * 1000))
+
+    def finish(self) -> None:
+        self.hide()
 
 
 class ShareChoiceDialog(QDialog):
