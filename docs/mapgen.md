@@ -134,16 +134,14 @@ spread of `mp_tdm_spawn` (TDM) and `mp_dm_spawn` (FFA) on flat surface cells; tw
 origins for the compass; and a `node_pathnode` grid on walkable cells by default, so Domination
 and the other team-based modes do not stall at load.
 
-Status (verified here): the pipeline runs end to end for a one-light map. cod2map, cod2rad and
-linker_pc all return 0, and `blockmap convert` parses the PC zone exactly, converts onto mp_nuked
-with 0 pointers unresolved, verifies, and passes the emulated loader. The earlier PC gfx_map RUNTIME
-shortfall was `surfaceCastsSunShadow` sized as 4 * surface_vis instead of 4 * static_surfaces
-(convert/pc.py); the box could not reveal it (its surface_vis is close to its static_surfaces and
-128-byte alignment absorbed the difference), a terrain map with hundreds of surfaces did. Fixed.
-
-A smaller residual remains for terrain maps with **many shadow-casting lights** (16 to 80 bytes,
-alignment-entangled, needs deeper work), so the blocky generator is held to one light for now; such
-a map loads but is dim toward the edges. Converting a map with many lights still fails loudly (it
-is never written). The linker also prints two harmless errors (missing assetlist/code_post_gfx_mp.csv
-and common_mp.csv for the ignore zones); the box build prints the same and converts fine, so they do
-not affect the result.
+Status (verified here): the pipeline runs end to end, including many-light terrain. cod2map, cod2rad
+and linker_pc all return 0, and `blockmap convert` parses the PC zone exactly, converts onto
+mp_nuked with 0 pointers unresolved, verifies, and passes the emulated loader. The PC gfx_map
+RUNTIME model was wrong for many-surface, many-light terrain; it is now calibrated across 11 built
+PC zones (tools/gfx_probe.py): surfaceCastsSunShadow (0x3AC) = 4 * surface_vis, 128-aligned; the
+four surface-vis arrays (0x37C..0x38C) hold no RUNTIME bytes on PC; the per-static-surface reserve
+at 0x3A8 is 12 bytes. A 4x4-light blocky map (o_blocks3) now parses, converts and passes the oracle,
+so the generator is no longer held to one light. Converting a map the parser cannot reproduce still
+fails loudly (never written). The linker prints two harmless errors (missing
+assetlist/code_post_gfx_mp.csv and common_mp.csv for the ignore zones); the box build prints the
+same and converts fine, so they do not affect the result.

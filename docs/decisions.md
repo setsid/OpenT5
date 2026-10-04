@@ -222,3 +222,22 @@ many shadow-casting lights; it is alignment-entangled (flips sign with map size)
 exact PC loader layout, so the blocky generator is held to one light and o_blocks2 ships for
 local testing on that basis. The linker's missing-assetlist errors (code_post_gfx_mp.csv,
 common_mp.csv) are harmless: the box build prints the same and converts fine.
+
+**Correction: the PC gfx_map fix was NOT surfaceCastsSunShadow = 4 * static_surfaces.** That
+earlier fix only coincidentally parsed simple maps (box, one-light terrain) where surface_vis
+tracks static_surfaces; it failed many-light terrain. The correct PC gfx_map RUNTIME model,
+calibrated across 11 built PC zones spanning 1/4/9 shadow lights and 1..670 static surfaces
+(tools/gfx_probe.py): surfaceCastsSunShadow (0x3AC) = 4 * surface_vis, 128-aligned (as PS3); the
+four surface-vis arrays (0x37C..0x38C) hold NO RUNTIME bytes on PC; the per-static-surface reserve
+at 0x3A8 is 12 * static_surfaces (not 8). All 11 zones, the box, and the 4x4-light blocky map now
+parse exactly. This supersedes the earlier surfaceCastsSunShadow note. The converter's refuse-to-
+write gate meant the wrong model simply blocked lighting rather than shipping bad data.
+
+**Blocky map overhaul (o_blocks3).** Blocks rescaled to 36 units (player ~72 is two blocks tall,
+step ~18 is half a block). Terrain redesigned flatter and larger (56x56x18) with buildings, cover,
+spread spawns, Domination flags, two S&D sites, and a single connected path-node component (145
+nodes). Lit by a 4x4 primary-light grid with ambient raised to 0.42. Grey planks fixed: an image
+override whose name also exists in the base zone was being reused from the base before the override
+ran; the override now wins (convert/materials.py), fixing plank/water/cobble. Staged as o_blocks3
+(local testing only). Open: the blocky S&D uses radius triggers (weak plant prompt); a follow-up is
+to use the stock brush-model bombzone set like the box.
