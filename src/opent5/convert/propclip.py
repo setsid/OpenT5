@@ -583,6 +583,44 @@ def _detach(cm: ClipMap, brush_index: int, keep: set[int]) -> None:
             cm.set_leaf_root(leaf_index, 0)
 
 
+def _collapse_leaf(cm: ClipMap, leaf: int, rest: list[int]) -> None:
+    """Make a world leaf reach exactly ``rest`` (and nothing else), the device-proven
+    way: a single flat pool-backed leaf node listing ``rest``, the leaf root repointed
+    at it. An empty ``rest`` points the leaf at node 0 (the all-zero node stock maps
+    use for an empty leaf). The node's contents are the union of the kept brushes'
+    contents, so the trace does not early-out on any of them."""
+    root = cm.leaf_root(leaf)
+    if not rest:
+        cm.set_leaf_root(leaf, 0)
+        return
+    contents = 0
+    for b in rest:
+        if 0 <= b < cm.num_brushes:
+            contents |= cm.brush(b).contents
+    if root > 0 and cm.node_count(root) > 0:
+        cm.set_flat_node(root, contents, rest)
+        cm._mine.add(root)
+    else:
+        cm.set_leaf_root(leaf, cm.append_flat_node(contents, rest))
+
+
+def detach_everywhere(cm: ClipMap, brush_index: int, keep: set[int]) -> None:
+    """Drop ``brush_index`` from EVERY world leaf that reaches it (except those in
+    ``keep``), including stock cod2map leaves the editor did not create. Each such
+    leaf's reachable set minus the brush is collapsed into a fresh flat pool-backed
+    node (as ``merge_brush_into_leaf`` does, which is device-proven solid). ``_detach``
+    only touches our own leaf nodes, so it cannot clear a stock brush's original
+    references; moving a stock prop's clip needs this, or the old spot keeps an
+    invisible wall."""
+    for leaf in range(cm.num_leafs):
+        if leaf in keep:
+            continue
+        reachable = cm.reachable_brushes(leaf)
+        if brush_index not in reachable:
+            continue
+        _collapse_leaf(cm, leaf, sorted(reachable - {brush_index}))
+
+
 # -- operations -----------------------------------------------------------------------------
 
 
@@ -684,6 +722,70 @@ def remove_cluster(cm: ClipMap, brush_indices: list[int]) -> None:
     """Remove a whole clip cluster's collision (each brush disabled in place)."""
     for i in sorted(set(brush_indices)):
         remove_clip(cm, i)
+
+
+def cluster_bounds(cm: ClipMap, brush_indices: list[int]) -> tuple[Vec3, Vec3] | None:
+    """The axis-aligned bounds enclosing a cluster of clip brushes, or ``None`` when
+    the cluster is empty. For showing which collision a move or delete will affect."""
+    boxes = [cm.brush(i) for i in brush_indices]
+    if not boxes:
+        return None
+    mins = tuple(min(b.mins[k] for b in boxes) for k in range(3))
+    maxs = tuple(max(b.maxs[k] for b in boxes) for k in range(3))
+    return mins, maxs
+
+
+def translate_clip_bsp(cm: ClipMap, locator: BspLocator, brush_index: int, delta: Vec3) -> None:
+    """Move one clip brush by a translation, keeping its size, and re-reference it
+    from the world leaf(s) the new box reaches (the BSP path). Use this, not
+    ``translate_clip``, on a real map so a trace finds the brush at its new place."""
+    br = cm.brush(brush_index)
+    move_clip_bsp(cm, locator, brush_index, _add3(br.mins, delta), _add3(br.maxs, delta))
+
+
+def move_cluster_bsp(
+    cm: ClipMap, locator: BspLocator, brush_indices: list[int], delta: Vec3
+) -> None:
+    """Move a whole clip cluster (a stock prop's brushes) by the same translation,
+    the BSP way: the whole cluster is first detached from every world leaf that
+    reaches any of its brushes (one leaf pass, so the OLD spot goes clear), each
+    brush's record and verts are moved by ``delta``, and each brush is then re-leafed
+    into the world leaves a trace at its new place reaches. ``numBrushes`` is
+    unchanged.
+
+    This is the move an editor applies to a stock prop (e.g. a bus): moving the
+    existing cluster, not adding a new clip at the destination, so no leftover wall
+    stays behind at the old position."""
+    idxset = set(brush_indices)
+    for i in idxset:
+        if cm.brush(i).numsides:
+            raise ClipError(f"brush {i} is not axis-aligned (has {cm.brush(i).numsides} sides)")
+    # one leaf pass: strip the whole cluster from every leaf that reaches any of it.
+    for leaf in range(cm.num_leafs):
+        reachable = cm.reachable_brushes(leaf)
+        if not (reachable & idxset):
+            continue
+        _collapse_leaf(cm, leaf, sorted(reachable - idxset))
+    # move each brush's record and verts.
+    d = tuple(float(v) for v in delta)
+    for i in brush_indices:
+        br = cm.brush(i)
+        mn, mx = _add3(br.mins, d), _add3(br.maxs, d)
+        cm.set_brush_bytes(
+            i, clip_cbrush(mn, mx, br.contents, _surface_of(cm, i),
+                           verts_ptr=br.verts_ptr, numverts=br.numverts),
+        )
+        if br.numverts and br.verts_ptr:
+            cm.set_brush_verts(i, box_corner_verts(mn, mx))
+    # re-leaf each brush into the world leaves its new box reaches.
+    for i in brush_indices:
+        br = cm.brush(i)
+        leaves = locator.leaves_for_box(br.mins, br.maxs)
+        if not leaves:
+            raise ClipError(f"moved cluster brush {i} locates to no world leaf (outside the BSP)")
+        for leaf in leaves:
+            merge_brush_into_leaf(cm, leaf, i, br.contents)
+        _assert_reachable(cm, locator, i, br.mins, br.maxs)
 
 
 # -- offline check ---------------------------------------------------------------------------
@@ -929,16 +1031,19 @@ def add_clip_bsp(
 
 def move_clip_bsp(cm: ClipMap, locator: BspLocator, brush_index: int, mins: Vec3, maxs: Vec3) -> None:
     """Move a clip brush to new bounds and re-reference it from the world leaf(s)
-    the new box reaches. Drops it from every leaf node it is currently in, rewrites
-    the ``cbrush_t`` and its verts, then merges it into the new leaves and asserts
-    reachability."""
+    the new box reaches. Drops it from EVERY leaf that currently reaches it (stock
+    leaves included, so the old spot goes clear), rewrites the ``cbrush_t`` and its
+    verts, then merges it into the new leaves and asserts reachability. The brush
+    index and ``numBrushes`` do not change."""
     br = cm.brush(brush_index)
     if br.numsides:
         raise ClipError(f"brush {brush_index} is not axis-aligned (has {br.numsides} sides)")
     leaves = locator.leaves_for_box(mins, maxs)
     if not leaves:
         raise ClipError("moved clip box locates to no world leaf (outside the BSP)")
-    _detach(cm, brush_index, set())
+    # detach from the destination leaves too, then re-add cleanly below, so a brush that
+    # barely moves (new leaves overlap old) still ends listed exactly once per leaf.
+    detach_everywhere(cm, brush_index, set())
     cm.set_brush_bytes(
         brush_index,
         clip_cbrush(mins, maxs, br.contents, _surface_of(cm, brush_index),

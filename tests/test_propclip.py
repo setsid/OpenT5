@@ -205,6 +205,37 @@ def test_contents_mask_check_flags_a_non_subset_brush():
     assert pc.check_leaf_contents_masks(pc.ClipMap(node)) == []
 
 
+def test_detach_everywhere_empties_a_stock_leaf_that_only_held_the_brush():
+    # A world leaf whose only brush is the one being removed becomes an empty leaf
+    # (root 0, the shape stock maps use), clearing a stock brush's reference without a
+    # pool append. Removing a brush that other brushes share a leaf with needs a
+    # Rewrite to re-list the rest, so that path is covered by the zone tests.
+    # node 0 is the all-zero empty node stock maps keep for an empty leaf; the leaf's
+    # own node (index 1) lists only brush 9.
+    cm = pc.ClipMap(synthetic(
+        [((0, 0, 0), (1, 1, 1))], [9], [("split", 0, 0), (1, 0x8030200, 0)], roots=[1],
+    ))
+    assert cm.reachable_brushes(0) == {9}
+    pc.detach_everywhere(cm, 9, set())
+    assert cm.reachable_brushes(0) == set()
+    assert cm.leaf_root(0) == 0  # repointed at the empty node
+    assert pc.check_world_leaf_refs(cm) == []
+
+
+def test_cluster_bounds():
+    node = synthetic([((0, 0, 0), (1, 1, 1))], [], [], roots=[0])
+    node["brushes"] = (
+        pc.clip_cbrush((0.0, 0.0, 0.0), (10.0, 10.0, 10.0))
+        + pc.clip_cbrush((2.0, 2.0, 20.0), (6.0, 6.0, 30.0))
+    )
+    h = bytearray(node["header"])
+    struct.pack_into(">H", h, pc._H_NUM_BRUSHES, 2)
+    node["header"] = bytes(h)
+    cm = pc.ClipMap(node)
+    assert pc.cluster_bounds(cm, [0, 1]) == ((0.0, 0.0, 0.0), (10.0, 10.0, 30.0))
+    assert pc.cluster_bounds(cm, []) is None
+
+
 def test_clips_in_footprint():
     # three clip brushes; footprint contains the first two.
     node = synthetic([((0, 0, 0), (1, 1, 1))], [], [], roots=[0])
