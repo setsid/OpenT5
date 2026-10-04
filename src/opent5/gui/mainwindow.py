@@ -814,7 +814,7 @@ class MainWindow(QMainWindow):
                 "Your edits stay in this window (see the Changes panel) until you close it.",
             )
             return
-        default_dir = self.settings.value("save_dir", "") or str(env.ROOT / "out")
+        default_dir = self.settings.value("save_dir", "") or str(env.ENV_HOME / "out")
         suggestion = str(Path(default_dir) / f"{doc.path.stem}_edited.ff")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save zone as (a new file)", suggestion, "Zones (*.ff)"
@@ -985,7 +985,7 @@ class MainWindow(QMainWindow):
         )
         if not stock:
             return
-        default_dir = self.settings.value("save_dir", "") or str(env.ROOT / "out")
+        default_dir = self.settings.value("save_dir", "") or str(env.ENV_HOME / "out")
         suggestion = str(Path(default_dir) / f"{Path(stock).stem}_patched.ff")
         out, _ = QFileDialog.getSaveFileName(
             self, "Save the patched zone as (a new file)", suggestion, "Zones (*.ff)"
@@ -1037,7 +1037,7 @@ class MainWindow(QMainWindow):
         def save(dialog) -> None:
             from opent5.gui import patchops
 
-            default_dir = self.settings.value("save_dir", "") or str(env.ROOT / "out")
+            default_dir = self.settings.value("save_dir", "") or str(env.ENV_HOME / "out")
             suggestion = str(Path(default_dir) / f"{result.source_zone}.o5patch")
             out, _ = QFileDialog.getSaveFileName(
                 dialog, "Save mod patch as", suggestion, "Mod patches (*.o5patch)"
