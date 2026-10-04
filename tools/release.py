@@ -73,6 +73,33 @@ def current_version() -> str:
     return m.group(1)
 
 
+#: Every file that holds the version, and the pattern that reads it. They must all agree, or a
+#: release would ship mismatched versions (npm showed 0.2.0 while the zone read 0.3.0 once).
+VERSION_FILES = (
+    (INIT, r'^__version__ = "([^"]+)"$'),
+    (ROOT / "pyproject.toml", r'^version = "([^"]+)"$'),
+    (ROOT / "package.json", r'^  "version": "([^"]+)",$'),
+)
+
+
+def all_versions() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for path, pattern in VERSION_FILES:
+        m = re.search(pattern, path.read_text(), re.M)
+        out[path.name] = m.group(1) if m else "(no version line)"
+    return out
+
+
+def check_versions(version: str) -> None:
+    """Refuse unless every version-holding file matches ``version`` (the __init__ source)."""
+    versions = all_versions()
+    if any(v != version for v in versions.values()):
+        detail = ", ".join(f"{name}={v}" for name, v in versions.items())
+        raise Refused(
+            f"version mismatch across files ({detail}); run: npm run version -- {version}"
+        )
+
+
 # -- npm run version -- X.Y.Z ------------------------------------------------------------
 
 
@@ -129,6 +156,7 @@ def preflight(version: str, dry_run: bool, allow_dirty: bool) -> list[str]:
     warnings = []
     if semver.parse(version) is None:
         raise Refused(f"__version__ {version!r} is not MAJOR.MINOR.PATCH")
+    check_versions(version)
     dirty = git("status", "--porcelain").rstrip("\n")
     if dirty.strip():
         if not (dry_run and allow_dirty):

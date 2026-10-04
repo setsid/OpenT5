@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opent5"
-version = "0.2.0"
+version = "0.3.0"
 description = "Open, browse, edit and rebuild Black Ops (T5) PS3 fastfiles"
 requires-python = ">=3.10"
 license = { text = "GPL-3.0-or-later" }
@@ -19,6 +19,9 @@ opent5 = "opent5.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"opent5.gui" = ["resources/*", "resources/brand/icon/*", "resources/brand/logo/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

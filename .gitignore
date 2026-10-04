@@ -22,3 +22,9 @@ out/
 *.dds
 extracted/
 .oracle/
+
+# large retail zone backups for pinned tests (not committed; ~36MB each)
+tests/fixtures/*.retail
+
+# local Claude Code session data and worktrees
+.claude/

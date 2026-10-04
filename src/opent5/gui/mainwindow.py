@@ -42,7 +42,7 @@ from opent5.gui.dialogs import (
 )
 from opent5.gui.palette import Item, Palette
 from opent5.gui.panels import ChangesPanel, GlobalSearchPanel, SearchPanel
-from opent5.gui.strips import LoadingPage
+from opent5.gui.strips import BusyOverlay, LoadingPage
 from opent5.gui.tree import human_size
 from opent5.gui.zonepage import VIEWS, ZonePage
 
@@ -91,11 +91,11 @@ class StartPage(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        title = QLabel(opent5.APP_NAME)
-        f = title.font()
-        f.setPointSize(f.pointSize() + 6)
-        title.setFont(f)
-        credit = QLabel(f"{opent5.APP_NAME} by {opent5.APP_AUTHOR}")
+        self.logo = QLabel()
+        self.logo.setObjectName("StartLogo")
+        self._set_logo(theme.current())
+        theme.on_change(self._set_logo, self)
+        credit = QLabel(f"by {opent5.APP_AUTHOR}")
         credit.setObjectName("Credit")
         hint = QLabel(
             "Open a zone with Ctrl+O, drop a .ff file on this window, or pick one below. "
@@ -118,11 +118,22 @@ class StartPage(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(32, 28, 32, 24)
         lay.setSpacing(8)
-        lay.addWidget(title)
+        lay.addWidget(self.logo)
         lay.addWidget(credit)
+        lay.addSpacing(6)
         lay.addWidget(hint)
         lay.addSpacing(10)
         lay.addLayout(cols, 1)
+
+    def _set_logo(self, _t) -> None:
+        px = icons.brand_logo("stacked", 180)
+        if px.isNull():
+            self.logo.setText(opent5.APP_NAME)
+            f = self.logo.font()
+            f.setPointSize(f.pointSize() + 6)
+            self.logo.setFont(f)
+        else:
+            self.logo.setPixmap(px)
 
     def _list(self) -> QListWidget:
         lst = QListWidget()
@@ -247,6 +258,10 @@ class MainWindow(QMainWindow):
         self.centre.setSizes([700, 220])
         self.bottom.hide()
         self.setCentralWidget(self.centre)
+
+        #: A scrim with a centred panel, shown over everything while a long task runs.
+        self.busy = BusyOverlay(self.centre)
+        self.busy.hide()
 
         self.palette = Palette(self)
         self._build_actions()
@@ -799,7 +814,7 @@ class MainWindow(QMainWindow):
                 "Your edits stay in this window (see the Changes panel) until you close it.",
             )
             return
-        default_dir = self.settings.value("save_dir", "") or str(env.ROOT / "out")
+        default_dir = self.settings.value("save_dir", "") or str(env.ENV_HOME / "out")
         suggestion = str(Path(default_dir) / f"{doc.path.stem}_edited.ff")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save zone as (a new file)", suggestion, "Zones (*.ff)"
@@ -821,11 +836,13 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.progress.show()
         page.saving.start(f"Saving {path.name}")
+        self.busy.start(f"Saving {path.name}", determinate=True)
         page.unsaved.setEnabled(False)
         self.message(f"Saving and verifying {path.name}...")
 
         def step(stage: str, fraction: float) -> None:
             page.saving.set_progress(stage, fraction)
+            self.busy.set_progress(stage, fraction)
             self.progress.setValue(int(fraction * 100))
             self.message(f"Saving {path.name}: {stage} ({int(fraction * 100)}%)")
 
@@ -833,6 +850,7 @@ class MainWindow(QMainWindow):
             self._tasks.remove(task)
             self.progress.hide()
             page.saving.hide()
+            self.busy.finish()
             page.unsaved.setEnabled(True)
 
         def done(report):
@@ -967,7 +985,7 @@ class MainWindow(QMainWindow):
         )
         if not stock:
             return
-        default_dir = self.settings.value("save_dir", "") or str(env.ROOT / "out")
+        default_dir = self.settings.value("save_dir", "") or str(env.ENV_HOME / "out")
         suggestion = str(Path(default_dir) / f"{Path(stock).stem}_patched.ff")
         out, _ = QFileDialog.getSaveFileName(
             self, "Save the patched zone as (a new file)", suggestion, "Zones (*.ff)"
@@ -991,6 +1009,7 @@ class MainWindow(QMainWindow):
         self._tasks.append(task)
         self.progress.setRange(0, 0)  # busy: create/apply report no fine-grained progress
         self.progress.show()
+        self.busy.start(busy)  # indeterminate: these report no fraction
         self.message(f"{busy}...")
 
         def finish() -> None:
@@ -999,6 +1018,7 @@ class MainWindow(QMainWindow):
             if not self._tasks:
                 self.progress.hide()
                 self.progress.setRange(0, 100)
+            self.busy.finish()
             self.message("")
 
         task.signals.done.connect(lambda result: (finish(), on_done(result)))
@@ -1017,7 +1037,7 @@ class MainWindow(QMainWindow):
         def save(dialog) -> None:
             from opent5.gui import patchops
 
-            default_dir = self.settings.value("save_dir", "") or str(env.ROOT / "out")
+            default_dir = self.settings.value("save_dir", "") or str(env.ENV_HOME / "out")
             suggestion = str(Path(default_dir) / f"{result.source_zone}.o5patch")
             out, _ = QFileDialog.getSaveFileName(
                 dialog, "Save mod patch as", suggestion, "Mod patches (*.o5patch)"
@@ -1267,6 +1287,8 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if self.palette.isVisible():
             self.palette._place()
+        if self.busy.isVisible():
+            self.busy.cover()
 
 
 def guard_edit_errors(fn):

@@ -1031,6 +1031,15 @@ class Document:
                 f"asset {index!r} field {path}: the asset no longer writes: {exc}"
             ) from None
 
+    def touch_asset(self, index: AssetKey) -> None:
+        """Record that an asset's node was edited in place (outside the field/text/image
+        editors), so ``build`` re-lays it out and ``save`` verifies it. The caller owns the
+        node mutation and its reversal; this only marks the asset and keeps one undo/redo
+        step in step with that mutation. Used by the map editor's clip edits, which change
+        the clipMap node directly through ``opent5.convert.propclip`` and the Rewrite."""
+        _, _, top = self._resolve(index)
+        self._push(_Op(index, "clip", None, None, "", [], {top}))
+
     # -- history -----------------------------------------------------------------------------
 
     @property
