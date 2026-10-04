@@ -68,7 +68,9 @@ WORLDSPAWN = (
     ("_sunshadowcolor", "0.709804 0.803922 0.984314"),
     ("sunlight", "16"),
     ("suncolor", "0.996078 0.976471 0.886275"),
-    ("ambientintensity", "0.18"),
+    # Raised ambient (was 0.18): the map is sealed and lit only by the primary spot grid, so
+    # shadowed and far faces need a floor of fill light to read rather than going near-black.
+    ("ambientintensity", "0.42"),
     ("_ambientcolor", "0.682353 0.752941 0.898039"),
     ("newsun", "1"),
     ("sundirection", "-45 155 0"),
@@ -145,44 +147,165 @@ def _flat_columns(t: Terrain) -> list[tuple[int, int]]:
     return out
 
 
-def spawn_entities(t: Terrain) -> list[dict]:
-    """TDM and FFA spawns on the terrain surface, plus the global start/intermission.
-
-    The spawn classes needed so the level does not AbortLevel (docs/convert.md 9.2): per team
-    one ``mp_tdm_spawn_*_start``, and ``mp_tdm_spawn`` (TDM/koth) and ``mp_dm_spawn`` (FFA).
-    """
+def _pick(t: Terrain, cols: list[tuple[int, int]], fx: float, fy: float) -> tuple[int, int]:
+    """The walkable column nearest the fractional map position (fx, fy in -1..1), so an entity
+    lands on open ground and not inside a building, a cover piece or the pond."""
     nx, ny, _ = t.shape
+    cx, cy = nx / 2 + fx * nx * 0.46, ny / 2 + fy * ny * 0.46
+    if not cols:
+        return (int(cx), int(cy))
+    return min(cols, key=lambda c: (c[0] - cx) ** 2 + (c[1] - cy) ** 2)
+
+
+def _origin(t: Terrain, i: int, j: int, dz: int = 8) -> tuple[float, float, float]:
+    x, y, _ = t.cell_centre_world(i, j, 0)
+    return (x, y, _surface_world_z(t, i, j) + dz)
+
+
+def spawn_entities(t: Terrain) -> list[dict]:
+    """Team-based (TDM/KOTH), FFA and objective-mode spawns spread across the playable ground,
+    plus the global start / intermission. The spawn classes needed so the level does not
+    AbortLevel (docs/convert.md 9.2): per team a ``mp_tdm_spawn_*_start`` and the neutral
+    ``mp_tdm_spawn`` / ``mp_dm_spawn`` pools, plus the SD and DOM spawns for those modes."""
     cols = _flat_columns(t)
-    cx, cy = nx // 2, ny // 2
-    cols.sort(key=lambda c: (c[0] - cx) ** 2 + (c[1] - cy) ** 2)
     ents: list[dict] = []
-
-    def at(i, j, dz=16):
-        x, y, _ = t.cell_centre_world(i, j, 0)
-        return (x, y, _surface_world_z(t, i, j) + dz)
-
-    centre = cols[0] if cols else (cx, cy)
-    ents.append({"classname": "info_player_start", "origin": _v(*at(*centre))})
+    centre = _pick(t, cols, 0.0, 0.0)
+    ents.append({"classname": "info_player_start", "origin": _v(*_origin(t, *centre))})
     ents.append(
         {
             "classname": "mp_global_intermission",
-            "origin": _v(*at(*centre, dz=t.block * 6)),
+            "origin": _v(*_origin(t, *centre, dz=t.block * 10)),
             "angles": "20 90 0",
         }
     )
-    west = [c for c in cols if c[0] < cx]
-    east = [c for c in cols if c[0] >= cx]
-    for cls, pool, yaw in (
-        ("mp_tdm_spawn_allies_start", west, 90),
-        ("mp_tdm_spawn_axis_start", east, 270),
+    # Team start lines on opposite ends: allies at -x (yaw 0, facing +x), axis at +x (yaw 180).
+    team_y = (-0.42, -0.16, 0.16, 0.42)
+    west_start = ("mp_tdm_spawn_allies_start", "mp_dom_spawn_allies_start", "mp_sd_spawn_attacker")
+    east_start = ("mp_tdm_spawn_axis_start", "mp_dom_spawn_axis_start", "mp_sd_spawn_defender")
+    for fx, starts, yaw in ((-0.72, west_start, 0), (0.72, east_start, 180)):
+        for fy in team_y:
+            i, j = _pick(t, cols, fx, fy)
+            for cls in starts:
+                ents.append(
+                    {"classname": cls, "origin": _v(*_origin(t, i, j)), "angles": _v(0, yaw, 0)}
+                )
+    # Neutral pools (TDM / FFA / DOM) spread over the middle and flanks.
+    for fx, fy in (
+        (-0.4, -0.4), (0.4, 0.4), (-0.4, 0.4), (0.4, -0.4),
+        (0.0, -0.55), (0.0, 0.55), (-0.6, 0.0), (0.6, 0.0), (0.0, 0.0),
     ):
-        for c in pool[:4] or cols[:4]:
-            ents.append({"classname": cls, "origin": _v(*at(*c)), "angles": _v(0, yaw, 0)})
-    # neutral TDM and FFA spawns spread across the flat columns
-    spread = cols[:: max(1, len(cols) // 10)][:10] if cols else [(cx, cy)]
-    for c in spread:
-        for cls in ("mp_tdm_spawn", "mp_dm_spawn"):
-            ents.append({"classname": cls, "origin": _v(*at(*c)), "angles": "0 0 0"})
+        i, j = _pick(t, cols, fx, fy)
+        for cls in ("mp_tdm_spawn", "mp_dm_spawn", "mp_dom_spawn"):
+            ents.append({"classname": cls, "origin": _v(*_origin(t, i, j)), "angles": "0 0 0"})
+    return ents
+
+
+def objective_entities(t: Terrain) -> list[dict]:
+    """Domination flags (A/B/C) and the two Search & Destroy bomb sites, placed on the ground.
+
+    DOM flags are ``trigger_radius`` points (flag_primary) each with a ``script_origin``
+    descriptor, linked A-B-C. SD uses two bomb sites on the defenders' (+x) side, each a
+    ``bombzone`` radius-use trigger and a bomb model, plus the attackers' plantable bomb. These
+    give the sd / dom scripts the game objects they need without AbortLevel; the radius
+    triggers show the objective (the brush-model plant prompt is left for a release build).
+    """
+    cols = _flat_columns(t)
+    ents: list[dict] = []
+
+    def radius(i, j):
+        return f"{t.block * 2.5:g}"
+
+    # Domination: three flags across the middle, linked A-B-C.
+    links = {"a": "flag_b", "b": "flag_a flag_c", "c": "flag_b"}
+    for label, fx in (("a", -0.45), ("b", 0.0), ("c", 0.45)):
+        i, j = _pick(t, cols, fx, 0.0)
+        ox, oy, oz = _origin(t, i, j, dz=0)
+        ents.append(
+            {
+                "classname": "trigger_radius",
+                "origin": _v(ox, oy, oz),
+                "targetname": "flag_primary",
+                "script_label": f"_{label}",
+                "radius": radius(i, j),
+                "height": f"{t.block * 4:g}",
+                "script_gameobjectname": "dom",
+            }
+        )
+        ents.append(
+            {
+                "classname": "script_origin",
+                "origin": _v(ox, oy, oz + t.block * 2),
+                "targetname": "flag_descriptor",
+                "script_linkname": f"flag_{label}",
+                "script_linkto": links[label],
+                "script_gameobjectname": "dom",
+            }
+        )
+    # Search & Destroy: two bomb sites on the +x (defender) side. Each is the chain the sd
+    # script walks unchecked (patch_mp sd.gsc bombs 466-502): a plant trigger (targetname
+    # "bombzone") targeting the bomb visual, the visual targeting the defuse trigger.
+    for label, fy in (("a", -0.4), ("b", 0.4)):
+        i, j = _pick(t, cols, 0.42, fy)
+        ox, oy, oz = _origin(t, i, j, dz=0)
+        ents.append(
+            {
+                "classname": "trigger_radius_use",
+                "origin": _v(ox, oy, oz),
+                "targetname": "bombzone",
+                "target": f"bombzone_{label}_auto1",
+                "script_gameobjectname": "bombzone",
+                "script_bombmode_original": "1",
+                "script_label": f"_{label}",
+                "radius": radius(i, j),
+                "height": f"{t.block * 3:g}",
+            }
+        )
+        ents.append(
+            {
+                "classname": "script_model",
+                "origin": _v(ox, oy, oz + 2),
+                "angles": "0 90 0",
+                "model": "p_glo_bomb_stack",
+                "targetname": f"bombzone_{label}_auto1",
+                "target": f"bombzone_{label}_auto2",
+                "script_gameobjectname": "bombzone",
+                "spawnflags": "5",
+            }
+        )
+        ents.append(
+            {
+                "classname": "trigger_radius_use",
+                "origin": _v(ox, oy, oz),
+                "targetname": f"bombzone_{label}_auto2",
+                "script_gameobjectname": "bombzone",
+                "radius": radius(i, j),
+                "height": f"{t.block * 3:g}",
+            }
+        )
+    # The attackers' plantable bomb and its pickup trigger, on the -x side.
+    i, j = _pick(t, cols, -0.42, 0.0)
+    ox, oy, oz = _origin(t, i, j, dz=0)
+    ents.append(
+        {
+            "classname": "trigger_radius",
+            "origin": _v(ox, oy, oz),
+            "targetname": "sd_bomb_pickup_trig",
+            "script_gameobjectname": "sd",
+            "radius": radius(i, j),
+            "height": f"{t.block * 3:g}",
+        }
+    )
+    ents.append(
+        {
+            "classname": "script_model",
+            "origin": _v(ox, oy, oz + 2),
+            "angles": "0 270 0",
+            "model": "prop_suitcase_bomb",
+            "targetname": "sd_bomb",
+            "script_gameobjectname": "sd",
+            "spawnflags": "4",
+        }
+    )
     return ents
 
 
@@ -291,7 +414,7 @@ def light_grid_brush(t: Terrain) -> list[str]:
     (x0, y0, _), (x1, y1, _) = t.world_bounds()
     zlo = t.origin[2] + t.sea_level * t.block
     zhi = t.origin[2] + t.shape[2] * t.block
-    return _axis_brush((x0 + 8, y0 + 8, zlo), (x1 - 8, y1 - 8, zhi), LIGHT_GRID, 64)
+    return _axis_brush((x0 + 8, y0 + 8, zlo), (x1 - 8, y1 - 8, zhi), LIGHT_GRID, t.block)
 
 
 def map_text(t: Terrain, boxes: list[Box], scale: int | None = None, light_grid: int = 3) -> str:
@@ -312,7 +435,11 @@ def map_text(t: Terrain, boxes: list[Box], scale: int | None = None, light_grid:
     lines += light_grid_brush(t)
     lines.append("}")
     ents = (
-        spawn_entities(t) + primary_lights(t, grid=light_grid) + compass_corners(t) + path_nodes(t)
+        spawn_entities(t)
+        + objective_entities(t)
+        + primary_lights(t, grid=light_grid)
+        + compass_corners(t)
+        + path_nodes(t)
     )
     for i, e in enumerate(ents, 1):
         lines.append(f"// entity {i}")
