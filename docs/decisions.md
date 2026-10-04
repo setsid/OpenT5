@@ -110,3 +110,16 @@ headless, so it is flagged for an interactive check (it falls back to wireframe)
 **Final exe:** rebuilt from HEAD after all features, sha1 3b329952, both smoke
 tests green, delivered to opent5-hwtest/OpenT5-0.2.0-preview/ (your 0.1.0 install
 untouched).
+
+**Loader cleared; fixC/fixD built, blocky map parked at cod2rad.** With the loader
+freed, fixC (SD radius triggers) and fixD (path nodes) compiled and converted:
+both reparse exactly, 0 unresolved pointers, emulated loader consumes them exactly
+(53185 and 53195 conversions, 0 outside block), verify ok, all 12 modes ready.
+Delivered to opent5-hwtest/nuked/k_box_fixC and k_box_fixD with checklists.
+The blocky map is parked: cod2map writes the BSP and grid fine, but cod2rad
+crashes (exit -1, no console output through the loader) even on a reduced 20x20x16
+map. The lightmap material matches the working box maps, so the cause is the
+blocky geometry (many brushes, caves, or the water slab) rather than the grid or
+lightmap. Next: capture cod2rad's real output (run cod2rad.exe outside the loader,
+or find its log), or build a variant without water and caves to isolate it. The
+generator and textures are sound and committed; only the cod2rad bake fails.

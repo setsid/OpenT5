@@ -71,8 +71,10 @@ opent5-hwtest/nuked/
 opent5-hwtest/OpenT5-0.2.0-preview/ holds the 0.2.0 exe and its screenshots for
 review. Your installed 0.1.0 at Desktop\OpenT5\ is untouched.
 
-Not built tonight (PC compile blocked, see Parked): k_box_fixC, k_box_fixD, and
-the blocky-map demos. Commands are staged for the morning.
+fixC and fixD are now built (loader cleared): opent5-hwtest/nuked/k_box_fixC
+(sha1 3c31a0f0) and k_box_fixD (sha1 503d5638), each with a CHECKLIST. Both pass
+the offline checks (exact reparse, emulated loader, verify, 12 modes ready).
+The blocky-map PC compile is parked at cod2rad (see Parked).
 
 ## Proven offline vs needs a device run
 
