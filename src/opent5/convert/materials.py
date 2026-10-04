@@ -623,21 +623,10 @@ def _convert_one(
         target = im if isinstance(im, dict) else getattr(im, "target", None)
         iname = target.get("name") if isinstance(target, dict) else getattr(im, "name", None)
         stock_name = iname if iname in scan.images else "," + str(iname)
-        if stock_name in scan.images:
-            struct.pack_into(">I", raw, 0xC, scan.images[stock_name])
-            result.base_nodes.append(t)
-            images[iname] = {"action": f"reused: the base zone's {stock_name!r}"}
-        elif isinstance(target, dict) and id(target) in converted:
-            if isinstance(im, dict):
-                raise ConvertError(f"image {iname!r}: loaded inline twice in the PC zone")
-            struct.pack_into(">I", raw, 0xC, im.raw)
-            images[iname] = {"action": "alias to its first converted use"}
-        elif not isinstance(im, dict):
-            raise ConvertError(
-                f"material {name!r}: image {iname!r} is an alias to an image the converter does "
-                "not write (loaded by a material that is reused from the base); use force for it"
-            )
-        elif iname in overrides:
+        if isinstance(im, dict) and iname in overrides:
+            # The map's own art wins, even when an image of this name also exists in the base
+            # zone (plank/water/cobble borrow mp_nuked colour maps; without this they would be
+            # reused from the base at line below and show its texture). Written inline here.
             new = override_image(target, overrides[iname])
             struct.pack_into(">I", raw, 0xC, PTR_INLINE)
             target.clear()
@@ -652,6 +641,20 @@ def _convert_one(
                 "size": list(struct.unpack_from(">2H", h, 8)),
                 "bytes": len(new["pixels"]),
             }
+        elif stock_name in scan.images:
+            struct.pack_into(">I", raw, 0xC, scan.images[stock_name])
+            result.base_nodes.append(t)
+            images[iname] = {"action": f"reused: the base zone's {stock_name!r}"}
+        elif isinstance(target, dict) and id(target) in converted:
+            if isinstance(im, dict):
+                raise ConvertError(f"image {iname!r}: loaded inline twice in the PC zone")
+            struct.pack_into(">I", raw, 0xC, im.raw)
+            images[iname] = {"action": "alias to its first converted use"}
+        elif not isinstance(im, dict):
+            raise ConvertError(
+                f"material {name!r}: image {iname!r} is an alias to an image the converter does "
+                "not write (loaded by a material that is reused from the base); use force for it"
+            )
         elif iname in shared:
             struct.pack_into(">I", raw, 0xC, PTR_INLINE)
             target.clear()
