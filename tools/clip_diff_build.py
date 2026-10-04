@@ -82,14 +82,14 @@ def main() -> int:
     work_dir.mkdir(parents=True, exist_ok=True)
     base = base_map_text()
     clip = inject_clip(base)
-    write_map(work_dir / "mp_clipdiff_a.map", base)
-    write_map(work_dir / "mp_clipdiff_b.map", clip)
+    write_map(work_dir / "mp_opent5cda.map", base)
+    write_map(work_dir / "mp_opent5cdb.map", clip)
     import json
     rep = {}
     import os
     if not os.environ.get("ONLY_B"):
-        rep["a"] = compile_map("mp_clipdiff_a", work_dir)
-    rep["b"] = compile_map("mp_clipdiff_b", work_dir)
+        rep["a"] = compile_map("mp_opent5cda", work_dir)
+    rep["b"] = compile_map("mp_opent5cdb", work_dir)
     print(json.dumps(rep, indent=1))
     return 0
 

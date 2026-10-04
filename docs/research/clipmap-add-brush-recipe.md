@@ -1,10 +1,14 @@
 # Recipe: what cod2map does to the clipMap when a clip brush is added
 
-Status: collision ground-truth R&D, after p_clip_a (the BSP-leaf fix) still had no
-collision on device. Goal: read off exactly what the real compiler changes in the
-clipMap when one clip brush is added, compare it to `opent5.convert.propclip.add_clip_bsp`,
-and use that plus offline structural checks to find why a converter-added clip is not
-solid on hardware.
+Status: RESOLVED. The root cause is the brushVerts contiguity invariant (see "Root
+cause" below). Device confirmed p_clip_move (an existing clip re-leafed to the test
+spot, numBrushes unchanged) is SOLID, and p_clip_a (an appended clip) walked through.
+The fix is in `opent5.convert.propclip.add_clip_bsp` (contiguous brushVerts append) and
+is staged as p_clip_add for device confirmation.
+
+Goal (original): read off what the real compiler changes in the clipMap when a clip
+brush is added, compare it to `add_clip_bsp`, and find why a converter-added clip was
+not solid on hardware.
 
 Build base: `fix/clip-trace-recipe` off `fix/clip-trace-miss`.
 
@@ -137,47 +141,15 @@ the leafBrushes/leafBrushNode append all remain live suspects. `p_clip_move` (mo
 clip, no `numBrushes` growth) is the next test and will separate the append hypothesis from the
 rest; p_clip_c would separately retest the leaf-assignment hypothesis if staged.
 
-## What is still missing (the gap, not closed)
+## How the gap was closed
 
-The offline oracle reports p_clip_a solid while the device shows walk-through, so the gap is not
-captured by the structural checks. Unproven suspects, none yet eliminated by device results:
-
-1. **Load-time collision structures sized from the original brush count.** `CM_LoadMap` allocates
-   per-brush runtime state (checkcount / box-brush / broadphase). If any of these is sized or
-   indexed from a count that the appended brush exceeds, or from an array the converter did not
-   grow, a brush appended past the original `numBrushes` would never be tested. `p_clip_move`
-   (no `numBrushes` growth) tests this directly. It cannot be confirmed from the stripped ELF here.
-1a. **Leaf assignment / the engine descending to a different leaf than `BspLocator`.** Still open:
-   p_clip_c (clip attached only to empty leaves) was never device-tested, so we have no evidence
-   that attaching to the reachable trace leaf is sufficient or that attaching to empty leaves fails.
-2. **The engine's point->leaf descent differing from `BspLocator`.** `reachable_brushes` and
-   `locate` were validated only against stock reachability, which is self-consistent but not a
-   direct check that the engine descends 204,-47 to leaf 596.
-3. **The one-element pool pads** the converter inserts into `leafBrushes` / `brushVerts` on first
-   append (reparse-exact and oracle-clean, but untested on device in isolation).
-
-## Recommended next device test (cheap, decisive)
-
-To separate "a brush appended past the original `numBrushes` is never traced" (suspect 1) from
-everything else, do **not** grow the brushes array. Instead **move an existing stock axial
-player-clip** (e.g. brush 82, or one of the other ten) to the test spot with `move_clip_bsp`.
-That keeps `numBrushes` unchanged (it reuses the brush index) though it still appends to the
-`leafBrushes` and `leafBrushNodes` pools to re-reference the moved brush from the new leaf, so it
-isolates the brushes-array append specifically. Stage that and test:
-
-- if the moved existing clip **is** solid at the new spot, the cause is the brushes-array append
-  (a load-time structure sized to or keyed by the original brush set), and the converter must
-  re-sort/rebuild as cod2map does, or grow whatever runtime array is missed;
-- if the moved existing clip is **also** walk-through, the cause is in the leafBrushes /
-  leafBrushNodes append, the leaf descent, or the placement, and the next step is a faithful
-  CM_BoxTrace (which needs the collision routines located in an unstripped or symbolised t5mp).
-
-(`move_clip_bsp` needs the parsing `Rewrite` passed to `ClipMap`, as the production converter does;
-it raises `ClipError` otherwise.)
-
-p_clip_d was **not** staged: the gate ("the trace reports solid offline AND reproduces reality")
-cannot be met, because the offline oracle already reports p_clip_a solid yet the device disagrees,
-so staging another appended clip would only reproduce p_clip_a.
+At the time of the first write-up the offline structural oracle reported p_clip_a solid while the
+device showed walk-through, so the cause was not captured by the leaf/reachability checks. The
+decisive step was p_clip_move: an existing stock clip re-leafed to the test spot (no `numBrushes`
+growth). The device showed it SOLID, which isolated the cause to the brushes/brushVerts growth of
+the append. The `brushVerts` contiguity analysis above then pinned it exactly: the one-element pad
+the converter inserted into `brushVerts` broke the running-count layout the engine relies on. The
+"Root cause", "The fix", and "p_clip_add" sections above record the resolution.
 
 ## p_clip_move (staged, the diagnostic build)
 
@@ -216,10 +188,101 @@ grow, unlike the appended p_clip_a):
   itself is still unproven (p_clip_c was never device-tested). The next step needs a faithful
   CM_BoxTrace from a symbolised t5mp.
 
+## Root cause (confirmed): the brushVerts contiguity invariant
+
+Device result settled it: **p_clip_move (an existing stock clip, brush 82, re-leafed to
+the test spot with `numBrushes` unchanged) is SOLID; p_clip_a (a brush appended past the
+original `numBrushes`) walks through.** The two edits differ only in that the append grows
+the `brushes` array (+1) and the `brushVerts` pool, while the move rewrites in place. The
+discriminating structure is **`brushVerts`**.
+
+Evidence (`tools/clip_verts_check.py`, PS3 big-endian):
+
+- In retail mp_nuked, `brushVerts` is strictly contiguous in brush-index order: every
+  brush's verts sit at the running sum of the earlier brushes' vert counts,
+  `verts_ptr[i] == base + 12 * Sum(numverts[0..i-1])` — **0 mismatches across all 5890
+  brushes**, and the running total equals `numBrushVerts` (48747) exactly. The engine
+  addresses a brush's collision verts by this running count, not by the stored `verts`
+  pointer.
+- p_clip_move: contiguity perfect (0 mismatches) -> solid on device.
+- p_clip_a: **1 mismatch, at the appended brush 5890** — its verts sit 12 bytes (one vec3)
+  past the running-count position, because the converter's pool append
+  (`ClipMap._append_pool`) inserts a one-element pad at the pool's old end so the appended
+  pointer clears the allocation boundary (`brushVerts` is immediately followed by `uinds`).
+  That pad shifts the appended brush off its running-count slot, so the engine reads the
+  pad (zeros) instead of the clip's corners and the brush collides with nothing. This is
+  the p_clip_a walk-through, reproduced and explained offline.
+
+So p_clip_a had a correct `verts` pointer yet failed: proof the engine uses the running
+count, not the pointer. The move preserved contiguity because it rewrites verts in place.
+
+Secondary finding (not the failure, but cod2map does it and we did not): cod2map keeps
+`box_model.leaf.leafBrushNode` pointing at the last `leafBrushNode` and renumbers it when
+nodes are inserted (box diff: 8 -> 15). Appending nodes at the end (as the converter does)
+leaves the box-hull node in place, so `box_model.leaf.leafBrushNode` stays valid without an
+update; no fix needed for the append-at-end path.
+
+## The fix (task 2): `add_clip_bsp` appends brushVerts contiguously
+
+`ClipMap.append_verts_contiguous` appends the eight corner verts to `brushVerts` with NO
+boundary pad, so the appended brush's verts sit exactly at the running-count position and
+the pool stays contiguous. The stored `verts` pointer is set to that position; because the
+following allocation (`uinds`) begins at the boundary, the Rewrite resolves the pointer to
+that neighbour, which is harmless since the engine ignores the stored pointer for collision
+verts. `add_clip_bsp` now uses this instead of the padded `append_verts`. The padded path is
+parked (kept only for `add_clip`, the synthetic-test fallback).
+
+A full re-sort/rebuild of the brush array (what the compiler does internally) is NOT needed:
+appending the new brush at the end with contiguous verts satisfies the invariant (the new
+brush's verts are the new tail), and the move proved re-leafing a brush into the trace leaf
+works. This keeps every stock brush untouched.
+
+## Offline verification (task 3)
+
+- `test_propclip.py`: passes (the `add_clip_bsp` tests now exercise the contiguous path).
+- `tools/convert_map.py oracle` on p_clip_add: reparse-exact (`blocks_end_at_header` true),
+  `consumed_exactly` true, 109497/109497 pointers identical (`same_fields`/`same_values`),
+  `targets_outside_their_block` 0, `clipmap_world_leaf_problems` 0,
+  `clipmap_leaf_contents_problems` 0.
+- brushVerts contiguity: 0 mismatches; running total 48755 == `numBrushVerts` 48755.
+- `clip_oracle solid`: the new clip (brush 5890) is solid at (204,-47,*), leaf 596.
+- Unchanged stock clips (brushes 82, 83, 102, 107): record byte-identical ignoring the
+  re-encoded `verts_ptr`, and their verts read by running count are identical to pristine, so
+  stock collision is undisturbed.
+- Zone rebuild round-trip (`tests/test_cli.py::test_rebuild_is_byte_identical`): passes. The
+  change is confined to `add_clip_bsp`, outside the parse/rebuild path.
+
+## p_clip_add (staged, the proof build)
+
+Staged at `/mnt/c/Users/bolst/Desktop/opent5-hwtest/nuked/p_clip_add/mp_nuked.ff`
+(`tools/stage_clip_add.py`). A genuinely NEW clip brush (numBrushes grows), the cod2map way.
+
+- **Landmark:** the central road crossing between the two houses, slightly east of map
+  centre (204,-47) — the same spot as p_clip_move, so the only change from the solid
+  p_clip_move is that the clip is NEW (appended) rather than an existing brush re-leafed. The
+  west and east team spawn clusters sit either side, so a player crossing the middle walks
+  into it; the marker prop stands at the wall.
+- **New brush:** index **5890**, bounds **(180,-147,-48)..(228,53,112)** (thin in X, the
+  travel axis; wide in Y; tall in Z), contents 0x08030200, numsides 0, 8 contiguous verts.
+- **Marker prop:** central collidable prop 28 and its GfxWorld draw inst 434 moved to
+  (204,-47,-20) (render-only; `numStaticModels` unchanged).
+- **Counts:** numBrushes 5890 -> 5891; numBrushVerts 48747 -> 48755; numStaticModels 1385
+  unchanged.
+- **Second spot for the user to confirm nothing shifted:** the **bus in the centre of the
+  map** — its invisible player-clip shell (stock brushes 83, 102, 104, 107, unchanged) must
+  still block exactly as in stock. (The re-sort was not needed, so no stock brush moved; the
+  bus is a clear reference the player passes.)
+- **File sha1:** `fab14aecbaf1be9cad4429a8608bdfb2750a01d8`.
+
+Device reading: if p_clip_add is solid, a NEW appended clip now works and the fix is proven;
+the bus must still be solid (nothing else shifted).
+
 ## Tools (scratch, this branch)
 
 - `tools/clip_diff_build.py` - builds the two box maps and runs the real toolchain.
 - `tools/clip_diff_parse.py` - diffs two compiled PC clipMaps.
 - `tools/clip_oracle.py` - the offline structural check (`validate` / `solid`).
-- `tools/stage_clip_move.py` - stages p_clip_move (moves clip 82 + marker prop 28), repacks the
-  PS3 .ff, and verifies the whole gate.
+- `tools/clip_verts_check.py` - checks the brushVerts contiguity invariant on a zone.
+- `tools/stage_clip_move.py` - stages p_clip_move (moves clip 82 + marker prop 28).
+- `tools/stage_clip_add.py` - stages p_clip_add (NEW brush via the fixed `add_clip_bsp` +
+  marker prop), repacks the PS3 .ff, and verifies the whole gate.

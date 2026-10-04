@@ -287,12 +287,47 @@ class ClipMap:
     def append_verts(self, mins: Vec3, maxs: Vec3) -> int:
         """Append a brush's eight corner verts to the ``brushVerts`` pool; returns
         the pointer for the brush's +0x58 field. Returns 0 when the clipMap has no
-        brushVerts pool (no brushes carry verts)."""
+        brushVerts pool (no brushes carry verts).
+
+        PADDED append (the parked path): leaves one boundary element so the returned
+        pointer resolves to the appended tail. This breaks brushVerts contiguity, so
+        it is kept only for the synthetic tests; the device fix uses
+        ``append_verts_contiguous`` (see its note)."""
         if self.node.get("brush_verts") is None:
             return 0
         ptr = self._append_pool("brush_verts", box_corner_verts(mins, maxs), 12)
         self._hset(_H_NUM_BRUSHVERTS, len(self.node["brush_verts"]) // 12)
         return ptr
+
+    def append_verts_contiguous(self, mins: Vec3, maxs: Vec3) -> int:
+        """Append a brush's eight corner verts to ``brushVerts`` with NO boundary
+        pad, keeping the pool strictly contiguous in brush-index order.
+
+        cod2map lays ``brushVerts`` out so that each brush's verts sit at the running
+        sum of the earlier brushes' vert counts (verified on retail mp_nuked: 0
+        mismatches across 5890 brushes), and the engine addresses a brush's collision
+        verts by that running count, not by the stored ``verts`` pointer. The padded
+        append (``append_verts`` / ``_append_pool``) inserts one unused vec3 at the
+        pool's old end to keep the returned pointer off the allocation boundary; that
+        one element shifts the appended brush off its running-count position, so the
+        engine reads the pad (zeros) instead of the brush's corners and the brush
+        collides with nothing. This is the cause of the p_clip_a walk-through on
+        device (p_clip_a had a 12-byte gap at the appended brush; p_clip_move, which
+        rewrites verts in place, had none and was solid).
+
+        So the verts go at the pool's old end with no gap, and the returned pointer is
+        the running-count position. Because an immediately following allocation
+        (``uinds``) begins at that boundary, the Rewrite resolves this pointer to that
+        neighbour rather than to the appended bytes; that is harmless because the
+        engine ignores the stored pointer for collision verts (it uses the running
+        count), and the appended bytes themselves are contiguous and correct."""
+        if self.node.get("brush_verts") is None:
+            return 0
+        block, mem = self._orig_alloc("brush_verts")
+        inner = len(self.node["brush_verts"])  # old end = the new brush's running-count position
+        self.node["brush_verts"] = self.node["brush_verts"] + box_corner_verts(mins, maxs)
+        self._hset(_H_NUM_BRUSHVERTS, len(self.node["brush_verts"]) // 12)
+        return ((block << _OFFSET_BLOCK_SHIFT) | ((mem + inner) & _OFFSET_MASK)) + 1
 
     # brushes ------------------------------------------------------------------------------
 
@@ -873,11 +908,15 @@ def add_clip_bsp(
     leaf(s) a trace through its box reaches (``BspLocator``), so it is actually
     hit, then assert the brush is reachable from the box centre's leaf. Use this,
     not ``add_clip``, for a free-standing prop clip; raises ``ClipError`` if the
-    box reaches no leaf or the post-attach reachability check fails."""
+    box reaches no leaf or the post-attach reachability check fails.
+
+    The verts are appended contiguously (``append_verts_contiguous``): an appended
+    brush's verts must sit at the running-count position cod2map uses, or the engine
+    reads the wrong bytes and the brush does not collide (the p_clip_a cause)."""
     leaves = locator.leaves_for_box(mins, maxs)
     if not leaves:
         raise ClipError("clip box locates to no world leaf (outside the BSP)")
-    verts_ptr = cm.append_verts(mins, maxs)
+    verts_ptr = cm.append_verts_contiguous(mins, maxs)
     numverts = 8 if verts_ptr else 0
     brush_index = cm.append_brush(
         clip_cbrush(mins, maxs, contents, surface_flags, verts_ptr, numverts)
