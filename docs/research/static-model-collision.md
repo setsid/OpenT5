@@ -69,3 +69,24 @@ at header) and verify.
 - The aabb tree being triangle collision means a terrain map built from tris (not brushes) would
   need the aabb tree generated for its terrain to be solid; our generated maps use brushes, so
   this does not block them, but a future tri-based generator would need it.
+
+## Device result (p_route_b) and the decision
+
+Tested on device by moving the Nuketown school bus +300 X, editing only its cStaticModel_s and
+its GfxStaticModelDrawInst: the bus RENDERS at the new spot but is walk-through there, and the OLD
+spot keeps an invisible wall exactly where the bus was. So **collision does not follow
+cStaticModel_s. Route B is dead. The editor's prop collision is locked to Route A (clip cbrushes).**
+
+What the stock bus's collision actually is (follow-up): a cluster of clip cbrushes, not baked
+triangles. Brushes overlapping the bus footprint include brush 5169 at (-189,-266,-80)..(-1,169,56),
+size 188x435x136 (the bus volume), plus ~6-8 thinner brushes forming the shell; only 25 of 4644
+collision-tri verts fall in the footprint (scattered, not a bus mesh). cbrush_t carries mins/maxs,
+so these are identifiable by their AABB. Consequence for the editor: a prop's collision is a set of
+clip cbrushes, so moving or deleting a prop means moving or removing the cbrushes whose AABB sits in
+its footprint (a cluster, not one brush). This applies to stock props too, not only editor-added
+ones.
+
+Also seen on device: the bus's BAKED LIGHTMAP SHADOW stays at the old spot as a black slab on the
+road. The editor cannot re-bake lightmaps (that is cod2rad), so a moved prop leaves its baked shadow
+behind. The editor must at least warn on moving a prop that casts a baked shadow; proper relighting
+is out of v0.3.0 scope.
