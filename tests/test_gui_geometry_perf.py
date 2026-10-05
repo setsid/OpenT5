@@ -90,3 +90,47 @@ def test_vectorised_build_is_materially_faster_than_the_loop():
     loop = _best(lambda: geometry._with_static_models_loop(xfile, asset, world))
     vec = _best(lambda: geometry.with_static_models(xfile, asset, world))
     assert vec < loop / 2.0, f"vectorised {vec * 1000:.0f} ms, loop {loop * 1000:.0f} ms"
+
+
+def _run_textures(doc, mesh):
+    xfile = doc.xfile
+    for key in [k for k in geometry._texcache if k[0] == id(xfile)]:
+        del geometry._texcache[key]
+    return geometry.textures(doc, mesh)
+
+
+@pytest.mark.zones
+def test_parallel_texture_decode_matches_serial(monkeypatch):
+    """Decoding colour maps across a thread pool gives the exact same tri_tex and texture list,
+    in the same order, as a single-threaded decode."""
+    doc = ZoneDoc.open(retail_zone("mp_nuked"))
+    mesh = geometry.mesh(doc, "world_models", None)
+    tri_tex_p, tex_p = _run_textures(doc, mesh)
+    monkeypatch.setattr(geometry, "_TEXTURE_WORKERS", 1)
+    tri_tex_s, tex_s = _run_textures(doc, mesh)
+    assert np.array_equal(tri_tex_p, tri_tex_s)
+    assert len(tex_p) == len(tex_s)
+    for a, b in zip(tex_p, tex_s, strict=True):
+        assert a.shape == b.shape
+        assert np.array_equal(a, b)
+
+
+@pytest.mark.zones
+def test_parallel_texture_decode_is_faster(monkeypatch):
+    """The thread pool decodes the map's colour maps materially faster than serial. A modest
+    1.5x bar (measured ~3x on an eight-core box) so the test is not flaky on a busy machine."""
+    doc = ZoneDoc.open(retail_zone("mp_nuked"))
+    mesh = geometry.mesh(doc, "world_models", None)
+    if (os.cpu_count() or 1) < 2:
+        pytest.skip("no second core to parallelise onto")
+
+    start = time.perf_counter()
+    _run_textures(doc, mesh)
+    parallel = time.perf_counter() - start
+    monkeypatch.setattr(geometry, "_TEXTURE_WORKERS", 1)
+    start = time.perf_counter()
+    _run_textures(doc, mesh)
+    serial = time.perf_counter() - start
+    assert (
+        parallel < serial / 1.5
+    ), f"parallel {parallel * 1000:.0f} ms, serial {serial * 1000:.0f} ms"

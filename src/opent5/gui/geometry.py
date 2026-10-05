@@ -21,6 +21,7 @@ an index into ``MeshData.materials`` for the shaded, textured renderer.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import numpy as np
@@ -161,20 +162,78 @@ def _downscale(rgba: np.ndarray, maxdim: int = TEXTURE_MAX) -> np.ndarray:
     return np.ascontiguousarray(rgba, np.uint8)
 
 
+#: How many threads decode colour maps at once. Decode is numpy (GIL dropped) mixed with
+#: reading one shared disk, so a few workers win most of the speedup and more only add
+#: contention; measured best around four on an eight-core WSL box reading off a 9p mount.
+_TEXTURE_WORKERS = min(8, max(1, os.cpu_count() or 1))
+
+
+def _decode_colormaps_parallel(doc, named_nodes: list) -> dict:
+    """Decode ``[(name, colormap_node), ...]`` across a thread pool, each worker using its own
+    ``PakSet`` (one open file handle per slot, so no shared seek), and return ``{name: rgba or
+    None}``. Falls back to a single-threaded decode (one shared PakSet) for one item or when a
+    pool cannot be made, so the path is always safe."""
+    from opent5.export.images import PakSet
+    from opent5.gui.backend import pak_dirs
+
+    folders = pak_dirs(doc.path)
+    zone = doc.zone_name
+    if len(named_nodes) <= 1 or _TEXTURE_WORKERS <= 1:
+        paks = PakSet(zone, folders)
+        try:
+            return {name: _decode_one_colormap(node, paks) for name, node in named_nodes}
+        finally:
+            paks.close()
+
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    local = threading.local()
+    opened: list = []
+    opened_lock = threading.Lock()
+
+    def worker_paks() -> PakSet:
+        paks = getattr(local, "paks", None)
+        if paks is None:
+            paks = local.paks = PakSet(zone, folders)
+            with opened_lock:
+                opened.append(paks)
+        return paks
+
+    def decode(item):
+        name, node = item
+        return name, _decode_one_colormap(node, worker_paks())
+
+    try:
+        with ThreadPoolExecutor(max_workers=_TEXTURE_WORKERS) as pool:
+            return dict(pool.map(decode, named_nodes))
+    finally:
+        for paks in opened:
+            paks.close()
+
+
+def _decode_one_colormap(node, paks) -> np.ndarray | None:
+    """Decode one material's colour map to a downscaled RGBA array, or None when it has no
+    colour map or cannot be decoded. Pure and uncached: it touches only its arguments, so it is
+    safe to run on a worker thread given that worker's own ``PakSet``."""
+    if node is None:
+        return None
+    from opent5.export.images import ImageError, decode_image
+
+    try:
+        decoded = decode_image(node, paks)
+        if decoded.layers:
+            return _downscale(decoded.layers[0][1])
+    except (ImageError, ValueError, KeyError, IndexError, TypeError):
+        return None
+    return None
+
+
 def _decode_colormap(xfile, name: str, node, paks) -> np.ndarray | None:
     key = (id(xfile), name)
     if key in _texcache:
         return _texcache[key]
-    from opent5.export.images import ImageError, decode_image
-
-    rgba = None
-    if node is not None:
-        try:
-            decoded = decode_image(node, paks)
-            if decoded.layers:
-                rgba = _downscale(decoded.layers[0][1])
-        except (ImageError, ValueError, KeyError, IndexError, TypeError):
-            rgba = None
+    rgba = _decode_one_colormap(node, paks)
     _texcache[key] = rgba
     return rgba
 
@@ -187,26 +246,34 @@ def textures(doc, mesh: MeshData):
     -1 where there is none (no material, an undecodable colour map, or a streamed
     texture whose .pak is absent). Textures that cannot be decoded fall back to a
     flat shade this way. Pure CPU, safe to call on a worker thread."""
-    from opent5.export.images import PakSet
-    from opent5.gui.backend import pak_dirs
-
     xfile = _xfile(doc)
     mats = mesh.materials
     if not mats or mesh.groups is None:
         return np.full(len(mesh.triangles), -1, np.int32), []
     h = _helper(xfile)
     cmaps = _colormap_nodes(h)
-    paks = PakSet(doc.zone_name, pak_dirs(doc.path))
-    try:
-        slot_of_name: dict[str, int] = {}
-        texture_list: list[np.ndarray] = []
-        for name in dict.fromkeys(m for m in mats if m):
-            rgba = _decode_colormap(xfile, name, cmaps.get(name), paks)
-            if rgba is not None:
-                slot_of_name[name] = len(texture_list)
-                texture_list.append(rgba)
-    finally:
-        paks.close()
+    names = list(dict.fromkeys(m for m in mats if m))
+    # A map has hundreds of distinct colour maps; decoding each is independent, pure numpy
+    # (which drops the GIL) and bound partly on reading the .pak, so they decode across a small
+    # thread pool. Only the uncached ones, and each worker reads through its own PakSet because
+    # a PakSet keeps one file handle per slot and a shared seek+read is not thread-safe.
+    rgbas: dict[str, np.ndarray | None] = {}
+    todo = [n for n in names if (id(xfile), n) not in _texcache]
+    for n in names:
+        if (id(xfile), n) in _texcache:
+            rgbas[n] = _texcache[(id(xfile), n)]
+    if todo:
+        decoded = _decode_colormaps_parallel(doc, [(n, cmaps.get(n)) for n in todo])
+        for n, rgba in decoded.items():
+            _texcache[(id(xfile), n)] = rgba
+            rgbas[n] = rgba
+    slot_of_name: dict[str, int] = {}
+    texture_list: list[np.ndarray] = []
+    for name in names:  # names order, so the slots match a serial decode exactly
+        rgba = rgbas.get(name)
+        if rgba is not None:
+            slot_of_name[name] = len(texture_list)
+            texture_list.append(rgba)
     group_slot = np.full(len(mats), -1, np.int32)
     for i, name in enumerate(mats):
         group_slot[i] = slot_of_name.get(name, -1) if name else -1
