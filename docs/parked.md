@@ -11,3 +11,8 @@ per branch. Each line: what, where, and why it is parked.
 - Lint debt on v0.3.0: `ruff check src tests tools` reports pre-existing errors (the bulk in
   `tools/`), plus two E501 lines in `mapwriter.path_nodes` / `preview`. Not introduced by the
   editor work. Worth a separate formatting/lint pass.
+- `tests/test_update_release.py::test_release_refuses_dirty_tree_and_existing_tag` fails on
+  v0.4.0. `tools/release.preflight` runs `check_versions` before the dirty check, and the
+  branch's version files are still pinned to 0.3.0, so it raises the version-mismatch refusal
+  instead of the "dirty" one the test expects. Pre-existing, in the release tooling, unrelated
+  to the editor. It clears once the version is bumped for the 0.4.0 release.

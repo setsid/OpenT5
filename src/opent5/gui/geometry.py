@@ -110,6 +110,15 @@ def mesh(doc, kind: str, index: int | None = None) -> MeshData:
     return out
 
 
+def drop_static_models(doc) -> None:
+    """Forget the cached world+models mesh for this zone, so a rebuild re-reads the edited
+    static-model placements (a moved, added or deleted prop). The plain world mesh is kept, as
+    only the placed models change."""
+    xfile = _xfile(doc)
+    for key in [k for k in _cache if k[0] == id(xfile) and k[1] == "world_models"]:
+        del _cache[key]
+
+
 def model_mesh(zdoc, node, name: str) -> MeshData:
     """LOD0 of an XModel node loaded inside another asset."""
     xfile = _xfile(zdoc)
@@ -246,6 +255,8 @@ def with_static_models(xfile, asset, world: MeshData) -> MeshData:
     group_id = len(materials)
     at, placed, missing = n_world, 0, 0
     for p in placements:
+        if not p["scale"]:  # a deleted/hidden prop: a degenerate scale-0 placement draws nothing
+            continue
         node = h.index.get(T.XMODEL, p["model"])
         try:
             parts = h.model_lod0(node) if node is not None else None
