@@ -171,11 +171,13 @@ def rotated_box_aabb_z(mins, maxs, centre, degrees: float) -> tuple[tuple, tuple
     )
 
 
-def project_point(point, eye, right, up, forward, focal: float, w: int, h: int):
+def project_point(point, eye, right, up, forward, focal: float, w: int, h: int, ortho_scale=None):
     """Screen position of a world point for the viewer's camera: ``(sx, sy, depth,
     in_front)``. The basis vectors and focal length are the camera's own (see
     ``mesh.Camera.basis`` and ``mesh.focal``), so a billboarded marker lands exactly where
-    the wireframe would draw the point."""
+    the wireframe would draw the point. Pass ``ortho_scale`` (pixels per world unit, from
+    ``mesh.Camera.ortho_scale``) to project under the parallel projection instead, so markers
+    and the gizmo land correctly in the Top / Front / Side views."""
     p = np.asarray(point, np.float64)
     e = np.asarray(eye, np.float64)
     rel = p - e
@@ -184,6 +186,8 @@ def project_point(point, eye, right, up, forward, focal: float, w: int, h: int):
     z = float(rel @ np.asarray(forward, np.float64))
     if z <= EPS:
         return 0.0, 0.0, z, False
+    if ortho_scale is not None:
+        return w / 2.0 + ortho_scale * x, h / 2.0 - ortho_scale * y, z, True
     sx = w / 2.0 + focal * x / z
     sy = h / 2.0 - focal * y / z
     return sx, sy, z, True

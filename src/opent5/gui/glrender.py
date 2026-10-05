@@ -157,9 +157,44 @@ class ShadedRenderer:
         self._loc = {}
         self._fbo = None  # reused across frames, rebuilt only when the size changes
         self._fbo_size = (0, 0)
+        self._usable = None  # tri-state cache for usable(): None until probed
 
     def available(self) -> bool:
         return self._ensure_context()
+
+    def usable(self) -> bool:
+        """Whether GL can actually draw here, not merely create a context. A headless session
+        (offscreen WSL has no real GPU) can hand back a context whose shader, texture and draw
+        calls never reach the framebuffer, so ``available()`` passes but every frame comes back
+        blank. This renders a tiny textured quad through the real pipeline and checks the output
+        actually varies; a blank result means the pipeline is dead and shaded mode must stay
+        off. Cached, so it probes once and leaves the real scene untouched."""
+        if self._usable is None:
+            self._usable = self._probe()
+        return self._usable
+
+    def _probe(self) -> bool:
+        if not self._make_current():
+            return False
+        try:
+            saved = self._scene  # the probe uploads its own scene; put the real one back after
+            pos = np.array([[-1, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0]], np.float32)
+            tris = np.array([[0, 1, 2], [0, 2, 3]], np.int64)
+            uv = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)
+            nrm = np.tile([0, 0, 1], (4, 1)).astype(np.float32)
+            tex = np.zeros((8, 8, 4), np.uint8)
+            tex[..., 0] = (np.arange(8)[None, :] * 32).astype(np.uint8)  # a gradient across X
+            tex[..., 3] = 255
+            if not self.set_scene(build_scene(pos, tris, nrm, uv, np.array([0, 0]), [tex])):
+                return False
+            image = self.render((0, 0, 2.6), (0, 0, 0), (0, 1, 0), 32, 32, (20, 22, 24), 0.1, 10)
+            self._scene = saved
+        except (RuntimeError, OSError):  # a broken context raises rather than returning blank
+            return False
+        if image is None:
+            return False
+        colours = {image.pixel(x, y) for x in range(0, 32, 4) for y in range(0, 32, 4)}
+        return len(colours) > 2
 
     def _ensure_context(self) -> bool:
         if self._ctx is not None:
@@ -249,8 +284,12 @@ class ShadedRenderer:
             self._gltextures[i] = gltex
         return True
 
-    def render(self, eye, target, up, w: int, h: int, bg, near: float, far: float) -> QImage | None:
-        """One frame into a w x h QImage. ``bg`` is (r, g, b) 0..255."""
+    def render(
+        self, eye, target, up, w: int, h: int, bg, near: float, far: float, ortho_half=None
+    ) -> QImage | None:
+        """One frame into a w x h QImage. ``bg`` is (r, g, b) 0..255. ``ortho_half`` (the world
+        half-height to show) switches to a parallel projection, matching the wireframe path's
+        Top / Front / Side views; without it the projection is perspective."""
         from PySide6.QtOpenGL import QOpenGLFramebufferObject
 
         if self._scene is None or not self._make_current():
@@ -274,7 +313,12 @@ class ShadedRenderer:
         glf.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         proj = QMatrix4x4()
-        proj.perspective(50.0, w / h, max(near, 1e-3), far)
+        if ortho_half is not None:
+            half = max(float(ortho_half), 1e-3)
+            half_w = half * (w / h)
+            proj.ortho(-half_w, half_w, -half, half, max(near, 1e-3), far)
+        else:
+            proj.perspective(50.0, w / h, max(near, 1e-3), far)
         v_eye = QVector3D(float(eye[0]), float(eye[1]), float(eye[2]))
         v_tgt = QVector3D(float(target[0]), float(target[1]), float(target[2]))
         v_up = QVector3D(float(up[0]), float(up[1]), float(up[2]))
