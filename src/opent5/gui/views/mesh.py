@@ -399,6 +399,9 @@ class MapEditController:
         #: non-blocking notices from the last clip edit (baked shadow, collision stays).
         self.warnings: list = []
         self._props_cache: list | None = None
+        #: bumped on every prop structural edit (add / move / rotate / delete) and on undo /
+        #: redo, so the view knows to rebuild the placed-model mesh for a live refresh.
+        self._prop_rev = 0
 
     # static-model props and their clip collision
     def props(self) -> list:
@@ -443,6 +446,8 @@ class MapEditController:
         result = self.session.move_prop_clip(prop.index, delta, footprint=prop.footprint)
         self.warnings = result["warnings"]
         self._props_cache = None
+        if result.get("found") or result.get("render_moved"):
+            self._prop_rev += 1
         return result
 
     def rotate_selected_prop(self, degrees: float) -> dict:
@@ -455,6 +460,8 @@ class MapEditController:
         result = self.session.rotate_prop_clip(prop.index, degrees, footprint=prop.footprint)
         self.warnings = result["warnings"]
         self._props_cache = None
+        if result.get("found"):
+            self._prop_rev += 1
         return result
 
     def add_prop(self, model: str, origin, half_extent) -> dict:
@@ -467,6 +474,7 @@ class MapEditController:
         self._props_cache = None
         self.selected_prop = result["prop"]
         self.selected_id = None
+        self._prop_rev += 1
         return result
 
     def prop_models(self) -> list[str]:
@@ -477,10 +485,19 @@ class MapEditController:
                 seen.append(p.model)
         return seen
 
+    def placeable_models(self) -> list[str]:
+        """Distinct prop models the zone can place a drawing copy of: those with an existing
+        GfxWorld draw instance to clone. The Add picker offers these, so a chosen model draws."""
+        seen: list[str] = []
+        for p in self.props():
+            if p.model and p.model not in seen and self.session.has_draw_inst(p.model):
+                seen.append(p.model)
+        return seen
+
     def default_crate_model(self) -> str | None:
-        """A crate-like model the zone already carries, for the quick add; the first model
-        whose name reads like a box/crate, else the first prop model of all."""
-        models = self.prop_models()
+        """A crate-like model the zone can place, for the quick add (B): the first placeable
+        model whose name reads like a box/crate, else the first placeable model of all."""
+        models = self.placeable_models() or self.prop_models()
         for m in models:
             low = m.lower()
             if any(k in low for k in ("crate", "cardboardbox", "cargo", "container", "_box")):
@@ -494,6 +511,9 @@ class MapEditController:
             return {"removed": [], "found": False, "warnings": []}
         result = self.session.remove_prop_clip(prop.index, footprint=prop.footprint)
         self.warnings = result["warnings"]
+        self._props_cache = None
+        if result.get("found") or result.get("render_hidden"):
+            self._prop_rev += 1
         return result
 
     # selection and projection
@@ -815,11 +835,15 @@ class MapEditController:
 
     def undo(self) -> None:
         self.session.undo()
+        self._props_cache = None
+        self._prop_rev += 1  # an undo may restore a prop's placement; refresh the mesh
         if self.selected() is None:
             self.selected_id = None
 
     def redo(self) -> None:
         self.session.redo()
+        self._props_cache = None
+        self._prop_rev += 1
 
 
 class Renderer:
@@ -1591,26 +1615,35 @@ class MeshCanvas(QWidget):
         return True
 
     def _add_crate(self) -> None:
-        """Place a solid crate prop at the current view target (render static model + clip),
-        then select it. Reports why if the spot cannot take one."""
+        """Quick add (B): place the zone's default crate-like prop at the view target."""
         ctl = self.controller
         if ctl is None or not ctl.can_edit_clips:
             self.status.emit("This zone has no editable clipMap, so a prop cannot be added.")
             return
         model = ctl.default_crate_model()
         if model is None:
-            self.status.emit("This zone carries no static-model prop to place.")
+            self.status.emit("This zone carries no placeable static-model prop to place.")
+            return
+        self.add_prop_chosen(model)
+
+    def add_prop_chosen(self, model: str) -> None:
+        """Place the chosen static-model prop at the current view target (render static model +
+        clip), then select it. Reports why if the spot cannot take one."""
+        ctl = self.controller
+        if ctl is None or not ctl.can_edit_clips:
+            self.status.emit("This zone has no editable clipMap, so a prop cannot be added.")
             return
         target = np.asarray(self.camera.target, np.float64)
         try:
             result = ctl.add_prop(model, target, (24.0, 24.0, 24.0))
         except EditError as exc:
-            self.status.emit(f"Could not add a crate here: {exc}")
+            self.status.emit(f"Could not add {model} here: {exc}")
             return
         note = f"  ({result['warnings'][0]})" if result.get("warnings") else ""
-        self.status.emit(f"Added crate {model}{note}")
+        self.status.emit(f"Added {model}{note}")
         self.selection_changed.emit(None)
         self.edited.emit()
+        self.invalidate()
 
     def keyReleaseEvent(self, e) -> None:
         if not e.isAutoRepeat():
@@ -1628,6 +1661,8 @@ class MapEditPanel(QWidget):
 
     changed = Signal()  # an edit happened; the view refreshes markers
     status = Signal(str)
+    #: the Add prop button was pressed; the view opens the model picker (it owns the camera).
+    add_prop_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -1689,12 +1724,16 @@ class MapEditPanel(QWidget):
 
         act_row = QHBoxLayout()
         self.add_button = QPushButton("Add", self)
+        self.add_button.setToolTip("Add a placed entity (asks for a classname)")
         self.add_button.clicked.connect(self._add)
+        self.add_prop_button = QPushButton("Add prop", self)
+        self.add_prop_button.setToolTip("Place a static-model prop: pick from the zone's models")
+        self.add_prop_button.clicked.connect(self.add_prop_requested)
         self.dup_button = QPushButton("Duplicate", self)
         self.dup_button.clicked.connect(self._duplicate)
         self.del_button = QPushButton("Delete", self)
         self.del_button.clicked.connect(self._delete)
-        for b in (self.add_button, self.dup_button, self.del_button):
+        for b in (self.add_button, self.add_prop_button, self.dup_button, self.del_button):
             act_row.addWidget(b)
         root.addLayout(act_row)
 
@@ -1988,7 +2027,11 @@ class MeshView(AssetView):
         self.panel = MapEditPanel(self)
         self.panel.changed.connect(self._on_panel_changed)
         self.panel.status.connect(self.status)
+        self.panel.add_prop_requested.connect(self._add_prop_dialog)
         self.panel.setVisible(False)
+        #: last prop-edit revision the models mesh was rebuilt for, so a prop edit refreshes
+        #: the view live but an entity-only edit does not rebuild the whole mesh.
+        self._last_prop_rev = 0
         self.split = QSplitter(Qt.Orientation.Horizontal, self)
         self.split.addWidget(holder)
         self.split.addWidget(self.panel)
@@ -2132,6 +2175,7 @@ class MeshView(AssetView):
                 self.edit_button.blockSignals(False)
                 return
             self._edit_controller = MapEditController(session)
+            self._last_prop_rev = self._edit_controller._prop_rev
             self._edit_controller.props_shown = self.models_button.isChecked()
             # start on Props so the view is not buried under the entity dots; the panel's Pick
             # control switches to Entities or All.
@@ -2160,6 +2204,7 @@ class MeshView(AssetView):
         self.panel.setVisible(False)
         self._edit_controller = None
         self._session = None
+        self._last_prop_rev = 0
 
     def _on_pick(self, obj_id) -> None:
         self.panel.show_object(obj_id)
@@ -2167,10 +2212,60 @@ class MeshView(AssetView):
     def _on_edited(self) -> None:
         if self._edit_controller is not None:
             self.panel.show_object(self._edit_controller.selected_id)
+        self._maybe_refresh_models()
         self.canvas.invalidate()
 
     def _on_panel_changed(self) -> None:
+        self._maybe_refresh_models()
         self.canvas.invalidate()
+
+    def _maybe_refresh_models(self) -> None:
+        """Rebuild the placed-model mesh after a prop edit (not an entity-only edit), so the
+        view reflects a moved, added or deleted prop without reopening."""
+        ctl = self._edit_controller
+        if ctl is None:
+            return
+        rev = getattr(ctl, "_prop_rev", 0)
+        if rev == self._last_prop_rev:
+            return
+        self._last_prop_rev = rev
+        self._refresh_models()
+
+    def _refresh_models(self) -> None:
+        """Rebuild the world+models mesh from the edited static-model placements, keeping the
+        camera and the edit session. Only the placed models change, so the plain world mesh is
+        reused from the cache."""
+        if self.doc is None or self.mesh_kind not in ("world", "world_models"):
+            return
+        if not self.models_button.isChecked():
+            return
+        from opent5.gui import geometry
+
+        geometry.drop_static_models(self.doc)
+        try:
+            self.mesh = self.doc.mesh("world_models", self.ref)
+        except (EditError, ValueError, KeyError, IndexError, TypeError) as exc:
+            self.status.emit(f"Could not refresh the models view: {exc}")
+            return
+        self._apply_mode()
+        if self.shaded_button.isChecked() and not self._sync:
+            self.canvas._scene = None
+            self._build_scene()
+
+    def _add_prop_dialog(self) -> None:
+        """Pick a placeable model and place it at the view target. Offers only models the zone
+        can draw a copy of (those with a draw instance to clone)."""
+        ctl = self._edit_controller
+        if ctl is None or not ctl.can_edit_clips:
+            self.status.emit("This zone has no editable clipMap, so a prop cannot be added.")
+            return
+        models = ctl.placeable_models()
+        if not models:
+            self.status.emit("This zone carries no placeable static-model prop to copy.")
+            return
+        model, ok = QInputDialog.getItem(self, "Add prop", "Model to place:", models, 0, False)
+        if ok and model:
+            self.canvas.add_prop_chosen(model)
 
     def _save_edited(self, path) -> None:
         if self._session is None:

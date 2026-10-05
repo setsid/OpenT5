@@ -80,6 +80,25 @@ def _render_absent_notice(model: str) -> str:
     )
 
 
+def _render_moved_collision_stays() -> str:
+    """Said when a prop with no clip cluster is moved: its model follows the gizmo, but its
+    baked collision cannot be relocated here."""
+    return (
+        "Moved the prop's model, but no clip collision was found at its footprint, so its "
+        "collision stays at the old position. The model draws at the new spot; baked collision "
+        "moves only with a full recompile, which is not available here."
+    )
+
+
+def _render_hidden_collision_stays() -> str:
+    """Said when a prop with no clip cluster is deleted: the model is hidden, but any baked
+    collision remains."""
+    return (
+        "Hid the prop's model, but it has no clip cluster to remove, so any baked-triangle "
+        "collision stays. Baked collision clears only with a full recompile, not here."
+    )
+
+
 # -- static-model render struct offsets (see src/opent5/xfile/layouts_pc.py cStaticModel_s
 # -- and src/opent5/convert/smodels.py for the GfxWorld draw inst / inst layouts).
 _SM_SIZE = 0x50  # cStaticModel_s
@@ -90,6 +109,7 @@ _SM_ABSMAX = 0x44
 _DRAW_SIZE = 0x2C  # GfxStaticModelDrawInst
 _DRAW_ORIGIN = 0x04
 _DRAW_AXIS = 0x10  # three CMP axis words
+_DRAW_SCALE = 0x1C  # placement.scale (f32); 0 is a degenerate placement that draws nothing
 _INST_SIZE = 0x28  # GfxStaticModelInst
 _INST_MINS = 0x00
 _INST_MAXS = 0x0C
@@ -719,18 +739,34 @@ class EditSession:
         return {"prop": index, "brush": brush, "warnings": warnings}
 
     def move_prop_clip(self, key, delta, footprint=None) -> dict:
-        """Move the prop's existing clip cluster by ``delta`` (the whole cluster moves,
-        so the old spot is left clear and ``numBrushes`` is unchanged) AND its render
-        (the clipMap ``cStaticModel`` and the matching GfxWorld draw instance + smodel
-        inst), so the prop draws and blocks at the new spot together. Finds the managed
-        cluster, else the stock cluster under ``footprint``. Returns the moved brush
-        indices and any warnings; when no cluster is found it moves nothing and reports
-        that the collision stays."""
+        """Move a static-model prop by ``delta``. The render always moves (the clipMap
+        ``cStaticModel`` and the matching GfxWorld draw instance + smodel inst), so the model
+        follows the gizmo for any prop. When the prop has a clip cluster (the managed one, else
+        the stock cluster under ``footprint``) the whole cluster moves with it, so the old spot
+        is left clear and ``numBrushes`` is unchanged; when it has none, only the render moves
+        and a warning says the baked collision stays. Returns the moved brush indices,
+        ``render_moved`` for the clip-less case, and any warnings."""
         cluster = self._cluster_for(key, footprint)
+        d = tuple(float(v) for v in delta)
         if not cluster:
+            # No clip cluster under the prop (most stock props have none). The render must
+            # still move so the model follows the gizmo; only a real static-model index has a
+            # render record to move. Its baked collision is left where it is, and we say so.
+            if isinstance(key, int) and 0 <= key < self._sml_count():
+                self._commit_clip(
+                    lambda cm, loc: self._render_shift(key, d),
+                    None,
+                    "move prop",
+                    touch_gfx=True,
+                )
+                return {
+                    "moved": [],
+                    "found": False,
+                    "render_moved": True,
+                    "warnings": [_render_moved_collision_stays()],
+                }
             return {"moved": [], "found": False, "warnings": [_COLLISION_STAYS]}
         warnings = [] if key in self._prop_clips else [_baked_shadow_notice("Moving")]
-        d = tuple(float(v) for v in delta)
         cm, _ = self._clip_engine()
         old_bounds = pc.cluster_bounds(cm, cluster)
 
@@ -798,25 +834,45 @@ class EditSession:
         return {"rotated": list(cluster), "found": True, "warnings": warnings}
 
     def remove_prop_clip(self, key, footprint=None) -> dict:
-        """Remove (soft-disable) the prop's existing clip cluster. Finds the managed
-        cluster, else the stock cluster under ``footprint``. Returns the removed brush
-        indices and any warnings; when none is found it removes nothing and reports that
-        the collision stays."""
+        """Delete a prop: hide its render (a degenerate GfxWorld draw instance that draws
+        nothing, reversibly) AND remove its clip cluster. Finds the managed cluster, else the
+        stock cluster under ``footprint``. Returns the removed brush indices, whether a render
+        was hidden and any warnings; a stock prop warns that its baked shadow stays, and a
+        prop with no clip cluster warns that any baked-triangle collision remains."""
         cluster = self._cluster_for(key, footprint)
-        if not cluster:
+        is_prop = isinstance(key, int) and 0 <= key < self._sml_count()
+        if not cluster and not is_prop:
             return {"removed": [], "found": False, "warnings": [_COLLISION_STAYS]}
-        warnings = [] if key in self._prop_clips else [_baked_shadow_notice("Deleting")]
-        cm, _ = self._clip_engine()
-        old_bounds = pc.cluster_bounds(cm, cluster)
+        warnings: list = []
+        if cluster and key not in self._prop_clips:
+            warnings.append(_baked_shadow_notice("Deleting"))
+        cm = self._clip_engine()[0] if cluster else None
+        old_bounds = pc.cluster_bounds(cm, cluster) if cluster else None
+
+        def op(cm_, loc):
+            if cluster:
+                pc.remove_cluster(cm_, cluster)
+            if is_prop:
+                self._render_hide(key)
+            return None
+
         self._commit_clip(
-            lambda cm, loc: pc.remove_cluster(cm, cluster),
+            op,
             lambda _r: self._prop_clips.pop(key, None),
             "remove prop clip",
+            touch_gfx=True,
         )
         # the footprint the collision used to fill: links that ran through it may now be clear.
         if old_bounds is not None:
             self._note_edited_box(*old_bounds)
-        return {"removed": list(cluster), "found": True, "warnings": warnings}
+        if not cluster:
+            warnings.append(_render_hidden_collision_stays())
+        return {
+            "removed": list(cluster),
+            "found": bool(cluster),
+            "render_hidden": is_prop,
+            "warnings": warnings,
+        }
 
     # -- static-model render (cStaticModel + GfxWorld draw inst + smodel inst) ----------------
 
@@ -849,6 +905,12 @@ class EditSession:
             if name == model:
                 return j
         return None
+
+    def has_draw_inst(self, model: str) -> bool:
+        """Whether the zone carries a GfxWorld draw instance for ``model`` to clone, so an
+        added copy will draw. A model without one can be given collision but will not render,
+        so the Add picker offers only models that have one."""
+        return self._draw_inst_by_model(model) is not None
 
     def _draw_inst_at_origin(self, origin, tol: float = 0.5) -> int | None:
         di = self._draw_insts()
@@ -905,6 +967,24 @@ class EditSession:
             self._set_draw_inst(j, bytes(raw))
             self._shift_inst_bounds(j, d)
             self._gfx_touched = True
+        return True
+
+    def _render_hide(self, prop_index) -> bool:
+        """Hide a prop's render by zeroing its GfxWorld draw-inst scale: a degenerate
+        placement that draws nothing (the viewer skips scale-0 placements). Reversible through
+        the clip snapshot. Returns True when a draw instance was found and hidden. The clipMap
+        ``cStaticModel`` is left as it is, so the clip removal is the collision side."""
+        if not isinstance(prop_index, int) or not (0 <= prop_index < self._sml_count()):
+            return False
+        o = prop_index * _SM_SIZE
+        origin = struct.unpack_from(">3f", self._clip_node["static_model_list"], o + _SM_ORIGIN)
+        j = self._draw_inst_at_origin(origin)
+        if j is None:
+            return False
+        raw = bytearray(self._draw_raw(j))
+        struct.pack_into(">f", raw, _DRAW_SCALE, 0.0)
+        self._set_draw_inst(j, bytes(raw))
+        self._gfx_touched = True
         return True
 
     def _render_rotate(self, prop_index, degrees, new_mins, new_maxs) -> bool:

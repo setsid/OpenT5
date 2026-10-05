@@ -27,8 +27,15 @@ an origin show a marker.
 ## Move
 
 Drag the selected object's translate gizmo along an axis, or type an exact origin in the
-property panel. A drag counts as one edit for undo. Moving a prop moves its collision clip
-with it, so the prop stays solid at the new position and the old position is left clear.
+property panel. A drag counts as one edit for undo. The prop's model always moves to the new
+spot, and the 3D view rebuilds so you see it move without reopening.
+
+What happens to the prop's collision depends on how it was built. A prop whose collision is a
+clip-brush cluster (a few stock props, and every prop you add here) moves that cluster with
+it, so it stays solid at the new position and the old position is left clear. Most stock props
+have no clip cluster: their collision is baked triangles that cannot be relocated without a
+full recompile, so moving one moves only its model and warns that its baked collision stays at
+the old spot.
 
 Moving or deleting a prop warns you that its baked lightmap shadow stays where the prop was
 baked. The editor cannot relight the map, so the shadow does not follow the prop. This is
@@ -42,15 +49,22 @@ the world axes keeps an axis-aligned solid volume.
 
 ## Add and duplicate
 
-Add an object from the palette of the models the zone already carries and the entity classes
-the gametypes need; it drops at a picked point on a surface. A newly added prop gets a solid
-clip sized to its footprint. Duplicate copies the selected object with a small offset. The
-editor adds only models and classes the zone already holds, not brand-new assets.
+Add prop opens a picker of the zone's placeable models and drops the chosen one at the view
+target. The picker lists only models the zone can draw a copy of, meaning those with an
+existing GfxWorld draw instance to clone; a model with no instance cannot be cloned, so it is
+left out rather than added as an invisible prop. B is a quick add of the zone's default
+crate-like model. A newly added prop gets a solid clip sized to its footprint, so it draws and
+blocks. Add (without "prop") still adds a placed entity by classname. Duplicate copies the
+selected object with a small offset. The editor adds only models and classes the zone already
+holds, not brand-new assets.
 
 ## Delete
 
-Delete removes the selected object. Deleting a prop removes the clip cluster under its
-footprint, so it is no longer solid. The baked-shadow warning applies here too.
+Delete removes the selected object. Deleting a prop hides its model (the 3D view rebuilds so it
+disappears without reopening) and removes the clip cluster under its footprint, so it is no
+longer solid. A prop whose collision is baked triangles rather than a clip cluster has its
+model hidden and warns that the baked collision stays, since baked collision clears only with a
+full recompile. The baked-shadow warning applies here too.
 
 ## Save to a new file
 
