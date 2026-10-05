@@ -272,6 +272,73 @@ def _place_parts(parts, scale, axes, origin):
     return np.concatenate(pos), np.concatenate(norm)
 
 
+def _normalise_rows(v: np.ndarray) -> np.ndarray:
+    """``vx.normalise`` over a stack of row vectors at once: (n, 3) -> (n, 3) float32, the same
+    guard and float32 cast per row, so a batched orthonormal matches the per-instance one."""
+    n = np.linalg.norm(v, axis=-1, keepdims=True)
+    return np.where(n > 1e-6, v / np.maximum(n, 1e-6), v).astype(np.float32)
+
+
+def _orthonormal_rows(cmp: np.ndarray) -> np.ndarray:
+    """``zone.orthonormal`` over every instance's three CMP axes at once: (n, 3, 3) -> (n, 3, 3).
+    Same steps as the scalar version (normalise forward, Gram-Schmidt the up, cross for left),
+    so each row matches ``orthonormal`` field for field; batched so the thousands of tiny 3x3
+    numpy calls that dominated the decode collapse into a handful of array ops."""
+    a0, a2 = cmp[:, 0, :], cmp[:, 2, :]
+    f = _normalise_rows(a0)
+    # dot(a2, f) per row; a 3-term sum, so the einsum matches the scalar np.dot bit for bit.
+    d = np.einsum("ni,ni->n", a2, f)
+    up = _normalise_rows(a2 - f * d[:, None])
+    left = np.cross(up, f)
+    return np.stack([f, left, up], axis=1).astype(np.float64)
+
+
+#: Structured view over a GfxStaticModelDrawInst's 0x2c raw bytes: origin (vec3), the three
+#: packed CMP axes and the scale, at their struct offsets, read for every instance in one pass.
+_DRAW_INST_DTYPE = np.dtype(
+    {"names": ["origin", "axis", "scale"],
+     "formats": [(">f4", 3), (">u4", 3), ">f4"],
+     "offsets": [0x4, 0x10, 0x1C], "itemsize": 0x2C}
+)  # fmt: skip
+
+
+def _decode_placements(h, g) -> list[dict]:
+    """The static-model placements the world+models build needs (index, model, origin, axes,
+    scale), decoded for every draw instance at once.
+
+    Field for field the same as ``ZoneExporter.static_models`` for these keys (same CMP unpack,
+    same orthonormalisation, same rounding), but the struct read, the axis unpack and the
+    orthonormal frame are vectorised over all instances rather than looped one tiny numpy call
+    at a time, which is where the per-instance decode spent its time. The exporter's own
+    ``static_models`` is left as is, so export output is untouched."""
+    from opent5.export.vertex import unpack_cmp
+
+    insts = g["smodel_draw_insts"] or []
+    if not insts:
+        return []
+    raw = b"".join(bytes(d["raw"]) for d in insts)
+    arr = np.frombuffer(raw, _DRAW_INST_DTYPE, len(insts))
+    origins = arr["origin"].astype(np.float64)
+    scales = arr["scale"].astype(np.float64)
+    axes = _orthonormal_rows(unpack_cmp(np.ascontiguousarray(arr["axis"])).astype(np.float64))
+    names = [h.resolver.name(d["model"]) for d in insts]
+    # The rounding stays in Python (round(), not np.round) so the values are bit-identical to
+    # the scalar path: np.round scales by a power of ten and can land on the other side of a
+    # decimal boundary, Python's round is correctly rounded.
+    out = []
+    for i in range(len(insts)):
+        out.append(
+            {
+                "index": i,
+                "model": names[i],
+                "origin": [round(float(v), 4) for v in origins[i]],
+                "axes": [[round(float(v), 5) for v in row] for row in axes[i]],
+                "scale": round(float(scales[i]), 5),
+            }
+        )
+    return out
+
+
 def _placement_sigs(h, g) -> list:
     """A cheap raw signature per static-model draw instance, for diffing an edit without the
     costly per-instance axis decode: ``(model_ref, scale, axis_words, origin)``. The model ref
@@ -294,7 +361,125 @@ def _placement_sigs(h, g) -> list:
 
 def with_static_models(xfile, asset, world: MeshData) -> MeshData:
     """``world`` plus every static model's LOD0 placed as the exporter places it
-    (``ZoneExporter.static_models``: origin + scale x position @ axes)."""
+    (``ZoneExporter.static_models``: origin + scale x position @ axes).
+
+    The placement transform is batched per model: every instance of a model shares the same
+    LOD0 vertices, so one ``numpy.matmul`` of those vertices against all the instances' axes at
+    once (BLAS, multi-core) replaces a Python matmul per prop, and the triangle, group, uv and
+    material arrays are written into preallocated buffers in placement order rather than
+    concatenated from thousands of per-prop pieces. The output (vertex order, triangles,
+    groups, materials) is byte-identical to the per-prop loop in ``_with_static_models_loop``;
+    the matmul is per matrix, so grouping by model only changes the order work happens in, not
+    the result each prop lands at."""
+    h = _helper(xfile)
+    placements = _decode_placements(h, asset.data)
+    n_world = len(world.positions)
+    world_normals = (
+        world.normals if world.normals is not None else np.zeros((n_world, 3), np.float32)
+    )
+    world_uvs = world.uvs if world.uvs is not None else np.zeros((n_world, 2), np.float32)
+    materials = list(world.materials or [])
+
+    # First pass: pick the drawn placements, fetch each model's parts once, and lay out every
+    # placement's vertex, triangle and group ranges in placement order, so the second pass can
+    # scatter each instance's batch result into exactly the slot the loop would have appended.
+    plans: list[dict] = []  # per drawn placement, with its destination ranges
+    by_model: dict[str, list[int]] = {}  # model -> indices into plans sharing those parts
+    drawn: list[tuple[int, int, int, str]] = []
+    at, tri_at, gid, missing = n_world, len(world.triangles), len(materials), 0
+    for p in placements:
+        if not p["scale"]:  # a deleted/hidden prop: a degenerate scale-0 placement draws nothing
+            continue
+        parts = _parts_for(h, p["model"])
+        if not parts:
+            missing += 1
+            continue
+        vstart, tstart, gid0 = at, tri_at, gid
+        for _mat, m in parts:
+            materials.append(_mat)
+            at += len(m.positions)
+            tri_at += len(m.triangles)
+            gid += 1
+        plans.append(
+            {"parts": parts, "axes": np.array(p["axes"]), "scale": p["scale"],
+             "origin": np.array(p["origin"]), "vstart": vstart, "tstart": tstart, "gid0": gid0}
+        )  # fmt: skip
+        by_model.setdefault(p["model"], []).append(len(plans) - 1)
+        drawn.append((p["index"], vstart, at - vstart, p["model"]))
+
+    total_v, total_t = at, tri_at
+    positions = np.empty((total_v, 3), np.float32)
+    normals = np.empty((total_v, 3), np.float32)
+    uvs = np.empty((total_v, 2), np.float32)
+    tris = np.empty((total_t, 3), np.int32)
+    groups = np.empty(total_t, np.int32)
+    positions[:n_world] = world.positions
+    normals[:n_world] = world_normals.astype(np.float32)
+    uvs[:n_world] = world_uvs.astype(np.float32)
+    tris[: len(world.triangles)] = world.triangles
+    groups[: len(world.groups)] = world.groups
+
+    # Second pass, one batch per model: build that model's shared vertices once, transform them
+    # against all its instances' axes in a single matmul, and write each instance into place.
+    for idxs in by_model.values():
+        parts = plans[idxs[0]]["parts"]
+        pm = np.concatenate([m.positions for _mat, m in parts]).astype(np.float32)
+        nm = np.concatenate(
+            [m.normals if m.normals is not None else np.zeros((len(m.positions), 3), np.float32)
+             for _mat, m in parts]
+        ).astype(np.float32)  # fmt: skip
+        um = np.concatenate(
+            [m.uvs if m.uvs is not None else np.zeros((len(m.positions), 2), np.float32)
+             for _mat, m in parts]
+        ).astype(np.float32)  # fmt: skip
+        # Triangle indices and group ids relative to the instance's own vertex/group base.
+        tri_rel, grp_rel, voff = [], [], 0
+        for j, (_mat, m) in enumerate(parts):
+            tri_rel.append(m.triangles + voff)
+            grp_rel.append(np.full(len(m.triangles), j, np.int32))
+            voff += len(m.positions)
+        tri_rel = np.concatenate(tri_rel)
+        grp_rel = np.concatenate(grp_rel)
+        axes = np.stack([plans[i]["axes"] for i in idxs])  # (k, 3, 3) f64
+        origins = np.stack([plans[i]["origin"] for i in idxs])  # (k, 3) f64
+        scales = np.array([plans[i]["scale"] for i in idxs], np.float64)  # (k,)
+        # Per-matrix matmul, so each instance equals pm @ axes exactly; origin + scale * (...)
+        # in that order to add the same way the loop did.
+        posk = (origins[:, None, :] + scales[:, None, None] * np.matmul(pm[None], axes)).astype(
+            np.float32
+        )
+        normk = np.matmul(nm[None], axes).astype(np.float32)
+        for slot, i in enumerate(idxs):
+            pl = plans[i]
+            vs, ts, n = pl["vstart"], pl["tstart"], len(pm)
+            positions[vs : vs + n] = posk[slot]
+            normals[vs : vs + n] = normk[slot]
+            uvs[vs : vs + n] = um
+            tris[ts : ts + len(tri_rel)] = (tri_rel + vs).astype(np.int32)
+            groups[ts : ts + len(grp_rel)] = grp_rel + pl["gid0"]
+
+    placed = len(drawn)
+    notes = [*world.notes, f"{placed} static models"]
+    if missing:
+        notes.append(f"{missing} without a usable model")
+    out = MeshData(
+        positions, tris, normals=normals, uvs=uvs, groups=groups,
+        materials=materials, label=world.label, notes=notes,
+    )  # fmt: skip
+    _models_state[(id(xfile), asset.index)] = {
+        "mesh": out,
+        "n_world": n_world,
+        "drawn": drawn,
+        "sigs": _placement_sigs(h, asset.data),
+    }
+    return out
+
+
+def _with_static_models_loop(xfile, asset, world: MeshData) -> MeshData:
+    """The original per-prop build the vectorised ``with_static_models`` replaced: the scalar
+    ``static_models`` decode plus a Python loop that places one prop at a time. Kept verbatim as
+    the reference the byte-identity and benchmark tests check the batched build against; not
+    used on the live path."""
     h = _helper(xfile)
     placements = h.static_models(asset.data)
     n_world = len(world.positions)
