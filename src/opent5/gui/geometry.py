@@ -36,6 +36,10 @@ KIND_OF_TYPE = {T.GFX_MAP: "world", T.COL_MAP_MP: "collision", T.COL_MAP_SP: "co
 #: Per parsed zone: an exporter shell (index, resolver, model cache) and the meshes.
 _helpers: dict[int, tuple[Any, Any]] = {}
 _cache: dict[tuple[int, str, Any], MeshData] = {}
+#: Per (id(xfile), gfx asset index): what a live prop edit needs to restage only the moved,
+#: rotated or rescaled static models in place, instead of rebuilding the whole world+models
+#: mesh (see ``restage_static_models``). Dropped with the world_models mesh it describes.
+_models_state: dict[tuple[int, int], dict] = {}
 #: Decoded, downscaled colour maps, keyed by (id(xfile), material name). None = none usable.
 _texcache: dict[tuple[int, str], np.ndarray | None] = {}
 #: Largest colour-map side kept for the shaded preview (GL mip-maps the rest down).
@@ -117,6 +121,8 @@ def drop_static_models(doc) -> None:
     xfile = _xfile(doc)
     for key in [k for k in _cache if k[0] == id(xfile) and k[1] == "world_models"]:
         del _cache[key]
+    for key in [k for k in _models_state if k[0] == id(xfile)]:
+        del _models_state[key]
 
 
 def model_mesh(zdoc, node, name: str) -> MeshData:
@@ -239,6 +245,53 @@ def world_mesh(xfile, asset) -> MeshData:
     )
 
 
+def _parts_for(h, model: str):
+    """LOD0 surfaces of a placement's model, or ``None`` when it has none usable. The same
+    decode the full build and the live restage both go through, so they place a model alike."""
+    node = h.index.get(T.XMODEL, model)
+    if node is None:
+        return None
+    try:
+        return h.model_lod0(node) or None
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def _place_parts(parts, scale, axes, origin):
+    """World-space positions and normals of one placement's LOD0 parts, concatenated in the
+    build's part order: ``origin + scale * (position @ axes)``. Exactly what the loop below
+    writes, factored out so a live restage recomputes one moved prop the same way."""
+    axes, origin = np.array(axes), np.array(origin)
+    pos, norm = [], []
+    for _mat, m in parts:
+        pos.append((origin + scale * (m.positions @ axes)).astype(np.float32))
+        if m.normals is not None:
+            norm.append((m.normals @ axes).astype(np.float32))
+        else:
+            norm.append(np.zeros((len(m.positions), 3), np.float32))
+    return np.concatenate(pos), np.concatenate(norm)
+
+
+def _placement_sigs(h, g) -> list:
+    """A cheap raw signature per static-model draw instance, for diffing an edit without the
+    costly per-instance axis decode: ``(model_ref, scale, axis_words, origin)``. The model ref
+    and whether the scale is zero decide topology (which props draw and with how many
+    vertices); the axis and origin decide only where a drawn prop sits."""
+    from opent5.xfile.schema import view
+
+    out = []
+    for d in g["smodel_draw_insts"] or []:
+        f = view(d).fields
+        model = d["model"]
+        ref = getattr(model, "raw", model)  # an AssetLink's raw ref; detects a model swap
+        out.append(
+            (ref, float(f["placement.scale"]),
+             tuple(int(w) for w in f["placement.axis"]),
+             tuple(float(v) for v in f["placement.origin"]))
+        )  # fmt: skip
+    return out
+
+
 def with_static_models(xfile, asset, world: MeshData) -> MeshData:
     """``world`` plus every static model's LOD0 placed as the exporter places it
     (``ZoneExporter.static_models``: origin + scale x position @ axes)."""
@@ -254,17 +307,17 @@ def with_static_models(xfile, asset, world: MeshData) -> MeshData:
     materials = list(world.materials or [])
     group_id = len(materials)
     at, placed, missing = n_world, 0, 0
+    #: each drawn placement's instance index and its vertex slice [start, start+count) in the
+    #: combined mesh, so a live edit can rewrite just the moved prop's vertices.
+    drawn: list[tuple[int, int, int, str]] = []
     for p in placements:
         if not p["scale"]:  # a deleted/hidden prop: a degenerate scale-0 placement draws nothing
             continue
-        node = h.index.get(T.XMODEL, p["model"])
-        try:
-            parts = h.model_lod0(node) if node is not None else None
-        except (ValueError, KeyError, TypeError):
-            parts = None
+        parts = _parts_for(h, p["model"])
         if not parts:
             missing += 1
             continue
+        start = at
         axes, origin = np.array(p["axes"]), np.array(p["origin"])
         for mat, m in parts:
             positions.append((origin + p["scale"] * (m.positions @ axes)).astype(np.float32))
@@ -280,11 +333,12 @@ def with_static_models(xfile, asset, world: MeshData) -> MeshData:
             materials.append(mat)
             group_id += 1
             at += n
+        drawn.append((p["index"], start, at - start, p["model"]))
         placed += 1
     notes = [*world.notes, f"{placed} static models"]
     if missing:
         notes.append(f"{missing} without a usable model")
-    return MeshData(
+    out = MeshData(
         np.concatenate(positions),
         np.concatenate(tris),
         normals=np.concatenate(normals),
@@ -294,6 +348,90 @@ def with_static_models(xfile, asset, world: MeshData) -> MeshData:
         label=world.label,
         notes=notes,
     )
+    _models_state[(id(xfile), asset.index)] = {
+        "mesh": out,
+        "n_world": n_world,
+        "drawn": drawn,
+        "sigs": _placement_sigs(h, asset.data),
+    }
+    return out
+
+
+def restage_static_models(doc) -> MeshData | None:
+    """Rebuild the world+models mesh after a prop edit by rewriting only the vertices of the
+    props that actually moved, rotated or rescaled, reusing the cached world surfaces, the
+    unmoved props and the shared triangle, group and material arrays.
+
+    Returns the updated mesh (its triangles are unchanged, so the view can refresh the display
+    without recomputing wireframe edges or bounds), or ``None`` when the edit changed the set
+    of drawn props (an add, a delete, or a model swap), which changes the mesh topology and
+    needs the full ``with_static_models`` rebuild."""
+    xfile = _xfile(doc)
+    asset = _pick(xfile, WORLD_TYPES, None, "world geometry (gfx_map)")
+    state = _models_state.get((id(xfile), asset.index))
+    if state is None or state.get("mesh") is None:
+        return None
+    h = _helper(xfile)
+    new_sigs = _placement_sigs(h, asset.data)
+    old_sigs = state["sigs"]
+    if len(new_sigs) != len(old_sigs):
+        return None  # an instance was added or removed: topology changed
+    # Topology holds only while every instance keeps its model and its drawn/hidden state (a
+    # zero scale draws nothing). A model swap or a show/hide needs the full rebuild.
+    changed_insts = set()
+    for i, (new, old) in enumerate(zip(new_sigs, old_sigs, strict=True)):
+        if new[0] != old[0] or (new[1] == 0.0) != (old[1] == 0.0):
+            return None
+        if new != old:
+            changed_insts.add(i)
+    old_mesh = state["mesh"]
+    if not changed_insts:  # nothing a placed model draws from changed (e.g. an entity-only edit)
+        return old_mesh
+    positions = old_mesh.positions.copy()
+    normals = old_mesh.normals.copy()
+    # Decode and re-place only the changed props, exactly as the full build does for them.
+    for inst_index, start, count, model in state["drawn"]:
+        if inst_index not in changed_insts:
+            continue
+        parts = _parts_for(h, model)
+        if not parts:
+            return None  # unexpected: a drawn prop lost its model; fall back to a full rebuild
+        p = _decoded_placement(h, asset.data, inst_index)
+        pos, norm = _place_parts(parts, p["scale"], p["axes"], p["origin"])
+        if len(pos) != count:
+            return None  # vertex count drifted; rebuild to stay correct
+        positions[start : start + count] = pos
+        normals[start : start + count] = norm
+    out = MeshData(
+        positions, old_mesh.triangles, normals=normals, uvs=old_mesh.uvs,
+        groups=old_mesh.groups, materials=old_mesh.materials,
+        label=old_mesh.label, notes=old_mesh.notes,
+    )  # fmt: skip
+    state["mesh"] = out
+    state["sigs"] = new_sigs
+    for key in ((id(xfile), "world_models", None), (id(xfile), "world_models", asset.index)):
+        if key in _cache:
+            _cache[key] = out
+    return out
+
+
+def _decoded_placement(h, g, inst_index: int) -> dict:
+    """One static-model placement decoded exactly as ``ZoneExporter.static_models`` decodes it
+    (same rounding), so a restage places a moved prop identically to a full rebuild. Decodes
+    the single changed instance rather than the whole list, which the full path re-decodes."""
+    from opent5.export.vertex import unpack_cmp
+    from opent5.export.zone import orthonormal
+    from opent5.xfile.schema import view
+
+    d = (g["smodel_draw_insts"] or [])[inst_index]
+    f = view(d).fields
+    axes = orthonormal(unpack_cmp(np.array(f["placement.axis"], np.uint32)).astype(np.float64))
+    return {
+        "model": h.resolver.name(d["model"]),
+        "origin": [round(v, 4) for v in f["placement.origin"]],
+        "axes": [[round(float(v), 5) for v in row] for row in axes],
+        "scale": round(f["placement.scale"], 5),
+    }
 
 
 def collision_mesh(xfile, asset) -> MeshData:
