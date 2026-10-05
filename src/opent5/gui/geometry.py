@@ -641,7 +641,10 @@ def restage_static_models(doc) -> MeshData | None:
         return old_mesh
     positions = old_mesh.positions.copy()
     normals = old_mesh.normals.copy()
-    # Decode and re-place only the changed props, exactly as the full build does for them.
+    # Decode and re-place only the changed props, exactly as the full build does for them. The
+    # vertex slices they touch are recorded so the shaded view can re-upload just those rows of
+    # the GPU buffer instead of the whole mesh.
+    changed_ranges: list[tuple[int, int]] = []
     for inst_index, start, count, model in state["drawn"]:
         if inst_index not in changed_insts:
             continue
@@ -654,6 +657,7 @@ def restage_static_models(doc) -> MeshData | None:
             return None  # vertex count drifted; rebuild to stay correct
         positions[start : start + count] = pos
         normals[start : start + count] = norm
+        changed_ranges.append((start, count))
     out = MeshData(
         positions, old_mesh.triangles, normals=normals, uvs=old_mesh.uvs,
         groups=old_mesh.groups, materials=old_mesh.materials,
@@ -661,10 +665,24 @@ def restage_static_models(doc) -> MeshData | None:
     )  # fmt: skip
     state["mesh"] = out
     state["sigs"] = new_sigs
+    state["changed_ranges"] = changed_ranges
     for key in ((id(xfile), "world_models", None), (id(xfile), "world_models", asset.index)):
         if key in _cache:
             _cache[key] = out
     return out
+
+
+def restage_changed_ranges(doc) -> list[tuple[int, int]]:
+    """The ``(vertex_start, count)`` slices the last ``restage_static_models`` rewrote, so the
+    shaded view can re-upload only those rows of the GPU vertex buffer. Empty when no restage
+    has run or nothing moved."""
+    xfile = _xfile(doc)
+    try:
+        asset = _pick(xfile, WORLD_TYPES, None, "world geometry (gfx_map)")
+    except EditError:
+        return []
+    state = _models_state.get((id(xfile), asset.index))
+    return list(state.get("changed_ranges", [])) if state else []
 
 
 def _decoded_placement(h, g, inst_index: int) -> dict:
