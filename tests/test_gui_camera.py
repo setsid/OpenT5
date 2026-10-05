@@ -81,6 +81,63 @@ def test_look_angles_round_trip():
     assert np.allclose(c.basis()[0], eye, atol=1e-6)
 
 
+def test_zoom_to_cursor_tracks_the_surface():
+    # with an anchor distance (the depth of the surface under the cursor), the anchored point
+    # stays exactly under the cursor however hard you zoom.
+    c = _cam()
+    eye, d = mv.cursor_ray(c, 520, 180, 640, 480)
+    forward = c.basis()[3]
+    anchor_t = 240.0  # a surface nearer than the pivot plane
+    anchor = eye + d * anchor_t
+    target, distance = mv.dolly_to_ray(eye, forward, c.distance, d, 0.3, 1.0, anchor_t)
+    new_eye = target - forward * distance
+    v = anchor - new_eye
+    assert np.linalg.norm(np.cross(v, d)) < 1e-6  # still on the same ray
+    assert float(v @ d) > 0  # still in front
+
+
+def test_preset_angles_face_the_axes():
+    top = mv.Camera()
+    top.yaw, top.pitch, top.ortho = mv.PRESETS["top"]
+    assert top.ortho and np.allclose(top.basis()[3], [0, 0, -1], atol=1e-6)  # straight down
+    front = mv.Camera()
+    front.yaw, front.pitch, front.ortho = mv.PRESETS["front"]
+    assert front.ortho and np.allclose(front.basis()[3], [0, 1, 0], atol=1e-6)
+    side = mv.Camera()
+    side.yaw, side.pitch, side.ortho = mv.PRESETS["side"]
+    assert side.ortho and np.allclose(side.basis()[3], [1, 0, 0], atol=1e-6)
+    assert mv.PRESETS["perspective"][2] is False
+
+
+def test_pitch_clamp_prevents_the_flip():
+    c = mv.Camera()
+    c.set_pitch(math.radians(200.0))  # dragged way past straight up
+    assert c.pitch == mv.PITCH_LIMIT  # clamped, not wrapped round to a flipped view
+    c.set_pitch(-math.radians(200.0))
+    assert c.pitch == -mv.PITCH_LIMIT
+    # the view direction still points down from a positive pitch and never flips over the top
+    c.set_pitch(mv.PITCH_LIMIT)
+    assert c.basis()[3][2] < 0  # looking downward, up is still up
+
+
+def test_ortho_zoom_keeps_point_under_cursor():
+    c = _cam()
+    c.ortho = True
+    c.ortho_half_h = 512.0
+    px, py, w, h = 540, 170, 640, 480
+    before, _d = mv.cursor_ray(c, px, py, w, h)  # world point under that pixel
+    c.target, c.ortho_half_h = mv.dolly_ortho(c, px, py, w, h, 0.5, 1.0)
+    after, _d = mv.cursor_ray(c, px, py, w, h)
+    assert c.ortho_half_h == 256.0  # zoomed in by the factor
+    assert np.allclose(before, after, atol=1e-6)  # the cursor's world point did not move
+
+
+def test_ortho_half_for_fits_width_and_height():
+    assert mv.ortho_half_for(100.0, 1.0) >= 100.0
+    # a viewport narrower than it is tall needs more world half-height to fit the width
+    assert mv.ortho_half_for(100.0, 0.5) > mv.ortho_half_for(100.0, 1.0)
+
+
 def test_ray_mesh_hit_cube_top_face():
     pos = np.array([[x, y, z] for z in (0, 64) for y in (0, 64) for x in (0, 64)], np.float32)
     quads = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
