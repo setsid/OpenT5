@@ -9,10 +9,6 @@ per branch. Each line: what, where, and why it is parked.
   entity path (`opent5.convert.entities` / the box-map generator), unrelated to the editor or
   the exe. Investigate separately; it does not affect the 0.3.0 editor release.
 - Lint debt: `ruff check src tests tools` reports pre-existing errors (the bulk in `tools/`),
-  plus two E501 lines in `mapwriter.path_nodes` / `preview`. Not introduced by the editor work.
-  Worth a separate formatting/lint pass.
-- `tests/test_gui_mesh.py::test_shaded_renderer_draws_textured_quad` fails in a headless WSL
-  session with "QOpenGLTexture called without a current context": offscreen WSL2 has no real GL
-  context for the shaded renderer's texture upload. `glrender.py` / the test are untouched;
-  environmental, not a code change. The camera/views work (which touches the renderer) should
-  make it skip cleanly when no GL context is available.
+  plus E501 lines in `convert.propclip`, `mapwriter.path_nodes`, `preview` and
+  `test_pathlinks`, and one UP037 in `convert.propclip`. Not introduced by the editor or the
+  camera work. Worth a separate formatting/lint pass.

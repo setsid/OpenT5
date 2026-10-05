@@ -9,8 +9,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import QApplication
 
 from opent5.edit import gizmo as gz
@@ -54,7 +54,84 @@ def test_render_cube_not_blank():
         for y in range(0, image.height(), 4)
     )  # fmt: skip
     assert lit > 20
-    assert view.grab().width() == 480
+    # the view grabs and renders; its minimum width now follows the view bar's buttons (the
+    # preset views were added), so it is at least the requested width rather than exactly it.
+    assert view.grab().width() >= 480
+
+
+def _cube_view(w=640, h=480):
+    view = mv.MeshView()
+    view.resize(w, h)
+    view._done(view._generation, MeshData(CUBE_POS, CUBE_TRIS, label="cube"))
+    view.canvas.resize(w, h)
+    return view
+
+
+def _corners_on_screen(canvas) -> bool:
+    """Whether all eight cube corners project inside the canvas under its own projection."""
+    cam = canvas.camera
+    eye, right, up, forward = cam.basis()
+    w, h = canvas.width(), canvas.height()
+    oscale = cam.ortho_scale(h) if cam.ortho else None
+    for x in (0, 64):
+        for y in (0, 64):
+            for z in (0, 64):
+                sx, sy, _d, front = gz.project_point(
+                    (x, y, z), eye, right, up, forward, mv.focal(h), w, h, oscale
+                )
+                if not front or not (0 <= sx < w and 0 <= sy < h):
+                    return False
+    return True
+
+
+def test_preset_top_is_ortho_and_frames_the_map():
+    view = _cube_view()
+    view.canvas.set_preset("top")
+    assert view.canvas.camera.ortho  # Top is orthographic
+    assert np.allclose(view.canvas.camera.basis()[3], [0, 0, -1], atol=1e-6)  # straight down
+    assert _corners_on_screen(view.canvas)  # the whole map is in view
+    view.canvas.set_preset("perspective")
+    assert not view.canvas.camera.ortho
+    assert _corners_on_screen(view.canvas)
+
+
+def test_default_framing_shows_the_whole_map():
+    view = _cube_view()
+    view.canvas.reset_camera()  # the view a map opens on
+    assert not view.canvas.camera.ortho
+    assert _corners_on_screen(view.canvas)
+
+
+def test_fly_toggle_and_speed_readout():
+    view = _cube_view()
+    canvas = view.canvas
+    canvas.set_fly(True)
+    assert canvas._flying and view.fly_button.isChecked()  # the bar button follows the canvas
+    lines = canvas._hud_lines()
+    assert any("fly" in line and "u/s" in line for line in lines)
+    before = canvas.fly_speed
+    pos = QPointF(canvas.width() / 2, canvas.height() / 2)
+    wheel = QWheelEvent(pos, pos, QPoint(0, 0), QPoint(0, 120),
+                        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+                        Qt.ScrollPhase.NoScrollPhase, False)  # fmt: skip
+    canvas.wheelEvent(wheel)
+    assert canvas.fly_speed > before  # a wheel notch in fly mode raises the speed
+    assert f"{canvas.fly_speed:,.0f}" in "   ".join(canvas._hud_lines())
+    canvas.set_fly(False)
+    assert not canvas._flying
+
+
+def test_view_cube_click_snaps_to_top():
+    view = _cube_view()
+    canvas = view.canvas
+    cx, cy = canvas._gizmo_hub()
+    _eye, right, up, _fwd = canvas.camera.basis()
+    r = canvas._GIZMO_R + 7
+    zx = cx + float(np.array([0, 0, 1.0]) @ right) * r
+    zy = cy - float(np.array([0, 0, 1.0]) @ up) * r
+    assert canvas._gizmo_preset_at(zx, zy) == "top"
+    _send_click(canvas, zx, zy)
+    assert canvas.camera.ortho  # clicking the gizmo's Z arm snapped to the Top view
 
 
 def nuked() -> Path | None:
@@ -87,9 +164,11 @@ def test_nuked_geometry():
 
 
 def _gl_ok() -> bool:
+    # usable(), not available(): a headless context can be created but render nothing (offscreen
+    # WSL), so the shaded tests skip cleanly there and still run where GL actually draws.
     from opent5.gui.glrender import ShadedRenderer
 
-    return ShadedRenderer().available()
+    return ShadedRenderer().usable()
 
 
 def test_build_scene_sorts_triangles_by_texture():
@@ -282,6 +361,26 @@ def test_pick_filter_props_ignores_entities():
     cam = _axis_camera(1000.0)
     ctl.pick(cam, 400, 300, 800, 600)
     assert ctl.selected_prop == 7 and ctl.selected_id is None
+
+
+def test_pick_prop_works_in_ortho_top_view():
+    # the editor must still pick in the orthographic Top view (where props are placed): a prop
+    # box around the origin, camera looking straight down, cursor at the screen centre.
+    prop = _FakeProp(7, (0, 0, 0), (-20, -20, -20), (20, 20, 20))
+    ctl = mv.MapEditController(_FakeSession([prop], []))
+    ctl.pick_filter = mv.MapEditController.PICK_ALL
+    ctl.props_shown = True
+    cam = mv.Camera()
+    cam.yaw, cam.pitch, cam.ortho = mv.PRESETS["top"]
+    cam.target = np.zeros(3)
+    cam.distance = 1000.0
+    cam.ortho_half_h = 500.0
+    w, h = 800, 600
+    ctl.pick(cam, w / 2, h / 2, w, h)
+    assert ctl.selected_prop == 7
+    # the gizmo handles also project under the ortho scale, so the move handles are reachable
+    _centre, handles = ctl.axis_handles(cam, w, h)
+    assert any(front for _i, _p, front in handles)
 
 
 def test_pick_props_need_static_models_shown():

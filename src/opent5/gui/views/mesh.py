@@ -8,10 +8,14 @@ any GPU. Edge density shades itself: busy areas read brighter, as in a
 wireframe drawn with additive blending. While the mouse drags, a fixed random
 subset of the edges is drawn; the full set comes back on release.
 
-Mouse: left drag orbits, middle drag pans, the wheel zooms to the cursor. Hold
-the right button to fly (mouse-look, WASD to move, Q/E down/up, Shift faster, the
-wheel sets the fly speed). Double click a surface to focus it, F frames the
-focus, Home frames the whole scene.
+The camera is an orbit camera (Z up) with a perspective and an orthographic
+projection. The Top / Front / Side presets are orthographic and axis aligned;
+Perspective is the free 3D view. Mouse: left drag orbits, middle drag pans, the
+wheel zooms towards the cursor (towards the surface under it when one is hit).
+Fly mode is a toggle (Space, or the Fly button) as well as a hold of the right
+button: WASD move, Q/E down/up, Shift sprints, a drag looks around and the wheel
+sets the fly speed. Double click a surface to focus it, F frames the focus, Home
+frames the whole map, 1-4 pick the preset views.
 """
 
 from __future__ import annotations
@@ -47,6 +51,18 @@ from opent5.xfile.constants import AssetType as T
 FOV_DEG = 50.0
 DRAG_EDGES = 40_000
 NEAR = 1.0
+#: Orbit look sensitivity, radians of rotation per pixel of drag. Angular, so the apparent
+#: speed is the same at any distance or zoom. The canvas multiplies it by ``sensitivity``.
+ORBIT_SENS = 0.006
+#: Fly look sensitivity, radians per pixel; a touch calmer than the orbit, as a fly look sweeps
+#: the whole view rather than rolling a pivot in front of you.
+FLY_LOOK_SENS = 0.005
+#: Zoom factor applied per wheel notch (``< 1`` zooms in). Multiplicative, so one notch covers
+#: the same fraction of the distance however near or far you are.
+ZOOM_STEP = 0.85
+#: Pitch is clamped just short of the poles so a drag past straight up or straight down cannot
+#: flip the view or snap the yaw. The ortho Top preset sets the pole exactly (see ``preset``).
+PITCH_LIMIT = math.radians(89.5)
 KIND_OF_TYPE = {T.GFX_MAP: "world", T.COL_MAP_MP: "collision", T.COL_MAP_SP: "collision",
                 T.XMODEL: "model"}  # fmt: skip
 KIND_TITLES = {
@@ -57,9 +73,9 @@ KIND_TITLES = {
 }
 COLLISION_MODES = ("Brushes and triangles", "Brushes", "Triangles")
 HELP_LINES = (
-    "LMB orbit   MMB pan   wheel zoom to cursor",
-    "hold RMB to fly: WASD move, Q/E down/up, Shift faster, wheel sets speed",
-    "double click to focus   F frame focus   Home frame all   H hide help",
+    "LMB orbit   MMB pan   wheel zoom to cursor   Space / RMB fly",
+    "fly: WASD/QE move   Shift sprint   drag to look   wheel sets speed",
+    "1 top  2 front  3 side  4 perspective   F focus   Home frame all   H hide",
 )
 #: Prepended to the hint when the view can be edited but Edit mode is off.
 EDIT_OFF_HINT = ("Edit is OFF: click Edit (top right) to select and move props",)
@@ -89,23 +105,51 @@ def unique_edges(triangles: np.ndarray) -> np.ndarray:
     return np.stack([codes // n, codes % n], 1)
 
 
+#: Preset view angles ``(yaw, pitch)`` in radians and whether the preset is orthographic.
+#: Top looks straight down with +X right and +Y up; Front and Side are axis-aligned ortho
+#: elevations; Perspective is the free 3D view.
+PRESETS = {
+    "top": (math.radians(-90.0), math.radians(90.0), True),
+    "front": (math.radians(-90.0), 0.0, True),
+    "side": (math.radians(180.0), 0.0, True),
+    "perspective": (math.radians(35.0), math.radians(30.0), False),
+}
+
+
 class Camera:
-    """Orbit camera, Z up: yaw around Z, pitch above the horizon, distance from target."""
+    """Orbit camera, Z up: yaw around Z, pitch above the horizon, distance from target.
+
+    Projection is perspective by default; ``ortho`` switches to a parallel projection whose
+    scale is set by ``ortho_half_h`` (the world half-height the view shows). The eye still
+    sits ``distance`` back along the view direction, so the near/far planes and picking stay
+    sensible, but in ortho the distance does not change the on-screen size of anything."""
 
     def __init__(self):
         self.target = np.zeros(3)
         self.yaw = math.radians(35.0)
         self.pitch = math.radians(30.0)
         self.distance = 512.0
+        self.ortho = False
+        self.ortho_half_h = 512.0
 
     def basis(self):
         cp, sp = math.cos(self.pitch), math.sin(self.pitch)
         cy, sy = math.cos(self.yaw), math.sin(self.yaw)
         forward = np.array([-cp * cy, -cp * sy, -sp])
+        # Right stays horizontal from the yaw alone, so straight up or down (cp -> 0) still has
+        # a defined right and up and the view does not gimbal-snap at the pole.
         right = np.array([-sy, cy, 0.0])
         up = np.cross(right, forward)
         eye = self.target - forward * self.distance
         return eye, right, up, forward
+
+    def set_pitch(self, pitch: float) -> None:
+        """Set the pitch, clamped just short of the poles so a drag cannot flip the view."""
+        self.pitch = max(-PITCH_LIMIT, min(PITCH_LIMIT, pitch))
+
+    def ortho_scale(self, h: int) -> float:
+        """Pixels per world unit under the orthographic projection, for a viewport ``h`` tall."""
+        return (h / 2.0) / max(self.ortho_half_h, 1e-6)
 
     def look_from(self, eye, target) -> None:
         """Aim the camera at ``target`` from ``eye``, leaving the eye in place."""
@@ -123,8 +167,10 @@ def project_edges(points, edges, cam: Camera, w: int, h: int):
     eye, right, up, forward = cam.basis()
     basis = np.stack([right, up, forward], 1).astype(np.float32)
     cs = (points - eye.astype(np.float32)) @ basis  # (n, 3): x right, y up, z depth
-    f = np.float32(focal(h))
     z = cs[:, 2]
+    if cam.ortho:
+        return _project_edges_ortho(cs, z, edges, cam, w, h)
+    f = np.float32(focal(h))
     front = z > NEAR
     inv = np.where(front, f / np.where(front, z, 1), 0).astype(np.float32)
     sx = np.float32(w / 2) + cs[:, 0] * inv
@@ -152,6 +198,27 @@ def project_edges(points, edges, cam: Camera, w: int, h: int):
         x1, y1 = np.concatenate([x1, rx]), np.concatenate([y1, ry])
         depth = np.concatenate([depth, 0.5 * (q[:, 2] + far_pt[:, 2])])
     # drop edges wholly off one side of the screen
+    off = (
+        ((x0 < 0) & (x1 < 0)) | ((x0 >= w) & (x1 >= w)) | ((y0 < 0) & (y1 < 0))
+        | ((y0 >= h) & (y1 >= h))
+    )  # fmt: skip
+    keep = ~off
+    return x0[keep], y0[keep], x1[keep], y1[keep], depth[keep]
+
+
+def _project_edges_ortho(cs, z, edges, cam: Camera, w: int, h: int):
+    """Screen positions under the parallel projection. The eye is placed well outside the
+    geometry by the framing, so nothing straddles the eye plane and the perspective path's
+    near-plane clip is not needed: edges with either endpoint behind the eye are simply
+    dropped. The scale is constant (``ortho_scale``), so depth does not change screen size."""
+    scale = np.float32(cam.ortho_scale(h))
+    sx = np.float32(w / 2) + cs[:, 0] * scale
+    sy = np.float32(h / 2) - cs[:, 1] * scale
+    front = z > 1e-3
+    e = edges[front[edges[:, 0]] & front[edges[:, 1]]]
+    a, b = e[:, 0], e[:, 1]
+    x0, y0, x1, y1 = sx[a], sy[a], sx[b], sy[b]
+    depth = 0.5 * (z[a] + z[b])
     off = (
         ((x0 < 0) & (x1 < 0)) | ((x0 >= w) & (x1 >= w)) | ((y0 < 0) & (y1 < 0))
         | ((y0 >= h) & (y1 >= h))
@@ -231,11 +298,18 @@ def nice_step(extent: float) -> float:
 
 
 def cursor_ray(cam: Camera, px: float, py: float, w: int, h: int):
-    """World-space ray (origin at the eye, unit direction) through a screen pixel.
+    """World-space ray (origin, unit direction) through a screen pixel.
 
-    The pixel is in the same coordinates the render uses; the direction does not
-    depend on the device-pixel ratio, so logical widget coordinates are fine."""
+    Under perspective the ray starts at the eye and fans out through the pixel; under the
+    parallel projection every ray runs along the view direction and the origin is the pixel's
+    own point on the eye plane. Either way picking, dragging and zoom-to-cursor feed the ray
+    straight in. The pixel is in render coordinates; the direction does not depend on the
+    device-pixel ratio, so logical widget coordinates are fine."""
     eye, right, up, forward = cam.basis()
+    if cam.ortho:
+        scale = cam.ortho_scale(h)
+        origin = eye + right * ((px - w / 2.0) / scale) + up * ((h / 2.0 - py) / scale)
+        return origin, forward / np.linalg.norm(forward)
     f = focal(h)
     dx = (px - w / 2.0) / f
     dy = (h / 2.0 - py) / f
@@ -243,22 +317,43 @@ def cursor_ray(cam: Camera, px: float, py: float, w: int, h: int):
     return eye, d / np.linalg.norm(d)
 
 
-def dolly_to_ray(eye, forward, distance: float, ray_dir, factor: float, min_dist: float):
+def dolly_to_ray(
+    eye, forward, distance: float, ray_dir, factor: float, min_dist: float, anchor_t=None
+):
     """Zoom towards (or away from) the point under the cursor.
 
     ``factor`` is the new pivot distance as a fraction of the old (``< 1`` zooms
     in). The eye slides along ``ray_dir`` so the world point under the cursor
-    keeps its place on screen. The pivot distance is floored at ``min_dist``: once
+    keeps its place on screen. ``anchor_t`` is the distance along the ray to the
+    point to hold under the cursor; passing the depth of the surface actually under
+    the cursor (from a ray cast) makes the zoom track that surface rather than a
+    point floating at the pivot plane, which is what sells zoom-to-cursor. Without
+    it the pivot plane is used. The pivot distance is floored at ``min_dist``: once
     there, zooming in keeps advancing the eye, so the pivot is pushed forward along
     the view direction and the camera passes through rather than stalling.
     Returns ``(new_target, new_distance)``."""
     cosang = float(ray_dir @ forward)
     if cosang <= 1e-4:  # cursor ray almost perpendicular to the view: dolly straight ahead
         ray_dir, cosang = forward, 1.0
-    t = distance / cosang
+    t = anchor_t if anchor_t is not None else distance / cosang
     new_eye = eye + ray_dir * (t * (1.0 - factor))
     new_distance = max(distance * factor, min_dist)
     return new_eye + forward * new_distance, new_distance
+
+
+def dolly_ortho(cam: Camera, px: float, py: float, w: int, h: int, factor: float, min_half: float):
+    """Zoom the orthographic view towards the cursor: scale ``ortho_half_h`` by ``factor`` and
+    shift the pivot so the world point under the cursor stays under it. Returns the new
+    ``(target, ortho_half_h)``."""
+    _eye, right, up, _forward = cam.basis()
+    scale = cam.ortho_scale(h)
+    wx = (px - w / 2.0) / scale
+    wy = (h / 2.0 - py) / scale
+    new_half = max(cam.ortho_half_h * factor, min_half)
+    # the shift keeps the cursor's world point fixed as the scale changes
+    shift = (1.0 - new_half / cam.ortho_half_h) if cam.ortho_half_h else 0.0
+    target = cam.target + right * (wx * shift) + up * (wy * shift)
+    return target, new_half
 
 
 def pan_delta(right, up, distance: float, focal_px: float, dx: float, dy: float):
@@ -269,12 +364,25 @@ def pan_delta(right, up, distance: float, focal_px: float, dx: float, dy: float)
     return -right * (dx * scale) + up * (dy * scale)
 
 
-def frame_distance(radius: float, fov_deg: float, aspect: float) -> float:
-    """Pivot distance that fits a sphere of ``radius`` comfortably in the view."""
+def frame_distance(radius: float, fov_deg: float, aspect: float, fill: float = 0.85) -> float:
+    """Pivot distance to frame a sphere of ``radius``. ``fill`` scales the distance: below 1 the
+    sphere more than fills the view (the old default, which crops the far corners), at or above 1
+    the whole sphere sits inside with that much margin. Framing the whole map passes ``fill`` a
+    touch above 1 so every corner stays in view."""
     half = math.radians(fov_deg) / 2.0
     if aspect < 1.0:  # a tall, narrow viewport is limited by its width
         half = math.atan(math.tan(half) * aspect)
-    return max(radius, 1.0) / math.sin(half) * 0.85
+    return max(radius, 1.0) / math.sin(half) * fill
+
+
+def ortho_half_for(radius: float, aspect: float) -> float:
+    """World half-height for the parallel projection to fit a sphere of ``radius``, allowing
+    for a viewport narrower than it is tall (the width then sets the limit) and a small
+    margin so the geometry does not touch the edges."""
+    half = max(radius, 1.0)
+    if aspect < 1.0:  # a tall, narrow viewport fits less across than down
+        half = half / max(aspect, 1e-6)
+    return half * 1.1
 
 
 def look_angles(eye, target):
@@ -525,9 +633,12 @@ class MapEditController:
 
         eye, right, up, forward = cam.basis()
         f = focal(h)
+        oscale = cam.ortho_scale(h) if cam.ortho else None
         ids, pts, depths = [], [], []
         for o in self.markers():
-            sx, sy, depth, front = gz.project_point(o.origin, eye, right, up, forward, f, w, h)
+            sx, sy, depth, front = gz.project_point(
+                o.origin, eye, right, up, forward, f, w, h, oscale
+            )
             ids.append(o.id)
             pts.append((sx, sy) if front else (np.nan, np.nan))
             depths.append(depth if front else np.inf)
@@ -540,9 +651,12 @@ class MapEditController:
 
         eye, right, up, forward = cam.basis()
         f = focal(h)
+        oscale = cam.ortho_scale(h) if cam.ortho else None
         idxs, pts, depths = [], [], []
         for p in self.props():
-            sx, sy, depth, front = gz.project_point(p.origin, eye, right, up, forward, f, w, h)
+            sx, sy, depth, front = gz.project_point(
+                p.origin, eye, right, up, forward, f, w, h, oscale
+            )
             idxs.append(p.index)
             pts.append((sx, sy) if front else (np.nan, np.nan))
             depths.append(depth if front else np.inf)
@@ -647,14 +761,19 @@ class MapEditController:
             return None, []
         eye, right, up, forward = cam.basis()
         f = focal(h)
-        csx, csy, cdepth, cfront = gz.project_point(centre, eye, right, up, forward, f, w, h)
+        oscale = cam.ortho_scale(h) if cam.ortho else None
+        csx, csy, cdepth, cfront = gz.project_point(
+            centre, eye, right, up, forward, f, w, h, oscale
+        )
         if not cfront:
             return None, []
-        world_len = max(cdepth, 1.0) * length_px / f
+        # the handle keeps about ``length_px`` on screen: the scale is constant in ortho, so the
+        # world length is fixed; in perspective it grows with depth.
+        world_len = (length_px / oscale) if oscale is not None else max(cdepth, 1.0) * length_px / f
         handles = []
         for i, axis in enumerate(EDIT_AXES):
             sx, sy, _d, front = gz.project_point(
-                centre + axis * world_len, eye, right, up, forward, f, w, h
+                centre + axis * world_len, eye, right, up, forward, f, w, h, oscale
             )
             handles.append((i, (sx, sy), front))
         return (csx, csy), handles
@@ -859,6 +978,11 @@ class Renderer:
         self.depth_cue = True
         self.grid = True
         self.bounds = (np.zeros(3), np.zeros(3))
+        # framing bounds and grid step exist before any mesh, so the cursor readout and HUD are
+        # safe if the mouse moves over an empty view.
+        self.frame_bounds = (np.zeros(3), np.zeros(3))
+        self.focus_bounds = (np.zeros(3), np.zeros(3))
+        self.grid_step = 16.0
         self.last_ms = 0.0
         self.last_edges = 0
 
@@ -1015,6 +1139,8 @@ class MeshCanvas(QWidget):
     """The drawing surface: owns the camera and the renderer."""
 
     camera_changed = Signal()
+    #: Fly mode turned on or off (so the view bar's Fly button can follow it).
+    fly_changed = Signal(bool)
     #: An entity was picked (its id, or None); the view updates the property panel.
     selection_changed = Signal(object)
     #: An edit went through the session (move, rotate, add, delete, ...).
@@ -1047,13 +1173,23 @@ class MeshCanvas(QWidget):
         self._drag = None
         self._dragging = False
         self.show_help = True
+        #: look/zoom speed multiplier; 1.0 is the tuned default. The orbit and zoom respond to
+        #: it, so a user who wants it calmer or quicker has one dial.
+        self.sensitivity = 1.0
         self._focus = None  # last point picked by a double click, or None
+        #: world point under the cursor (on the ground plane), for the on-screen readout.
+        self._cursor_world: np.ndarray | None = None
+        self.setMouseTracking(True)  # so the readout tracks the cursor without a button held
         self._settle = QTimer(self)
         self._settle.setSingleShot(True)
         self._settle.setInterval(120)
         self._settle.timeout.connect(self._end_drag)
-        # fly mode: held while the right button is down
+        # Fly mode. It is active (``_flying``) either while the right button is held (a quick
+        # look-and-go) or while toggled on (``_fly_toggle``, via Space or the Fly button), so
+        # WASD works hands-free. A fly button toggle notifies the view bar.
         self._flying = False
+        self._fly_toggle = False
+        self._fly_hold = False
         self.fly_speed = 512.0
         self._fly_keys: set = set()
         self._fly_last = 0.0
@@ -1089,7 +1225,9 @@ class MeshCanvas(QWidget):
             from opent5.gui.glrender import ShadedRenderer
 
             self._gl = ShadedRenderer()
-        if not self._gl.available():
+        # usable(), not available(): a context that creates but cannot draw (headless WSL) must
+        # not offer shaded mode, or the view goes blank. The probe is cached on the renderer.
+        if not self._gl.usable():
             self._gl_failed = True
             return False
         return True
@@ -1111,14 +1249,47 @@ class MeshCanvas(QWidget):
 
     def frame(self, lo, hi) -> None:
         """Reposition the camera so the bounds ``(lo, hi)`` fill the view, without
-        changing the view angles."""
+        changing the view angles. Sets both the perspective distance and the ortho scale, so a
+        preset frames the same whichever projection it uses."""
         lo, hi = np.asarray(lo, np.float64), np.asarray(hi, np.float64)
         radius = float(np.linalg.norm(hi - lo)) / 2.0
         aspect = max(self.width(), 1) / max(self.height(), 1)
         self.camera.target = (lo + hi) / 2.0
-        self.camera.distance = frame_distance(radius, FOV_DEG, aspect)
+        # fill just over 1 so the whole of the bounds stays in view rather than cropping the
+        # corners; the ortho scale fits with the same small margin.
+        self.camera.distance = frame_distance(radius, FOV_DEG, aspect, fill=1.1)
+        self.camera.ortho_half_h = ortho_half_for(radius, aspect)
         self.invalidate()
         self.camera_changed.emit()
+
+    def set_preset(self, name: str) -> None:
+        """Snap to a preset view (``top`` / ``front`` / ``side`` / ``perspective``) and frame
+        the whole map. Top, Front and Side are orthographic and axis aligned; Perspective is the
+        free 3D view. A fly toggle is dropped, as the presets are a stationary look."""
+        angles = PRESETS.get(name)
+        if angles is None:
+            return
+        self.set_fly(False)
+        self.camera.yaw, pitch, self.camera.ortho = angles[0], angles[1], angles[2]
+        self.camera.pitch = pitch  # presets may sit exactly at the pole; the drag clamp does not
+        self._focus = None
+        # frame the robust whole-map bounds (outliers trimmed), not the dense core, so a preset
+        # shows the entire map rather than diving into the middle of it.
+        self.frame(*self.renderer.frame_bounds)
+
+    def mode_name(self) -> str:
+        """The current interaction mode, for the on-screen readout."""
+        if self.controller is not None:
+            return f"edit: {self.controller.mode}"
+        if self._flying:
+            return "fly"
+        return "orbit"
+
+    def _world_per_pixel(self) -> float:
+        """World units per screen pixel at the pivot, for pans and the cursor readout."""
+        if self.camera.ortho:
+            return 1.0 / max(self.camera.ortho_scale(max(self.height(), 1)), 1e-9)
+        return self.camera.distance / max(focal(max(self.height(), 1)), 1.0)
 
     def frame_focus(self) -> None:
         """Frame the focused point (set by a double click) or, failing that, the
@@ -1130,18 +1301,22 @@ class MeshCanvas(QWidget):
             self.frame(*self.renderer.focus_bounds)
 
     def frame_scene(self) -> None:
-        """Frame the whole mesh."""
-        self.frame(*self.renderer.bounds)
+        """Frame the whole map. Uses the robust bounds (far-flung skybox and stray verts
+        trimmed), so Home shows the map rather than flying out to an outlier."""
+        self.frame(*self.renderer.frame_bounds)
 
     def frame_all(self, focus: bool = False) -> None:
         lo, hi = self.renderer.focus_bounds if focus else self.renderer.frame_bounds
         self.frame(lo, hi)
 
     def reset_camera(self) -> None:
+        """The view a map opens on: a perspective three-quarter angle framing the whole map."""
+        self.set_fly(False)
+        self.camera.ortho = False
         self.camera.yaw = math.radians(35.0)
         self.camera.pitch = math.radians(30.0)
         self._focus = None
-        self.frame_all(focus=True)
+        self.frame_all(focus=False)
 
     def _shaded_ready(self) -> bool:
         return self.shaded and self._scene is not None and self.gl_available()
@@ -1151,8 +1326,9 @@ class MeshCanvas(QWidget):
         w, h = max(1, int(self.width() * ratio)), max(1, int(self.height() * ratio))
         c = self.camera
         shaded = self._shaded_ready()
-        key = (w, h, fast, c.yaw, c.pitch, c.distance, tuple(c.target), self.renderer.depth_cue,
-               self.renderer.grid, theme.current().name, shaded)  # fmt: skip
+        key = (w, h, fast, c.yaw, c.pitch, c.distance, tuple(c.target), c.ortho, c.ortho_half_h,
+               self.renderer.depth_cue, self.renderer.grid, theme.current().name,
+               shaded)  # fmt: skip
         if key != self._key or self._image is None:
             self._image = self._gl_image(w, h) if shaded else None
             if self._image is None:
@@ -1173,7 +1349,8 @@ class MeshCanvas(QWidget):
         far = self.camera.distance + diag * 1.5 + 16.0
         near = max(self.camera.distance * 0.002, 0.5)
         bg = _rgb(theme.current().base)
-        return self._gl.render(eye, self.camera.target, up, w, h, bg, near, far)
+        ortho_half = self.camera.ortho_half_h if self.camera.ortho else None
+        return self._gl.render(eye, self.camera.target, up, w, h, bg, near, far, ortho_half)
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
@@ -1183,40 +1360,67 @@ class MeshCanvas(QWidget):
             p.end()
             return
         p.drawImage(0, 0, self.render_image(self._dragging))
+        self._paint_hud(p)
+        if self.show_help:
+            self._paint_help(p)
+        self._paint_gizmo(p)
+        if self.controller is not None:
+            self._paint_edit(p)
+        p.end()
+
+    def _hud_lines(self) -> list[str]:
+        """The one always-on readout, top-left: what the map is, the interaction mode, what is
+        selected, and the grid, projection and cursor coordinate. Kept to a few short lines so
+        it informs without crowding the view."""
+        verts, tris, _edges = self.counts
+        count = f"{verts:,} verts  {tris:,} tris"
+        if self._dragging and not self._shaded_ready():
+            count += f"   {self.renderer.last_ms:.0f} ms"
+        lines = [self.title, count]
+        mode = f"fly  {self.fly_speed:,.0f} u/s" if self._flying else self.mode_name()
+        sel = self._selection_summary()
+        if sel:
+            mode += f"   {sel}"
+        if self.controller is not None and self.controller.session.dirty:
+            mode += "   edited"
+        lines.append(mode)
+        info = ["ortho" if self.camera.ortho else "persp"]
+        if self.renderer.grid and not self._shaded_ready():
+            info.append(f"grid {self.renderer.grid_step:g} u")
+        if self._cursor_world is not None:
+            cx, cy, cz = (float(v) for v in self._cursor_world)
+            info.append(f"cursor {cx:.0f} {cy:.0f} {cz:.0f}")
+        lines.append("   ".join(info))
+        return lines
+
+    def _selection_summary(self) -> str:
+        ctl = self.controller
+        if ctl is None:
+            return ""
+        prop = ctl.selected_prop_obj()
+        if prop is not None:
+            return f"{prop.model or 'prop'} #{prop.index}"
+        obj = ctl.selected()
+        if obj is not None:
+            return f"{obj.label} ({obj.id})"
+        return "nothing selected"
+
+    def _paint_hud(self, p: QPainter) -> None:
+        t = theme.current()
         p.setFont(theme.mono_font(8))
         p.setPen(QColor(t.text_dim))
-        verts, tris, edges = self.counts
-        shaded = self._shaded_ready()
-        if shaded:
-            third = f"shaded  {self._tex_count:,} textures"
-        else:
-            third = f"{self.renderer.last_edges:,} edges drawn  {self.renderer.last_ms:.0f} ms" + (
-                "  (preview)" if self._dragging else ""
-            )
-        lines = [
-            self.title,
-            f"{verts:,} vertices  {tris:,} triangles  {edges:,} edges",
-            third,
-        ]
+        lines = self._hud_lines()
         fm = p.fontMetrics()
         back = QColor(t.base)
         back.setAlpha(210)
         width = max(fm.horizontalAdvance(line) for line in lines) + 12
         p.fillRect(2, 2, width, fm.height() * len(lines) + 8, back)
         y = 6 + fm.ascent()
-        for line in lines:
+        for i, line in enumerate(lines):
+            # the mode line (index 2) in the text colour so it reads as the live state
+            p.setPen(QColor(t.text if i == 2 else t.text_dim))
             p.drawText(8, y, line)
             y += fm.height()
-        help_top = self._paint_help(p) if self.show_help else self.height()
-        if self.renderer.grid and not shaded:
-            step = self.renderer.grid_step
-            p.setFont(theme.mono_font(8))
-            p.setPen(QColor(t.text_dim))
-            p.drawText(8, help_top - 6, f"grid {step:g} units")
-        self._paint_gizmo(p)
-        if self.controller is not None:
-            self._paint_edit(p)
-        p.end()
 
     def _help_lines(self) -> tuple[str, ...]:
         """Camera controls, plus edit controls when Edit is on, or a prompt to turn it on."""
@@ -1247,15 +1451,46 @@ class MeshCanvas(QWidget):
             y += fm.height()
         return top
 
+    #: orientation gizmo axis -> (label, world direction, preset snapped to by a click).
+    _GIZMO_AXES = (
+        ("X", np.array([1.0, 0.0, 0.0]), "side"),
+        ("Y", np.array([0.0, 1.0, 0.0]), "front"),
+        ("Z", np.array([0.0, 0.0, 1.0]), "top"),
+    )
+    _GIZMO_R = 20
+
+    def _gizmo_hub(self) -> tuple[int, int]:
+        """Screen centre of the orientation gizmo (bottom-right corner)."""
+        return self.width() - 38, self.height() - 38
+
+    def _gizmo_preset_at(self, px: float, py: float):
+        """The preset a click on the orientation gizmo selects, or None. An axis label picks
+        that elevation; the hub picks the perspective view."""
+        cx, cy = self._gizmo_hub()
+        _eye, right, up, _fwd = self.camera.basis()
+        r = self._GIZMO_R
+        for _name, v, preset in self._GIZMO_AXES:
+            lx = cx + float(v @ right) * (r + 7)
+            ly = cy - float(v @ up) * (r + 7)
+            if (px - lx) ** 2 + (py - ly) ** 2 <= 100:  # within ~10px of the label
+                return preset
+        if (px - cx) ** 2 + (py - cy) ** 2 <= 49:  # the hub, within ~7px
+            return "perspective"
+        return None
+
     def _paint_gizmo(self, p: QPainter) -> None:
+        """A small clickable orientation gizmo: click an axis to snap to that elevation, or the
+        hub for the perspective view."""
         t = theme.current()
         _eye, right, up, _fwd = self.camera.basis()
-        cx, cy, r = self.width() - 34, self.height() - 34, 20
+        cx, cy = self._gizmo_hub()
+        r = self._GIZMO_R
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setFont(theme.mono_font(7))
-        axes = (("X", np.array([1.0, 0, 0])), ("Y", np.array([0, 1.0, 0])),
-                ("Z", np.array([0, 0, 1.0])))  # fmt: skip
-        for name, v in axes:
+        p.setBrush(QColor(t.text_dim))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(cx, cy), 2.5, 2.5)  # the hub (perspective)
+        for name, v, _preset in self._GIZMO_AXES:
             sx, sy = float(v @ right), -float(v @ up)
             end = QPointF(cx + sx * r, cy + sy * r)
             p.setPen(QPen(QColor(t.text_dim), 1.0))
@@ -1294,7 +1529,6 @@ class MeshCanvas(QWidget):
         self._paint_prop_markers(p)
         self._paint_cluster(p)
         self._paint_gizmo_handles(p)
-        self._paint_edit_readout(p)
 
     def _paint_prop_markers(self, p: QPainter) -> None:
         """Static-model props as small diamonds; the selected one brighter."""
@@ -1308,6 +1542,7 @@ class MeshCanvas(QWidget):
 
         eye, right, up, forward = self.camera.basis()
         f = focal(self.height())
+        oscale = self.camera.ortho_scale(self.height()) if self.camera.ortho else None
         for prop in ctl.props():
             selected = prop.index == ctl.selected_prop
             if not selected and not ctl.props_pickable:
@@ -1318,7 +1553,7 @@ class MeshCanvas(QWidget):
                 if centre is not None:
                     origin = centre
             sx, sy, _d, front = gz.project_point(
-                origin, eye, right, up, forward, f, self.width(), self.height()
+                origin, eye, right, up, forward, f, self.width(), self.height(), oscale
             )
             if not front:
                 continue
@@ -1353,6 +1588,7 @@ class MeshCanvas(QWidget):
         eye, right, up, forward = self.camera.basis()
         f = focal(self.height())
         w, h = self.width(), self.height()
+        oscale = self.camera.ortho_scale(h) if self.camera.ortho else None
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         p.setPen(QPen(QColor("#e0a0ff"), 1.2))
         edges = (
@@ -1366,7 +1602,7 @@ class MeshCanvas(QWidget):
                 (mins[0], mins[1], maxs[2]), (maxs[0], mins[1], maxs[2]),
                 (maxs[0], maxs[1], maxs[2]), (mins[0], maxs[1], maxs[2]),
             ]  # fmt: skip
-            scr = [gz.project_point(c, eye, right, up, forward, f, w, h) for c in corners]
+            scr = [gz.project_point(c, eye, right, up, forward, f, w, h, oscale) for c in corners]
             for a, b in edges:
                 if scr[a][3] and scr[b][3]:
                     p.drawLine(QPointF(scr[a][0], scr[a][1]), QPointF(scr[b][0], scr[b][1]))
@@ -1389,25 +1625,15 @@ class MeshCanvas(QWidget):
             p.drawEllipse(QPointF(sx, sy), 4, 4)
             p.drawText(QPointF(sx + 4, sy - 4), names[i])
 
-    def _paint_edit_readout(self, p: QPainter) -> None:
-        ctl = self.controller
-        t = theme.current()
-        obj = ctl.selected()
-        bits = [f"edit: {ctl.mode}"]
-        if obj is not None:
-            bits.append(f"{obj.label}  {obj.keys.get('origin', '')}")
-        if ctl.session.dirty:
-            bits.append("edited")
-        text = "    ".join(bits)
-        p.setFont(theme.mono_font(8))
-        p.setPen(QColor(t.text))
-        fm = p.fontMetrics()
-        x = self.width() - fm.horizontalAdvance(text) - 10
-        p.drawText(max(x, 8), 16, text)
-
     # interaction
     def mousePressEvent(self, e) -> None:
         self._press_pos = e.position()
+        if e.button() == Qt.MouseButton.LeftButton:
+            preset = self._gizmo_preset_at(e.position().x(), e.position().y())
+            if preset is not None:  # clicked the orientation gizmo: snap to that view
+                self.set_preset(preset)
+                self.setFocus()
+                return
         if self.controller is not None and e.button() == Qt.MouseButton.LeftButton:
             axis = self.controller.hit_axis(
                 self.camera, e.position().x(), e.position().y(), self.width(), self.height()
@@ -1427,9 +1653,10 @@ class MeshCanvas(QWidget):
         self._drag = (e.position(), e.buttons())
         self.setFocus()
         if e.button() == Qt.MouseButton.RightButton:
-            self._start_fly()
+            self._begin_fly_hold()
 
     def mouseMoveEvent(self, e) -> None:
+        self._track_cursor(e.position().x(), e.position().y())
         if self._edit_drag and self.controller is not None:
             self.controller.update_drag(
                 self.camera, e.position().x(), e.position().y(), self.width(), self.height()
@@ -1441,32 +1668,47 @@ class MeshCanvas(QWidget):
                 self.edited.emit()
             return
         if self._drag is None:
+            self.update()  # redraw the cursor readout even without a drag
             return
         last, _buttons = self._drag
         d = e.position() - last
         self._drag = (e.position(), e.buttons())
         c = self.camera
         buttons = e.buttons()
-        if buttons & Qt.MouseButton.LeftButton:
-            c.yaw -= d.x() * 0.008
-            c.pitch = max(-1.55, min(1.55, c.pitch + d.y() * 0.008))
-        elif buttons & Qt.MouseButton.RightButton:  # fly: look around in place
+        look = buttons & (Qt.MouseButton.LeftButton | Qt.MouseButton.RightButton)
+        if self._flying and look:  # fly: mouse-look in place, eye fixed
             eye, _r, _u, _f = c.basis()
-            c.yaw -= d.x() * 0.006
-            c.pitch = max(-1.55, min(1.55, c.pitch + d.y() * 0.006))
+            c.yaw -= d.x() * FLY_LOOK_SENS
+            c.set_pitch(c.pitch + d.y() * FLY_LOOK_SENS)
             _e2, _r2, _u2, forward = c.basis()
             c.target = eye + forward * c.distance
-        elif buttons & Qt.MouseButton.MiddleButton:  # pan
+        elif buttons & Qt.MouseButton.LeftButton:  # orbit
+            c.yaw -= d.x() * ORBIT_SENS * self.sensitivity
+            c.set_pitch(c.pitch + d.y() * ORBIT_SENS * self.sensitivity)
+        elif buttons & Qt.MouseButton.MiddleButton:  # pan, same apparent speed in either mode
             _eye, right, up, _f = c.basis()
-            c.target = c.target + pan_delta(
-                right, up, c.distance, focal(max(self.height(), 1)), d.x(), d.y()
-            )
+            wpp = self._world_per_pixel()
+            c.target = c.target - right * (d.x() * wpp) + up * (d.y() * wpp)
         else:
             return
         self._dragging = True
         self._settle.start()
         self.invalidate()
         self.camera_changed.emit()
+
+    def _track_cursor(self, px: float, py: float) -> None:
+        """Record the world point under the cursor (where its ray meets the ground plane) for
+        the on-screen readout. The ground plane is the grid's Z, so the coordinate reads true
+        for prop placement in the Top view."""
+        eye, d = cursor_ray(self.camera, px, py, self.width(), self.height())
+        lo, _hi = self.renderer.frame_bounds
+        z = float(lo[2])
+        dz = float(d[2])
+        if abs(dz) < 1e-9:
+            self._cursor_world = None
+            return
+        t = (z - float(eye[2])) / dz
+        self._cursor_world = eye + d * t if t > 0 else None
 
     def mouseReleaseEvent(self, e) -> None:
         if self._edit_drag and e.button() == Qt.MouseButton.LeftButton:
@@ -1488,7 +1730,7 @@ class MeshCanvas(QWidget):
             self.selection_changed.emit(picked)
             self.invalidate()
         if e.button() == Qt.MouseButton.RightButton:
-            self._stop_fly()
+            self._end_fly_hold()
         self._drag = None
         self._settle.start(10)
 
@@ -1505,17 +1747,41 @@ class MeshCanvas(QWidget):
         self.invalidate()
         self.camera_changed.emit()
 
-    def _start_fly(self) -> None:
-        self._flying = True
-        self._fly_last = time.perf_counter()
-        self._fly_timer.start()
+    def set_fly(self, on: bool) -> None:
+        """Turn the persistent fly toggle on or off (the Fly button and Space call this)."""
+        if self._fly_toggle == on:
+            return
+        self._fly_toggle = on
+        self._update_fly_state()
+        self.fly_changed.emit(self._fly_toggle)
 
-    def _stop_fly(self) -> None:
-        self._flying = False
-        self._fly_timer.stop()
-        self._fly_keys.clear()
-        self._dragging = False
+    def toggle_fly(self) -> None:
+        self.set_fly(not self._fly_toggle)
+
+    def _begin_fly_hold(self) -> None:
+        self._fly_hold = True
+        self._update_fly_state()
+
+    def _end_fly_hold(self) -> None:
+        self._fly_hold = False
+        self._update_fly_state()
+
+    def _update_fly_state(self) -> None:
+        """Fly is active while held with the right button or while toggled on; keep the move
+        timer and the flag in step with those two inputs."""
+        flying = self._fly_toggle or self._fly_hold
+        if flying == self._flying:
+            return
+        self._flying = flying
+        if flying:
+            self._fly_last = time.perf_counter()
+            self._fly_timer.start()
+        else:
+            self._fly_timer.stop()
+            self._fly_keys.clear()
+            self._dragging = False
         self.invalidate()
+        self.camera_changed.emit()
 
     def _fly_step(self) -> None:
         now = time.perf_counter()
@@ -1550,20 +1816,40 @@ class MeshCanvas(QWidget):
 
     def wheelEvent(self, e) -> None:
         steps = e.angleDelta().y() / 120.0
+        px, py = e.position().x(), e.position().y()
         if self._flying:  # the wheel sets the fly speed, not the zoom
             self.fly_speed = max(1.0, self.fly_speed * (1.25**steps))
             self.camera_changed.emit()
+            self.update()
             return
-        eye, d = cursor_ray(self.camera, e.position().x(), e.position().y(),
-                            self.width(), self.height())  # fmt: skip
-        _e2, _r, _u, forward = self.camera.basis()
-        min_dist = max(self._scene_diag() * 5e-4, 1.0)
-        target, dist = dolly_to_ray(eye, forward, self.camera.distance, d, 0.8**steps, min_dist)
-        self.camera.target, self.camera.distance = target, dist
+        factor = ZOOM_STEP ** (steps * self.sensitivity)
+        if self.camera.ortho:
+            min_half = max(self._scene_diag() * 5e-4, 1.0)
+            self.camera.target, self.camera.ortho_half_h = dolly_ortho(
+                self.camera, px, py, self.width(), self.height(), factor, min_half
+            )
+        else:
+            eye, d = cursor_ray(self.camera, px, py, self.width(), self.height())
+            _e2, _r, _u, forward = self.camera.basis()
+            min_dist = max(self._scene_diag() * 5e-4, 1.0)
+            # zoom towards the surface actually under the cursor when the ray hits one, so the
+            # point stays put; otherwise towards the pivot plane.
+            hit = ray_mesh_hit(eye, d, self.renderer.points, self.renderer.tris)
+            anchor_t = float(np.dot(hit - eye, d)) if hit is not None else None
+            target, dist = dolly_to_ray(
+                eye, forward, self.camera.distance, d, factor, min_dist, anchor_t
+            )
+            self.camera.target, self.camera.distance = target, dist
         self._dragging = True
         self._settle.start()
         self.invalidate()
         self.camera_changed.emit()
+
+    #: number keys to preset views.
+    _PRESET_KEYS = {
+        Qt.Key.Key_1: "top", Qt.Key.Key_2: "front",
+        Qt.Key.Key_3: "side", Qt.Key.Key_4: "perspective",
+    }  # fmt: skip
 
     def keyPressEvent(self, e) -> None:
         k = e.key()
@@ -1576,6 +1862,10 @@ class MeshCanvas(QWidget):
         elif k == Qt.Key.Key_H:
             self.show_help = not self.show_help
             self.update()
+        elif k == Qt.Key.Key_Space:
+            self.toggle_fly()
+        elif k in self._PRESET_KEYS:
+            self.set_preset(self._PRESET_KEYS[k])
         elif k in _FLY_KEYS and self._flying:
             if not e.isAutoRepeat():
                 self._fly_keys.add(k)
@@ -1989,19 +2279,41 @@ class MeshView(AssetView):
             "Edit placed entities and static-model props in place; click a marker to select"
         )
         self.edit_button.setVisible(False)
+        self.fly_button = self._toggle("Fly", False, self._set_fly)
+        self.fly_button.setAutoRaise(True)
+        self.fly_button.setToolTip("Fly through the map: WASD move, Q/E down/up, Shift sprint "
+                                   "(Space, or hold the right button)")  # fmt: skip
         self.mode = QComboBox(bar)
         self.mode.addItems(COLLISION_MODES)
         self.mode.setToolTip("Which collision geometry to draw")
         self.mode.currentIndexChanged.connect(self._apply_mode)
+        # Preset views: Top / Front / Side are orthographic and axis aligned, Perspective is
+        # the free 3D view. Each snaps the camera and frames the whole map.
+        self.view_buttons = []
+        for text, preset, tip in (
+            ("Top", "top", "Top-down orthographic view (1), for placing props"),
+            ("Front", "front", "Front orthographic elevation (2)"),
+            ("Side", "side", "Side orthographic elevation (3)"),
+            ("Persp", "perspective", "Free perspective view (4)"),
+        ):
+            b = QToolButton(bar)
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setAutoRaise(True)
+            b.clicked.connect(lambda _c=False, name=preset: self._pick_preset(name))
+            self.view_buttons.append(b)
         self.frame_button = QToolButton(bar)
         self.frame_button.setText("Frame all")
-        self.frame_button.setToolTip("Frame the whole scene (Home)")
+        self.frame_button.setToolTip("Frame the whole map (Home)")
         self.frame_button.clicked.connect(lambda: self.canvas.frame_scene())
         self.info = QLabel("", bar)
         self.info.setObjectName("AssetMeta")
         for w in (self.shaded_button, self.depth_button, self.grid_button,
-                  self.models_button, self.edit_button, self.mode):  # fmt: skip
+                  self.models_button, self.edit_button, self.fly_button, self.mode):  # fmt: skip
             row.addWidget(w)
+        row.addSpacing(8)
+        for b in self.view_buttons:
+            row.addWidget(b)
         row.addStretch(1)
         row.addWidget(self.info)
         row.addWidget(self.frame_button)
@@ -2009,6 +2321,7 @@ class MeshView(AssetView):
 
         self.canvas = MeshCanvas(self)
         self.canvas.camera_changed.connect(self._camera_status)
+        self.canvas.fly_changed.connect(self._on_fly_changed)
         self.canvas.selection_changed.connect(self._on_pick)
         self.canvas.edited.connect(self._on_edited)
         self.canvas.status.connect(self.status)
@@ -2130,6 +2443,22 @@ class MeshView(AssetView):
         if self.doc is None or self.mesh_kind not in ("world", "world_models"):
             return
         self._start(self.doc, "world_models" if on else "world", self.ref)
+
+    def _pick_preset(self, name: str) -> None:
+        self.canvas.set_preset(name)
+        self.canvas.setFocus()  # so 1-4 and WASD reach the canvas, not the button just clicked
+
+    def _set_fly(self, on: bool) -> None:
+        self.canvas.set_fly(on)
+        self.canvas.setFocus()  # so WASD reaches the canvas, not the button just clicked
+
+    def _on_fly_changed(self, on: bool) -> None:
+        """Keep the Fly button in step when fly is toggled from the canvas (Space, or a
+        right-button hold ending, or a preset clearing it)."""
+        if self.fly_button.isChecked() != on:
+            self.fly_button.blockSignals(True)
+            self.fly_button.setChecked(on)
+            self.fly_button.blockSignals(False)
 
     # -- in-place editing --------------------------------------------------------------------
 
