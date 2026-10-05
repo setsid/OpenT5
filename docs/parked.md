@@ -12,3 +12,6 @@ per branch. Each line: what, where, and why it is parked.
   plus E501 lines in `convert.propclip`, `mapwriter.path_nodes`, `preview` and
   `test_pathlinks`, and one UP037 in `convert.propclip`. Not introduced by the editor or the
   camera work. Worth a separate formatting/lint pass.
+- `gui/geometry.py` `_cache` and `_models_state` are keyed by `id(xfile)` and are not purged when
+  a new zone loads (only `_helpers`/`_texcache` are cleared), so old MeshData can linger in memory.
+  Pre-existing cache behaviour; worth a purge-on-zone-load pass.
