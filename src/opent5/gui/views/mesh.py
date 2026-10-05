@@ -510,6 +510,13 @@ class MapEditController:
         #: bumped on every prop structural edit (add / move / rotate / delete) and on undo /
         #: redo, so the view knows to rebuild the placed-model mesh for a live refresh.
         self._prop_rev = 0
+        #: bumped on any edit that could move a marker or prop, so the per-paint projection
+        #: cache below is dropped. The view repaints on every mouse move for the cursor
+        #: readout, so projecting every prop and entity each time was the overlay's main cost;
+        #: the cache reuses the last projection while the camera and the scene are unchanged.
+        self._scene_epoch = 0
+        self._markers_cache: list | None = None
+        self._proj_cache: dict = {}
 
     # static-model props and their clip collision
     def props(self) -> list:
@@ -625,42 +632,76 @@ class MapEditController:
         return result
 
     # selection and projection
+    def invalidate_projection(self) -> None:
+        """Drop the cached marker/prop projections (an edit moved something, or the markers
+        list changed). The next paint reprojects."""
+        self._scene_epoch += 1
+        self._markers_cache = None
+        self._proj_cache.clear()
+
     def markers(self) -> list:
-        return self.session.markers()
+        if self._markers_cache is None:
+            self._markers_cache = self.session.markers()
+        return self._markers_cache
+
+    @staticmethod
+    def _cam_sig(cam: Camera, w: int, h: int) -> tuple:
+        return (round(cam.yaw, 6), round(cam.pitch, 6), round(cam.distance, 4),
+                float(cam.target[0]), float(cam.target[1]), float(cam.target[2]),
+                cam.ortho, round(cam.ortho_half_h, 4), w, h)  # fmt: skip
+
+    def _project_all(self, origins: np.ndarray, cam: Camera, w: int, h: int):
+        """Project an (n, 3) array of world points to the screen in one vectorised pass:
+        ``((n, 2) positions with NaN behind the camera, (n,) depths)``. One matrix multiply for
+        every marker rather than a Python call each, which is what made the overlay slow."""
+        eye, right, up, forward = cam.basis()
+        if not len(origins):
+            return np.zeros((0, 2), np.float64), np.zeros(0, np.float64)
+        rel = np.asarray(origins, np.float64) - eye
+        x = rel @ right
+        y = rel @ up
+        z = rel @ forward
+        front = z > 1e-9
+        if cam.ortho:
+            oscale = cam.ortho_scale(h)
+            sx = w / 2.0 + oscale * x
+            sy = h / 2.0 - oscale * y
+        else:
+            f = focal(h)
+            zz = np.where(front, z, 1.0)
+            sx = w / 2.0 + f * x / zz
+            sy = h / 2.0 - f * y / zz
+        pts = np.stack([np.where(front, sx, np.nan), np.where(front, sy, np.nan)], 1)
+        depths = np.where(front, z, np.inf)
+        return pts, depths
 
     def marker_screen(self, cam: Camera, w: int, h: int):
-        from opent5.edit import gizmo as gz
-
-        eye, right, up, forward = cam.basis()
-        f = focal(h)
-        oscale = cam.ortho_scale(h) if cam.ortho else None
-        ids, pts, depths = [], [], []
-        for o in self.markers():
-            sx, sy, depth, front = gz.project_point(
-                o.origin, eye, right, up, forward, f, w, h, oscale
-            )
-            ids.append(o.id)
-            pts.append((sx, sy) if front else (np.nan, np.nan))
-            depths.append(depth if front else np.inf)
-        return ids, np.array(pts, np.float64).reshape(-1, 2), np.array(depths, np.float64)
+        cached = self._proj_cache.get("markers")
+        sig = (self._cam_sig(cam, w, h), self._scene_epoch)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+        markers = self.markers()
+        ids = [o.id for o in markers]
+        origins = np.array([o.origin for o in markers], np.float64).reshape(-1, 3)
+        pts, depths = self._project_all(origins, cam, w, h)
+        result = (ids, pts, depths)
+        self._proj_cache["markers"] = (sig, result)
+        return result
 
     def prop_screen(self, cam: Camera, w: int, h: int):
         """Static-model prop origins projected to the screen, for picking and markers:
         ``(indices, (n, 2) positions, depths)``."""
-        from opent5.edit import gizmo as gz
-
-        eye, right, up, forward = cam.basis()
-        f = focal(h)
-        oscale = cam.ortho_scale(h) if cam.ortho else None
-        idxs, pts, depths = [], [], []
-        for p in self.props():
-            sx, sy, depth, front = gz.project_point(
-                p.origin, eye, right, up, forward, f, w, h, oscale
-            )
-            idxs.append(p.index)
-            pts.append((sx, sy) if front else (np.nan, np.nan))
-            depths.append(depth if front else np.inf)
-        return idxs, np.array(pts, np.float64).reshape(-1, 2), np.array(depths, np.float64)
+        cached = self._proj_cache.get("props")
+        sig = (self._cam_sig(cam, w, h), self._prop_rev)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+        props = self.props()
+        idxs = [p.index for p in props]
+        origins = np.array([p.origin for p in props], np.float64).reshape(-1, 3)
+        pts, depths = self._project_all(origins, cam, w, h)
+        result = (idxs, pts, depths)
+        self._proj_cache["props"] = (sig, result)
+        return result
 
     @property
     def props_pickable(self) -> bool:
@@ -870,6 +911,7 @@ class MapEditController:
             origin = gz.translate_on_axis(self._drag["start"], axis, self._drag["s0"], s1)
             origin = gz.snap_vec(origin, self.grid) if self.grid else origin
             self.session.move_object(obj.id, origin, coalesce=True, group=self._drag_token)
+        self.invalidate_projection()  # the dragged entity moved; reproject the markers
 
     def _update_prop_drag(self, gz, eye, d) -> None:
         """A prop drag updates only the live preview; the heavy clip edit lands on release."""
@@ -935,27 +977,32 @@ class MapEditController:
     # structural edits
     def add(self, keys: dict) -> int:
         self.selected_id = self.session.add_object(keys)
+        self.invalidate_projection()  # the markers list grew
         return self.selected_id
 
     def duplicate(self) -> int | None:
         if self.selected_id is None:
             return None
         self.selected_id = self.session.duplicate_object(self.selected_id)
+        self.invalidate_projection()
         return self.selected_id
 
     def delete(self) -> None:
         if self.selected_id is not None:
             self.session.delete_object(self.selected_id)
             self.selected_id = None
+            self.invalidate_projection()
 
     def set_property(self, key: str, value: str | None) -> None:
         if self.selected_id is not None:
             self.session.set_property(self.selected_id, key, value)
+            self.invalidate_projection()  # a property edit may move the marker (origin)
 
     def undo(self) -> None:
         self.session.undo()
         self._props_cache = None
         self._prop_rev += 1  # an undo may restore a prop's placement; refresh the mesh
+        self.invalidate_projection()
         if self.selected() is None:
             self.selected_id = None
 
@@ -963,6 +1010,7 @@ class MapEditController:
         self.session.redo()
         self._props_cache = None
         self._prop_rev += 1
+        self.invalidate_projection()
 
 
 class Renderer:
@@ -1012,6 +1060,18 @@ class Renderer:
         else:
             self.bounds = self.frame_bounds = self.focus_bounds = (np.zeros(3), np.zeros(3))
         self._build_grid()
+
+    def update_points(self, positions: np.ndarray) -> None:
+        """Replace the vertex positions without touching the edge, triangle or grid topology.
+        For a live prop move or rotate, the triangles and their wireframe edges are unchanged
+        and only some vertices shift, so this skips the costly edge rebuild (``unique_edges``)
+        and robust framing (percentiles) that ``set_mesh`` does. The full min/max bounds are
+        refreshed cheaply for the near/far planes and fly speed; the trimmed framing bounds
+        stay as they were, which a single moved prop leaves effectively unchanged anyway."""
+        self.points = np.ascontiguousarray(positions, np.float32)
+        if len(self.points):
+            self.bounds = (self.points.min(0).astype(np.float64),
+                           self.points.max(0).astype(np.float64))  # fmt: skip
 
     def _build_grid(self) -> None:
         lo, hi = self.frame_bounds
@@ -1177,8 +1237,10 @@ class MeshCanvas(QWidget):
         #: it, so a user who wants it calmer or quicker has one dial.
         self.sensitivity = 1.0
         self._focus = None  # last point picked by a double click, or None
-        #: world point under the cursor (on the ground plane), for the on-screen readout.
+        #: world point under the cursor (on the ground plane), for the on-screen readout, and
+        #: the last whole-unit coordinate shown, so an idle move repaints only when it changes.
         self._cursor_world: np.ndarray | None = None
+        self._cursor_shown: tuple | None = None
         self.setMouseTracking(True)  # so the readout tracks the cursor without a button held
         self._settle = QTimer(self)
         self._settle.setSingleShot(True)
@@ -1212,6 +1274,15 @@ class MeshCanvas(QWidget):
         self._scene = None  # the shaded scene is rebuilt for the new mesh
         self._scene_uploaded = False
         self._tex_count = 0
+        self.invalidate()
+
+    def update_mesh_positions(self, mesh) -> None:
+        """Refresh only the vertex positions of the current mesh (a live prop move or rotate,
+        where the triangles are unchanged). Keeps the wireframe edges, so the view updates
+        without the full ``set_mesh`` rebuild. A shaded scene, which carries its own vertex
+        buffer, is rebuilt separately by the view."""
+        self.renderer.update_points(mesh.positions)
+        self.counts = (len(mesh.positions), len(mesh.triangles), len(self.renderer.edges))
         self.invalidate()
 
     def set_shaded(self, on: bool) -> None:
@@ -1508,16 +1579,16 @@ class MeshCanvas(QWidget):
         # real map, so draw them only when the pick filter includes entities; the default
         # Props filter hides them so the props are visible and reachable.
         if ctl.entities_pickable:
-            ids, pts, _depths = ctl.marker_screen(self.camera, w, h)
-            for obj in ctl.markers():
-                try:
-                    i = ids.index(obj.id)
-                except ValueError:
+            # marker_screen projects every marker in one pass and returns rows aligned with
+            # markers(); iterate by position (no per-marker id lookup) and skip anything behind
+            # the camera or off screen, so only the visible dots cost a draw call.
+            markers = ctl.markers()
+            _ids, pts, _depths = ctl.marker_screen(self.camera, w, h)
+            sel = ctl.selected_id
+            for obj, (sx, sy) in zip(markers, pts, strict=True):
+                if np.isnan(sx) or sx < -8 or sy < -8 or sx > w + 8 or sy > h + 8:
                     continue
-                sx, sy = pts[i]
-                if np.isnan(sx):
-                    continue
-                selected = obj.id == ctl.selected_id
+                selected = obj.id == sel
                 colour = QColor(MARKER_KINDS.get(obj.kind, t.text))
                 r = 5 if selected else 3
                 if selected:
@@ -1530,6 +1601,15 @@ class MeshCanvas(QWidget):
         self._paint_cluster(p)
         self._paint_gizmo_handles(p)
 
+    def _diamond(self, p: QPainter, sx: float, sy: float, r: float) -> None:
+        # QPainter.drawPolygon takes a single QPolygonF, not loose points: passing four
+        # QPointF args raises inside paintEvent, which unwinds through Qt's C++ paint
+        # callback and crashes the windowed app on the first repaint with props drawn.
+        p.drawPolygon(
+            QPolygonF([QPointF(sx, sy - r), QPointF(sx + r, sy),
+                       QPointF(sx, sy + r), QPointF(sx - r, sy)])  # fmt: skip
+        )
+
     def _paint_prop_markers(self, p: QPainter) -> None:
         """Static-model props as small diamonds; the selected one brighter."""
         ctl = self.controller
@@ -1538,43 +1618,37 @@ class MeshCanvas(QWidget):
         if not ctl.props_pickable and ctl.selected_prop is None:
             return
         t = theme.current()
-        from opent5.edit import gizmo as gz
+        w, h = self.width(), self.height()
+        base = QColor("#8e7fa0")
+        if ctl.props_pickable:
+            # One cached projection of every prop origin (reused across repaints while the
+            # camera holds), then draw only the on-screen ones. Projecting each prop with a
+            # Python call every paint was the overlay's cost on a prop-heavy map.
+            _idxs, pts, _depths = ctl.prop_screen(self.camera, w, h)
+            selected_idx = ctl.selected_prop
+            p.setPen(QPen(base, 1.2))
+            p.setBrush(base)
+            for (sx, sy), idx in zip(pts, _idxs, strict=True):
+                if idx == selected_idx:
+                    continue  # drawn below from the live gizmo centre
+                if np.isnan(sx) or sx < -8 or sy < -8 or sx > w + 8 or sy > h + 8:
+                    continue
+                self._diamond(p, sx, sy, 4)
+        if ctl.selected_prop is not None:
+            from opent5.edit import gizmo as gz
 
-        eye, right, up, forward = self.camera.basis()
-        f = focal(self.height())
-        oscale = self.camera.ortho_scale(self.height()) if self.camera.ortho else None
-        for prop in ctl.props():
-            selected = prop.index == ctl.selected_prop
-            if not selected and not ctl.props_pickable:
-                continue
-            origin = prop.origin
-            if selected:
-                centre = ctl.gizmo_centre()  # follows a live translate preview
-                if centre is not None:
-                    origin = centre
-            sx, sy, _d, front = gz.project_point(
-                origin, eye, right, up, forward, f, self.width(), self.height(), oscale
-            )
-            if not front:
-                continue
-            # props stand out from the entity dots: a brighter, larger diamond, not a square.
-            colour = QColor("#c88bd8" if selected else "#8e7fa0")
-            p.setPen(QPen(QColor(t.text) if selected else colour, 1.5 if selected else 1.2))
-            p.setBrush(colour)
-            r = 6 if selected else 4
-            # QPainter.drawPolygon takes a single QPolygonF, not loose points: passing four
-            # QPointF args raises inside paintEvent, which unwinds through Qt's C++ paint
-            # callback and crashes the windowed app on the first repaint with props drawn.
-            p.drawPolygon(
-                QPolygonF(
-                    [
-                        QPointF(sx, sy - r),
-                        QPointF(sx + r, sy),
-                        QPointF(sx, sy + r),
-                        QPointF(sx - r, sy),
-                    ]
-                )
-            )
+            eye, right, up, forward = self.camera.basis()
+            f = focal(h)
+            oscale = self.camera.ortho_scale(h) if self.camera.ortho else None
+            centre = ctl.gizmo_centre()  # follows a live translate preview
+            if centre is not None:
+                sx, sy, _d, front = gz.project_point(centre, eye, right, up, forward, f, w, h,
+                                                     oscale)  # fmt: skip
+                if front:
+                    colour = QColor("#c88bd8")
+                    p.setPen(QPen(QColor(t.text), 1.5))
+                    p.setBrush(colour)
+                    self._diamond(p, sx, sy, 6)
 
     def _paint_cluster(self, p: QPainter) -> None:
         """Highlight the selected prop's clip cluster (the collision a move or delete
@@ -1656,7 +1730,7 @@ class MeshCanvas(QWidget):
             self._begin_fly_hold()
 
     def mouseMoveEvent(self, e) -> None:
-        self._track_cursor(e.position().x(), e.position().y())
+        moved = self._track_cursor(e.position().x(), e.position().y())
         if self._edit_drag and self.controller is not None:
             self.controller.update_drag(
                 self.camera, e.position().x(), e.position().y(), self.width(), self.height()
@@ -1668,7 +1742,11 @@ class MeshCanvas(QWidget):
                 self.edited.emit()
             return
         if self._drag is None:
-            self.update()  # redraw the cursor readout even without a drag
+            # Redraw for the cursor readout, but only when the shown coordinate actually
+            # changes: the HUD prints whole units, so a sub-unit wiggle need not repaint the
+            # whole overlay on every mouse-move event.
+            if moved:
+                self.update()
             return
         last, _buttons = self._drag
         d = e.position() - last
@@ -1696,19 +1774,26 @@ class MeshCanvas(QWidget):
         self.invalidate()
         self.camera_changed.emit()
 
-    def _track_cursor(self, px: float, py: float) -> None:
+    def _track_cursor(self, px: float, py: float) -> bool:
         """Record the world point under the cursor (where its ray meets the ground plane) for
         the on-screen readout. The ground plane is the grid's Z, so the coordinate reads true
-        for prop placement in the Top view."""
+        for prop placement in the Top view. Returns whether the shown (whole-unit) coordinate
+        changed, so an idle mouse-move can skip a repaint when the readout would not change."""
         eye, d = cursor_ray(self.camera, px, py, self.width(), self.height())
         lo, _hi = self.renderer.frame_bounds
         z = float(lo[2])
         dz = float(d[2])
         if abs(dz) < 1e-9:
             self._cursor_world = None
-            return
-        t = (z - float(eye[2])) / dz
-        self._cursor_world = eye + d * t if t > 0 else None
+        else:
+            t = (z - float(eye[2])) / dz
+            self._cursor_world = eye + d * t if t > 0 else None
+        shown = (None if self._cursor_world is None
+                 else tuple(round(float(v)) for v in self._cursor_world))  # fmt: skip
+        if shown == self._cursor_shown:
+            return False
+        self._cursor_shown = shown
+        return True
 
     def mouseReleaseEvent(self, e) -> None:
         if self._edit_drag and e.button() == Qt.MouseButton.LeftButton:
@@ -2570,13 +2655,22 @@ class MeshView(AssetView):
             return
         from opent5.gui import geometry
 
-        geometry.drop_static_models(self.doc)
-        try:
-            self.mesh = self.doc.mesh("world_models", self.ref)
-        except (EditError, ValueError, KeyError, IndexError, TypeError) as exc:
-            self.status.emit(f"Could not refresh the models view: {exc}")
-            return
-        self._apply_mode()
+        # A move, rotate or rescale leaves the mesh topology intact (the same props, the same
+        # triangles), so restage rewrites only the moved props' vertices and the view refreshes
+        # without rebuilding the whole world+models mesh or its wireframe edges. An add, delete
+        # or model swap changes which props draw, so it falls back to the full rebuild.
+        incremental = geometry.restage_static_models(self.doc)
+        if incremental is not None:
+            self.mesh = incremental
+            self.canvas.update_mesh_positions(self.mesh)
+        else:
+            geometry.drop_static_models(self.doc)
+            try:
+                self.mesh = self.doc.mesh("world_models", self.ref)
+            except (EditError, ValueError, KeyError, IndexError, TypeError) as exc:
+                self.status.emit(f"Could not refresh the models view: {exc}")
+                return
+            self._apply_mode()
         if self.shaded_button.isChecked() and not self._sync:
             self.canvas._scene = None
             self._build_scene()

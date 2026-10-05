@@ -228,3 +228,113 @@ def test_view_rebuilds_models_mesh_after_a_prop_move():
 
     # the rebuilt mesh now carries the moved model's vertices at the new, far-off spot
     assert near_far_spot(view.mesh) > 0
+
+
+# -- performance: a move refreshes in place, not a whole-mesh rebuild ------------------------
+
+
+def _drawing_prop(s: EditSession):
+    for p in s.static_models():
+        if s._draw_inst_at_origin(p.origin) is not None:
+            return p
+    pytest.skip("no drawing prop in this mp_nuked build")
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_prop_move_restages_in_place_matching_a_full_rebuild():
+    """A prop move keeps the mesh topology (same props, same triangles), so the view restages
+    only the moved prop's vertices rather than rebuilding the whole world+models mesh. The
+    result must be identical to a full rebuild, and must reuse the existing triangle array
+    (proof no rebuild happened)."""
+    import time
+
+    import numpy as np
+
+    doc = ZoneDoc.open(retail_zone("mp_nuked"))
+    view = mv.MeshView()
+    view.load_sync(doc, "world_models")  # records the restage plan
+    session = view._ensure_session()
+    ctl = mv.MapEditController(session)
+    prop = _drawing_prop(session)
+    ctl.selected_prop = prop.index
+
+    before_tris = view.mesh.triangles
+    before_pos = view.mesh.positions.copy()
+    ctl.move_selected_prop((777.0, -321.0, 44.0))
+
+    s = time.perf_counter()
+    inc = geometry.restage_static_models(doc)
+    restage_ms = (time.perf_counter() - s) * 1000.0
+    assert inc is not None  # a move takes the fast, in-place path
+    assert inc.triangles is before_tris  # the triangle array is reused: no mesh rebuild
+    assert not np.array_equal(inc.positions, before_pos)  # but the moved prop's verts shifted
+
+    # identical to a full rebuild from the edited placements
+    world = geometry.mesh(doc, "world", None)
+    asset = geometry._pick(doc.xfile, geometry.WORLD_TYPES, None, "world")
+    s = time.perf_counter()
+    full = geometry.with_static_models(doc.xfile, asset, world)
+    full_ms = (time.perf_counter() - s) * 1000.0
+    assert np.array_equal(inc.positions, full.positions)
+    assert np.array_equal(inc.normals, full.normals)
+    assert np.array_equal(inc.triangles, full.triangles)
+    assert np.array_equal(inc.groups, full.groups)
+    assert np.array_equal(inc.uvs, full.uvs)
+    assert inc.materials == full.materials
+    assert restage_ms < full_ms  # and it is cheaper than the whole-mesh rebuild it replaces
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_prop_add_falls_back_to_full_rebuild():
+    """Adding a prop changes which models draw (the mesh topology), so the in-place restage
+    declines and the view does the full rebuild."""
+    doc = ZoneDoc.open(retail_zone("mp_nuked"))
+    view = mv.MeshView()
+    view.load_sync(doc, "world_models")
+    session = view._ensure_session()
+    ctl = mv.MapEditController(session)
+    models = ctl.placeable_models()
+    if not models:
+        pytest.skip("no placeable model in this build")
+
+    ctl.add_prop(models[0], (0.0, 0.0, 5000.0), (16.0, 16.0, 16.0))
+    assert geometry.restage_static_models(doc) is None  # topology changed: full rebuild needed
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_marker_projection_culls_offscreen_and_caches():
+    """The overlay projects every prop and marker in one pass, culls the ones behind the
+    camera, and caches the result while the camera and the scene hold, so repainting on every
+    mouse move does not reproject the whole scene."""
+    import numpy as np
+
+    doc = ZoneDoc.open(retail_zone("mp_nuked"))
+    view = mv.MeshView()
+    view.load_sync(doc, "world_models")
+    session = view._ensure_session()
+    ctl = mv.MapEditController(session)
+    cam = view.canvas.camera
+    view.canvas.frame_scene()
+    w, h = 1200, 800
+
+    # a point behind the camera projects to NaN (culled); the target in front projects
+    eye, _right, _up, forward = cam.basis()
+    behind = eye - forward * 1000.0
+    pts, _depths = ctl._project_all(np.array([behind, cam.target], np.float64), cam, w, h)
+    assert np.isnan(pts[0, 0])  # behind the camera: dropped
+    assert not np.isnan(pts[1, 0])  # in front: kept
+
+    # the projection is cached while the camera holds, and reprojected when it moves
+    a = ctl.prop_screen(cam, w, h)
+    assert ctl.prop_screen(cam, w, h) is a  # reused, not reprojected
+    cam.yaw += 0.5
+    assert ctl.prop_screen(cam, w, h) is not a  # camera moved: fresh projection
+
+    # an edit invalidates the cache so the moved prop reprojects
+    before = ctl.prop_screen(cam, w, h)
+    ctl.selected_prop = _drawing_prop(session).index
+    ctl.move_selected_prop((10.0, 0.0, 0.0))
+    assert ctl.prop_screen(cam, w, h) is not before
