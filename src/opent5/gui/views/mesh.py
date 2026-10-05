@@ -719,8 +719,7 @@ class MapEditController:
         props = [
             p.index
             for p in self.props()
-            if p.index != prop.index
-            and boxes_overlap(prop.absmin, prop.absmax, p.absmin, p.absmax)
+            if p.index != prop.index and boxes_overlap(prop.absmin, prop.absmax, p.absmin, p.absmax)
         ]
         return {"clips": clips, "props": props}
 
@@ -1336,9 +1335,9 @@ class Renderer:
                     # look like translucent solids over the wireframe rather than flat lines.
                     ccov = (1.0 - np.exp(-0.5 * cc[chit]))[:, None]
                     cunder = out[chit].astype(np.float32)
-                    out[chit] = np.clip(
-                        cunder + (clip_rgb - cunder) * ccov, 0, 255
-                    ).astype(np.uint8)
+                    out[chit] = np.clip(cunder + (clip_rgb - cunder) * ccov, 0, 255).astype(
+                        np.uint8
+                    )
         img8 = out.reshape(h, w, 3)
         image = QImage(img8.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
         self.last_ms = (time.perf_counter() - started) * 1000.0
@@ -1504,15 +1503,16 @@ class MeshCanvas(QWidget):
     def gl_available(self) -> bool:
         if self._gl_failed:
             return False
-        if self._gl is None:
-            from opent5.gui.glrender import ShadedRenderer
+        from opent5.gui.glrender import ShadedRenderer, can_draw
 
-            self._gl = ShadedRenderer()
-        # usable(), not available(): a context that creates but cannot draw (headless WSL) must
-        # not offer shaded mode, or the view goes blank. The probe is cached on the renderer.
-        if not self._gl.usable():
+        # The decision uses the process-wide probe (can_draw), so defaulting to the GPU on every
+        # map load does not create a GL context per view. Only when GL can actually draw do we
+        # make this canvas its own renderer for the frames.
+        if not can_draw():
             self._gl_failed = True
             return False
+        if self._gl is None:
+            self._gl = ShadedRenderer()
         return True
 
     def set_scene(self, scene, tex_count: int) -> None:
@@ -1521,6 +1521,30 @@ class MeshCanvas(QWidget):
         self._scene_uploaded = False
         self._tex_count = tex_count
         self.invalidate()
+
+    def update_scene_vertices(self, mesh, ranges) -> bool:
+        """Refresh only the moved props' vertices in the uploaded shaded scene, both the
+        CPU-side interleaved copy and the GPU buffer, for a live prop move where the triangles,
+        groups and textures are unchanged. Returns False (so the caller falls back to a full
+        scene rebuild) when there is no uploaded scene to patch, which is the case headless and
+        before the first shaded frame."""
+        if (
+            self._scene is None
+            or not self._scene_uploaded
+            or self._gl is None
+            or not ranges
+            or mesh.normals is None
+        ):
+            return False
+        inter = self._scene.interleaved
+        for start, count in ranges:
+            inter[start : start + count, 0:3] = mesh.positions[start : start + count]
+            inter[start : start + count, 3:6] = mesh.normals[start : start + count]
+        if not self._gl.update_vertices(inter, ranges):
+            return False
+        self.renderer.update_points(mesh.positions)  # keep the wireframe fallback in step
+        self.invalidate()
+        return True
 
     def invalidate(self) -> None:
         self._key = None
@@ -1855,8 +1879,9 @@ class MeshCanvas(QWidget):
         # QPointF args raises inside paintEvent, which unwinds through Qt's C++ paint
         # callback and crashes the windowed app on the first repaint with props drawn.
         p.drawPolygon(
-            QPolygonF([QPointF(sx, sy - r), QPointF(sx + r, sy),
-                       QPointF(sx, sy + r), QPointF(sx - r, sy)])  # fmt: skip
+            QPolygonF(
+                [QPointF(sx, sy - r), QPointF(sx + r, sy), QPointF(sx, sy + r), QPointF(sx - r, sy)]
+            )  # fmt: skip
         )
 
     def _paint_prop_markers(self, p: QPainter) -> None:
@@ -2707,6 +2732,9 @@ class MeshView(AssetView):
         self._generation = 0
         self._sync = False
         self._jobs: set = set()
+        #: set once the user toggles Shaded by hand, so their choice sticks for the session and
+        #: a later map load does not override it with the GPU-or-not default.
+        self._shaded_user_set = False
 
         bar = QWidget(self)
         bar.setObjectName("ViewBar")
@@ -2843,6 +2871,7 @@ class MeshView(AssetView):
         return b
 
     def _set_shaded(self, on: bool) -> None:
+        self._shaded_user_set = True  # a hand toggle; keep it over the GPU-or-not default
         if on and not self.canvas.gl_available():
             self.shaded_button.blockSignals(True)
             self.shaded_button.setChecked(False)
@@ -2854,6 +2883,25 @@ class MeshView(AssetView):
         if on and self.mesh is not None and self.canvas._scene is None:
             self._build_scene()
         self.canvas.set_shaded(on)
+
+    def _apply_shaded_default(self, sync: bool = False) -> None:
+        """On a fresh mesh, default to the GPU shaded view when OpenGL can draw here and to the
+        software wireframe when it cannot, so the viewer uses the GPU by default without the
+        user having to ask. A hand toggle (``_shaded_user_set``) is respected instead. Keyed off
+        ``canvas.gl_available()``, which is false on a headless machine, so this is unit-testable
+        without a GPU and the software path stays the default there and in screenshots."""
+        if self._shaded_user_set:
+            want = self.shaded_button.isChecked()
+        else:
+            want = self.canvas.gl_available()
+        self.shaded_button.blockSignals(True)
+        self.shaded_button.setChecked(want)
+        self.shaded_button.blockSignals(False)
+        self.depth_button.setEnabled(not want)
+        self.grid_button.setEnabled(not want)
+        if want and self.mesh is not None and self.canvas._scene is None:
+            self._build_scene_sync() if sync else self._build_scene()
+        self.canvas.set_shaded(want)
 
     def _build_scene(self) -> None:
         if self.doc is None or self.mesh is None:
@@ -3110,6 +3158,14 @@ class MeshView(AssetView):
         if incremental is not None:
             self.mesh = incremental
             self.canvas.update_mesh_positions(self.mesh)
+            if self.shaded_button.isChecked() and not self._sync:
+                # Only the moved props' vertices changed, so patch those rows of the uploaded GPU
+                # buffer rather than re-decoding and re-uploading the whole scene. Falls back to
+                # the full rebuild when there is no uploaded scene yet to patch.
+                ranges = geometry.restage_changed_ranges(self.doc)
+                if not self.canvas.update_scene_vertices(self.mesh, ranges):
+                    self.canvas._scene = None
+                    self._build_scene()
         else:
             geometry.drop_static_models(self.doc)
             try:
@@ -3118,9 +3174,9 @@ class MeshView(AssetView):
                 self.status.emit(f"Could not refresh the models view: {exc}")
                 return
             self._apply_mode()
-        if self.shaded_button.isChecked() and not self._sync:
-            self.canvas._scene = None
-            self._build_scene()
+            if self.shaded_button.isChecked() and not self._sync:
+                self.canvas._scene = None
+                self._build_scene()
 
     def _add_prop_dialog(self) -> None:
         """Pick a placeable model and place it at the view target. Offers only models the zone
@@ -3223,8 +3279,6 @@ class MeshView(AssetView):
             self._sync = False
             return
         self._done(self._generation, mesh)
-        if self.shaded_button.isChecked() and self.mesh is not None:
-            self._build_scene_sync()
         self._sync = False
 
     def _done(self, generation: int, mesh: MeshData) -> None:
@@ -3240,8 +3294,7 @@ class MeshView(AssetView):
         self._apply_mode()
         self.stack.setCurrentWidget(self.canvas)
         self.canvas.reset_camera()
-        if self.shaded_button.isChecked() and not self._sync:
-            self._build_scene()
+        self._apply_shaded_default(sync=self._sync)
         if self._edit_after_models:
             # Edit was requested before the static models were loaded; now that they are,
             # turn Edit on (static models are drawn, so props are pickable).

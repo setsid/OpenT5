@@ -289,6 +289,68 @@ def test_prop_move_restages_in_place_matching_a_full_rebuild():
 
 @pytest.mark.zones
 @pytest.mark.slow
+def test_restage_changed_ranges_cover_exactly_the_moved_prop():
+    """restage records the vertex rows it rewrote so the shaded view can re-upload only those
+    to the GPU. The ranges must cover exactly the vertices that actually moved, and patching a
+    fresh full-build interleaved buffer over those rows must reproduce the restaged vertices (so
+    a partial GPU upload lands the same geometry a full re-upload would)."""
+    import numpy as np
+
+    from opent5.gui import glrender
+
+    doc = ZoneDoc.open(retail_zone("mp_nuked"))
+    view = mv.MeshView()
+    view.load_sync(doc, "world_models")
+    before_pos = view.mesh.positions.copy()
+    session = view._ensure_session()
+    ctl = mv.MapEditController(session)
+    prop = _drawing_prop(session)
+    ctl.selected_prop = prop.index
+
+    asset = geometry._pick(doc.xfile, geometry.WORLD_TYPES, None, "world")
+    ctl.move_selected_prop((777.0, -321.0, 44.0))
+    inc = geometry.restage_static_models(doc)
+    assert inc is not None
+    ranges = geometry.restage_changed_ranges(doc)
+    assert ranges  # the move was recorded
+
+    # The ranges cover exactly the rows whose vertices changed, nothing more, nothing less.
+    covered = np.zeros(len(inc.positions), bool)
+    for start, count in ranges:
+        covered[start : start + count] = True
+    moved = np.any(inc.positions != before_pos, axis=1)
+    assert np.array_equal(covered, moved)
+
+    # a partial GPU upload rebuilds the same interleaved buffer a full rebuild would.
+    world = geometry.mesh(doc, "world", None)
+    full = geometry.with_static_models(doc.xfile, asset, world)
+    scene_before = glrender.build_scene(
+        view.mesh.positions, view.mesh.triangles, view.mesh.normals, view.mesh.uvs, None, []
+    )
+    patched = scene_before.interleaved.copy()
+    for start, count in ranges:
+        patched[start : start + count, 0:3] = inc.positions[start : start + count]
+        patched[start : start + count, 3:6] = inc.normals[start : start + count]
+    full_scene = glrender.build_scene(
+        full.positions, full.triangles, full.normals, full.uvs, None, []
+    )
+    assert np.array_equal(patched[:, 0:3], full_scene.interleaved[:, 0:3])
+    assert np.array_equal(patched[:, 3:6], full_scene.interleaved[:, 3:6])
+
+
+@pytest.mark.zones
+@pytest.mark.slow
+def test_update_scene_vertices_falls_back_without_uploaded_scene():
+    """With no uploaded shaded scene (the headless case, and before the first shaded frame),
+    the incremental GPU patch declines so the caller does the full rebuild instead."""
+    doc = ZoneDoc.open(retail_zone("mp_nuked"))
+    view = mv.MeshView()
+    view.load_sync(doc, "world_models")
+    assert view.canvas.update_scene_vertices(view.mesh, [(0, 10)]) is False
+
+
+@pytest.mark.zones
+@pytest.mark.slow
 def test_prop_add_falls_back_to_full_rebuild():
     """Adding a prop changes which models draw (the mesh topology), so the in-place restage
     declines and the view does the full rebuild."""

@@ -76,6 +76,28 @@ void main() {
 """
 
 
+#: Process-wide "can OpenGL actually draw on this machine" answer. Whether GL works is a
+#: property of the machine, not of a canvas, and probing creates a context and a framebuffer,
+#: so probing once per viewer (the GPU-by-default decision runs on every map load) would spawn
+#: a context per view and, on an offscreen WSL box with no real GPU, exhaust GL and crash. This
+#: probes once with a throwaway renderer and every caller reuses the answer.
+_CAN_DRAW: bool | None = None
+
+
+def can_draw() -> bool:
+    """Whether a shaded frame would actually reach the framebuffer here, probed once per
+    process. False on a headless machine (an offscreen context can be made but draws nothing),
+    which keeps the viewer on the software wireframe by default there and in tests."""
+    global _CAN_DRAW
+    if _CAN_DRAW is None:
+        probe = ShadedRenderer()
+        try:
+            _CAN_DRAW = probe.usable()
+        finally:
+            probe._release_buffers()
+    return _CAN_DRAW
+
+
 def _face_normals(positions: np.ndarray, triangles: np.ndarray) -> np.ndarray:
     """Per-vertex normals averaged from the faces, for meshes with no stored normals."""
     n = np.zeros((len(positions), 3), np.float32)
@@ -282,6 +304,30 @@ class ShadedRenderer:
             gltex.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
             gltex.setWrapMode(QOpenGLTexture.WrapMode.Repeat)
             self._gltextures[i] = gltex
+        return True
+
+    def update_vertices(self, interleaved: np.ndarray, ranges) -> bool:
+        """Re-upload only the given ``(start, count)`` vertex rows of the interleaved buffer,
+        for a live prop move where the triangles and textures are unchanged and only a few
+        props' vertices shifted. Writes into the existing VBO with ``glBufferSubData`` rather
+        than reallocating and re-sending the whole scene. Returns False (so the caller rebuilds)
+        if there is no uploaded buffer or GL is not current."""
+        if self._vbo is None or self._scene is None or not ranges:
+            return False
+        if not self._make_current():
+            return False
+        stride = 8 * 4  # bytes per interleaved vertex (pos3, normal3, uv2 float32)
+        rows = np.ascontiguousarray(interleaved, np.float32)
+        try:
+            self._vbo.bind()
+            for start, count in ranges:
+                if count <= 0:
+                    continue
+                chunk = np.ascontiguousarray(rows[start : start + count]).tobytes()
+                self._vbo.write(int(start) * stride, chunk, len(chunk))
+            self._vbo.release()
+        except (RuntimeError, OSError):
+            return False
         return True
 
     def render(

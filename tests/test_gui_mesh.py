@@ -216,6 +216,39 @@ def test_shaded_view_falls_back_without_gl(monkeypatch):
     assert not view.canvas.shaded
 
 
+def test_viewer_defaults_to_gpu_when_gl_available(monkeypatch):
+    """A fresh mesh defaults to the shaded GPU view when OpenGL can draw. Keyed off
+    gl_available(), so it is checked with a stub and needs no real GPU."""
+    view = mv.MeshView()
+    monkeypatch.setattr(view.canvas, "gl_available", lambda: True)
+    view._done(view._generation, MeshData(CUBE_POS, CUBE_TRIS, label="cube"))
+    assert view.shaded_button.isChecked()
+    assert view.canvas.shaded
+
+
+def test_viewer_defaults_to_software_without_gl(monkeypatch):
+    """With no usable GL the viewer stays on the software wireframe by default."""
+    view = mv.MeshView()
+    monkeypatch.setattr(view.canvas, "gl_available", lambda: False)
+    view._done(view._generation, MeshData(CUBE_POS, CUBE_TRIS, label="cube"))
+    assert not view.shaded_button.isChecked()
+    assert not view.canvas.shaded
+
+
+def test_manual_shaded_choice_sticks_across_loads(monkeypatch):
+    """A hand toggle wins over the GPU-or-not default on later loads: turning Shaded off on a
+    GL machine keeps it off when the next map loads."""
+    view = mv.MeshView()
+    monkeypatch.setattr(view.canvas, "gl_available", lambda: True)
+    view._done(view._generation, MeshData(CUBE_POS, CUBE_TRIS, label="cube"))
+    assert view.canvas.shaded  # defaulted on
+    view.shaded_button.setChecked(False)  # user turns it off by hand
+    assert not view.canvas.shaded
+    view._done(view._generation, MeshData(CUBE_POS, CUBE_TRIS, label="cube2"))
+    assert not view.shaded_button.isChecked()  # the hand choice stuck
+    assert not view.canvas.shaded
+
+
 def test_world_view_offers_static_models_only_for_worlds():
     view = mv.MeshView()
     assert view.models_button.isHidden()

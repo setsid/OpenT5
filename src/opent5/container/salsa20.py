@@ -106,6 +106,16 @@ def _rotl(v: np.ndarray, by: int) -> np.ndarray:
     return (v << np.uint32(by)) | (v >> np.uint32(32 - by))
 
 
+# The four quarter-rounds of a column round (then a row round) act on disjoint words, so they
+# are run as one array op over a four-wide axis rather than four separate numpy calls each. The
+# index arrays gather the (a, b, c, d) word of all four quarters at once. Same arithmetic, same
+# bytes out as the per-quarter reference; it just cuts the numpy dispatch count about fourfold.
+_COL = (np.array([0, 5, 10, 15]), np.array([4, 9, 14, 3]),
+        np.array([8, 13, 2, 7]), np.array([12, 1, 6, 11]))  # fmt: skip
+_ROW = (np.array([0, 5, 10, 15]), np.array([1, 6, 11, 12]),
+        np.array([2, 7, 8, 13]), np.array([3, 4, 9, 14]))  # fmt: skip
+
+
 def keystream_fast(
     key: bytes, nonce: bytes, length: int, rounds: int = DEFAULT_ROUNDS, counter: int = 0
 ) -> bytes:
@@ -121,29 +131,27 @@ def keystream_fast(
     blocks = (length + BLOCK_SIZE - 1) // BLOCK_SIZE
     base = _state_for(key, nonce, 0)
     index = np.arange(counter, counter + blocks, dtype=np.uint64)
-    state = [np.full(blocks, word, dtype=np.uint32) for word in base]
+    state = np.empty((16, blocks), np.uint32)
+    for i, word in enumerate(base):
+        state[i] = word
     state[8] = (index & np.uint64(_MASK)).astype(np.uint32)
     state[9] = (index >> np.uint64(32)).astype(np.uint32)
-    x = [w.copy() for w in state]
+    x = state.copy()
 
-    def quarter(a: int, b: int, c: int, d: int) -> None:
-        x[b] ^= _rotl(x[a] + x[d], 7)
-        x[c] ^= _rotl(x[b] + x[a], 9)
-        x[d] ^= _rotl(x[c] + x[b], 13)
-        x[a] ^= _rotl(x[d] + x[c], 18)
+    def grouped(ai, bi, ci, di) -> None:
+        a, b, c, d = x[ai], x[bi], x[ci], x[di]
+        b = b ^ _rotl(a + d, 7)
+        c = c ^ _rotl(b + a, 9)
+        d = d ^ _rotl(c + b, 13)
+        a = a ^ _rotl(d + c, 18)
+        x[ai], x[bi], x[ci], x[di] = a, b, c, d
 
     with np.errstate(over="ignore"):
         for _ in range(rounds // 2):
-            quarter(0, 4, 8, 12)
-            quarter(5, 9, 13, 1)
-            quarter(10, 14, 2, 6)
-            quarter(15, 3, 7, 11)
-            quarter(0, 1, 2, 3)
-            quarter(5, 6, 7, 4)
-            quarter(10, 11, 8, 9)
-            quarter(15, 12, 13, 14)
-        out = np.stack([a + b for a, b in zip(x, state, strict=True)], axis=1)
-    return out.astype("<u4").tobytes()[:length]
+            grouped(*_COL)
+            grouped(*_ROW)
+        out = (x + state).T
+    return np.ascontiguousarray(out).astype("<u4").tobytes()[:length]
 
 
 def crypt(
