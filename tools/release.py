@@ -156,7 +156,6 @@ def preflight(version: str, dry_run: bool, allow_dirty: bool) -> list[str]:
     warnings = []
     if semver.parse(version) is None:
         raise Refused(f"__version__ {version!r} is not MAJOR.MINOR.PATCH")
-    check_versions(version)
     dirty = git("status", "--porcelain").rstrip("\n")
     if dirty.strip():
         if not (dry_run and allow_dirty):
@@ -165,6 +164,7 @@ def preflight(version: str, dry_run: bool, allow_dirty: bool) -> list[str]:
                 + "\n".join("  " + x for x in dirty.splitlines()[:20])
             )
         warnings.append("working tree is dirty (allowed for this dry run only)")
+    check_versions(version)  # after the dirty check, so a dirty tree reports that first
     tag = f"v{version}"
     if git("tag", "--list", tag).strip():
         raise Refused(f"tag {tag} already exists; bump the version (npm run version -- X.Y.Z)")

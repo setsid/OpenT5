@@ -70,6 +70,9 @@ def test_set_version_updates_all_three(tmp_path, monkeypatch, capsys):
 def test_release_refuses_dirty_tree_and_existing_tag(monkeypatch):
     answers = {"status": " M src/x.py\n", "tag": ""}
     monkeypatch.setattr(release, "git", lambda *a, **k: answers.get(a[0], ""))
+    # this test drives the dirty/tag/REPO refusals with a fixed version; the version-consistency
+    # gate is covered by its own test, so neutralise it here.
+    monkeypatch.setattr(release, "check_versions", lambda version: None)
     with pytest.raises(release.Refused, match="dirty"):
         release.preflight("1.0.0", dry_run=True, allow_dirty=False)
     with pytest.raises(release.Refused, match="dirty"):
@@ -82,6 +85,24 @@ def test_release_refuses_dirty_tree_and_existing_tag(monkeypatch):
     with pytest.raises(release.Refused, match="REPO is empty"):
         release.preflight("1.0.0", dry_run=False, allow_dirty=False)
     assert any("REPO" in w for w in release.preflight("1.0.0", True, False))
+
+
+def test_release_refuses_version_mismatch(monkeypatch):
+    # the release gate must refuse when the version-holding files disagree (the bug that let
+    # package.json lag at 0.2.0 while the zone read 0.3.0).
+    monkeypatch.setattr(
+        release,
+        "all_versions",
+        lambda: {"__init__.py": "0.4.0", "pyproject.toml": "0.4.0", "package.json": "0.3.0"},
+    )
+    with pytest.raises(release.Refused, match="version mismatch"):
+        release.check_versions("0.4.0")
+    monkeypatch.setattr(
+        release,
+        "all_versions",
+        lambda: {"__init__.py": "0.4.0", "pyproject.toml": "0.4.0", "package.json": "0.4.0"},
+    )
+    release.check_versions("0.4.0")  # all agree: must not raise
 
 
 def test_release_cli_guards():
