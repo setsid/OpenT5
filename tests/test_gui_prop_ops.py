@@ -4,9 +4,9 @@ OpenT5 3D viewer made to reflect saved edits.
 These drive the real MapEditController and MeshView offscreen against the pinned retail
 mp_nuked (never the live .env zone), so they exercise the same calls the GUI makes:
 
-- a move of an ARBITRARY prop (one with no clip cluster) still moves its render, warns that
-  the baked collision stays, and the viewer (geometry.with_static_models placements) shows it
-  at the new spot after save and reopen;
+- a move of an ARBITRARY prop (one with no clip cluster) still moves its render, adds a fresh
+  solid clip at the new footprint, warns that the old baked collision stays, and the viewer
+  (geometry.with_static_models placements) shows it at the new spot after save and reopen;
 - Add places a CHOSEN placeable model (not just the default crate) and it draws and is solid;
 - Delete hides the render (the viewer no longer places it) and removes the clip;
 - the view rebuilds the placed-model mesh after an edit, without reopening.
@@ -81,9 +81,11 @@ def test_move_clipless_prop_moves_render_and_viewer_reflects(tmp_path):
 
     result = ctl.move_selected_prop((512.0, 0.0, 0.0))
 
-    # a clip-less prop has no cluster to move, but its render moves and it warns
+    # a clip-less prop has no cluster to move, but its render moves, and the bundle move adds a
+    # fresh clip at the new footprint so it is solid there (when the new spot is inside the
+    # BSP); either way it warns that the old baked-triangle collision stays behind.
     assert result["found"] is False and result.get("render_moved") is True
-    assert any("collision stays" in w.lower() for w in result["warnings"])
+    assert any("baked" in w.lower() and "old position" in w.lower() for w in result["warnings"])
     new = (old[0] + 512.0, old[1], old[2])
     assert s._draw_inst_at_origin(old) is None  # the draw instance left the old spot
     assert s._draw_inst_at_origin(new) is not None  # and is at the new one

@@ -24,7 +24,7 @@ import math
 import time
 
 import numpy as np
-from PySide6.QtCore import QObject, QPointF, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QPointF, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QComboBox,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -72,6 +73,15 @@ KIND_TITLES = {
     "model": "Model",
 }
 COLLISION_MODES = ("Brushes and triangles", "Brushes", "Triangles")
+#: Contents-family filter for the collision overlay: label -> families passed to the session.
+COLLISION_FAMILIES = (
+    ("Clip walls", ("clip",)),
+    ("Solid", ("solid",)),
+    ("Clip + solid", ("clip", "solid")),
+    ("All", ("clip", "solid", "other")),
+)
+#: Colour the translucent clip-brush overlay is drawn in (a distinct cyan, additive).
+CLIP_OVERLAY_COLOUR = "#38bdf8"
 HELP_LINES = (
     "LMB orbit   MMB pan   wheel zoom to cursor   Space / RMB fly",
     "fly: WASD/QE move   Shift sprint   drag to look   wheel sets speed",
@@ -83,6 +93,7 @@ EDIT_OFF_HINT = ("Edit is OFF: click Edit (top right) to select and move props",
 EDIT_ON_HELP = (
     "EDIT ON: click a prop to select, then drag a gizmo axis to move",
     "G move   R rotate   B add crate   Del remove   Ctrl+D duplicate   Esc deselect",
+    "right-click a prop for the bundle menu   Show collision to see/remove clip walls",
 )
 _FLY_KEYS = frozenset(
     (Qt.Key.Key_W, Qt.Key.Key_A, Qt.Key.Key_S, Qt.Key.Key_D, Qt.Key.Key_Q, Qt.Key.Key_E)
@@ -486,6 +497,17 @@ class MapEditController:
         self.selected_id: int | None = None
         #: index of the selected static-model prop (clipMap staticModelList), or None.
         self.selected_prop: int | None = None
+        #: index of the selected clip brush in the collision view (an invisible wall), or None.
+        self.selected_clip: int | None = None
+        #: whether the collision overlay (clip brushes) is shown, pickable and deletable, and
+        #: which contents families it covers. Set by the view's Show collision toggle/filter.
+        self.show_collision = False
+        self.collision_families: tuple = ("clip",)
+        #: bumped on every clip-brush add/remove so the view rebuilds the collision overlay.
+        self._collision_rev = 0
+        #: the right-click menu's move scope: which bundle pieces a prop move drag acts on.
+        self.move_model = True
+        self.move_collision = True
         #: what a click selects, and which markers the view draws: PICK_ALL / PICK_PROPS /
         #: PICK_ENTITIES. Defaults to everything; the view switches it to PICK_PROPS when Edit
         #: turns on, so the map is not buried under its hundreds of entity dots and the props
@@ -629,6 +651,127 @@ class MapEditController:
         self._props_cache = None
         if result.get("found") or result.get("render_hidden"):
             self._prop_rev += 1
+        if result.get("found"):
+            self._collision_rev += 1
+        return result
+
+    # -- bundle pieces (the right-click menu drives these) -----------------------------------
+    def move_selected_model_only(self, delta) -> dict:
+        """Move only the selected prop's render (the model), not its collision."""
+        prop = self.selected_prop_obj()
+        if prop is None:
+            self.warnings = []
+            return {"render_moved": False, "warnings": []}
+        result = self.session.move_prop_render(prop.index, delta)
+        self.warnings = result.get("warnings", [])
+        self._props_cache = None
+        if result.get("render_moved"):
+            self._prop_rev += 1
+        return result
+
+    def move_selected_collision_only(self, delta) -> dict:
+        """Move only the selected prop's clip cluster (the collision), not the model."""
+        prop = self.selected_prop_obj()
+        if prop is None:
+            self.warnings = []
+            return {"moved": [], "found": False, "warnings": []}
+        result = self.session.move_prop_cluster(prop.index, delta, footprint=prop.footprint)
+        self.warnings = result.get("warnings", [])
+        self._props_cache = None
+        if result.get("found"):
+            self._prop_rev += 1
+            self._collision_rev += 1
+        return result
+
+    def delete_selected_model_only(self) -> dict:
+        prop = self.selected_prop_obj()
+        if prop is None:
+            self.warnings = []
+            return {"render_hidden": False, "warnings": []}
+        result = self.session.remove_prop_render(prop.index)
+        self.warnings = result.get("warnings", [])
+        self._props_cache = None
+        if result.get("render_hidden"):
+            self._prop_rev += 1
+        return result
+
+    def delete_selected_collision_only(self) -> dict:
+        prop = self.selected_prop_obj()
+        if prop is None:
+            self.warnings = []
+            return {"removed": [], "warnings": []}
+        cluster = self.session.clip_cluster_in_footprint(*prop.footprint)
+        result = self.session.remove_clips(cluster, key=prop.index)
+        self.warnings = result.get("warnings", [])
+        if result.get("removed"):
+            self._collision_rev += 1
+        return result
+
+    def footprint_pieces(self) -> dict:
+        """The individual pieces under the selected prop's footprint, for the context menu: the
+        clip brush indices and any other static-model props whose footprint overlaps."""
+        prop = self.selected_prop_obj()
+        if prop is None:
+            return {"clips": [], "props": []}
+        from opent5.convert.propclip import boxes_overlap
+
+        clips = self.session.clip_cluster_in_footprint(*prop.footprint)
+        props = [
+            p.index
+            for p in self.props()
+            if p.index != prop.index
+            and boxes_overlap(prop.absmin, prop.absmax, p.absmin, p.absmax)
+        ]
+        return {"clips": clips, "props": props}
+
+    # -- the collision overlay (clip brushes) ------------------------------------------------
+    def collision_boxes(self) -> list:
+        """(index, mins, maxs, family) of the clip brushes the collision view shows, for
+        picking and highlighting. Empty when the overlay is off or the zone has no clipMap."""
+        if not self.show_collision or not self.can_edit_clips:
+            return []
+        return [
+            (i, mn, mx, fam)
+            for (i, mn, mx, _c, fam) in self.session.collision_brushes(self.collision_families)
+        ]
+
+    def pick_clip_ray(self, cam: Camera, px: float, py: float, w: int, h: int):
+        """Nearest clip brush the cursor ray enters, as ``(brush_index, distance)``, by its
+        axis-aligned bounds (the same box the overlay draws it as)."""
+        eye, d = cursor_ray(cam, px, py, w, h)
+        best_i, best_t = None, np.inf
+        for i, mn, mx, _fam in self.collision_boxes():
+            t = ray_aabb_distance(eye, d, mn, mx)
+            if t is not None and t < best_t:
+                best_i, best_t = i, t
+        return best_i, best_t
+
+    def selected_clip_box(self):
+        """(mins, maxs) of the selected clip brush, or None."""
+        if self.selected_clip is None:
+            return None
+        for i, mn, mx, _fam in self.collision_boxes():
+            if i == self.selected_clip:
+                return (mn, mx)
+        return None
+
+    def delete_selected_clip(self) -> dict:
+        """Remove the selected clip brush (an invisible wall) with ``disable_clip``."""
+        if self.selected_clip is None:
+            self.warnings = []
+            return {"removed": [], "warnings": []}
+        result = self.session.remove_clips([self.selected_clip])
+        self.warnings = result.get("warnings", [])
+        if result.get("removed"):
+            self._collision_rev += 1
+        self.selected_clip = None
+        return result
+
+    def delete_clip_brushes(self, indices) -> dict:
+        result = self.session.remove_clips(list(indices))
+        self.warnings = result.get("warnings", [])
+        if result.get("removed"):
+            self._collision_rev += 1
         return result
 
     # selection and projection
@@ -753,12 +896,25 @@ class MapEditController:
                 ent_id = ids[ent_i]
                 origin = np.asarray(self._object_origin(ent_id), np.float64)
                 ent_dist = float(np.linalg.norm(origin - eye))
-        if prop_i is not None and prop_t <= ent_dist:
-            self.selected_prop = prop_i
-            self.selected_id = None
-            return None
-        self.selected_prop = None
-        self.selected_id = ent_id
+        clip_i, clip_t = (None, np.inf)
+        if self.show_collision and self.can_edit_clips:
+            clip_i, clip_t = self.pick_clip_ray(cam, px, py, w, h)
+        # Nearest hit wins. On a tie, a prop beats a clip brush beats an entity (so clicking a
+        # prop selects the prop, not the clip wall it sits inside), matching the old prop/entity
+        # order; the collision overlay off means no clip ever wins.
+        best = None
+        for kind, val, t in (
+            ("prop", prop_i, prop_t),
+            ("clip", clip_i, clip_t),
+            ("entity", ent_id, ent_dist),
+        ):
+            if val is None:
+                continue
+            if best is None or t < best[2]:
+                best = (kind, val, t)
+        self.selected_prop = best[1] if best and best[0] == "prop" else None
+        self.selected_clip = best[1] if best and best[0] == "clip" else None
+        self.selected_id = best[1] if best and best[0] == "entity" else None
         return self.selected_id
 
     def _object_origin(self, obj_id):
@@ -941,7 +1097,14 @@ class MapEditController:
             if preview[0] == "rotate" and abs(preview[1]) > 1e-6:
                 self.rotate_selected_prop(preview[1])
             elif preview[0] == "translate" and float(np.linalg.norm(preview[1])) > 1e-6:
-                self.move_selected_prop(tuple(float(v) for v in preview[1]))
+                delta = tuple(float(v) for v in preview[1])
+                # the right-click menu's move scope decides which bundle pieces follow the gizmo.
+                if self.move_model and self.move_collision:
+                    self.move_selected_prop(delta)
+                elif self.move_model:
+                    self.move_selected_model_only(delta)
+                elif self.move_collision:
+                    self.move_selected_collision_only(delta)
             return
         self._drag = None
 
@@ -1023,6 +1186,14 @@ class Renderer:
         self.drag_edges = self.edges
         self.grid_points = np.zeros((0, 3), np.float32)
         self.grid_edges = np.zeros((0, 2), np.int64)
+        #: the collision overlay (clip-brush volumes), drawn translucent over the wireframe when
+        #: ``show_collision`` is on. Separate from the world mesh, so toggling it or editing a
+        #: clip never rebuilds the world+models mesh.
+        self.collision_points = np.zeros((0, 3), np.float32)
+        self.collision_edges = np.zeros((0, 2), np.int64)
+        self.show_collision = False
+        #: bumped whenever the overlay mesh changes, so the frame cache knows to repaint.
+        self.collision_rev = 0
         self.depth_cue = True
         self.grid = True
         self.bounds = (np.zeros(3), np.zeros(3))
@@ -1060,6 +1231,20 @@ class Renderer:
         else:
             self.bounds = self.frame_bounds = self.focus_bounds = (np.zeros(3), np.zeros(3))
         self._build_grid()
+
+    def set_collision_mesh(self, positions: np.ndarray, triangles: np.ndarray) -> None:
+        """Set the collision overlay geometry (clip-brush volumes). Its edges are derived once;
+        projection and culling happen per frame in ``render`` through the same numpy pipeline as
+        the world wireframe, so it stays cheap even with a thousand brushes."""
+        self.collision_points = np.ascontiguousarray(positions, np.float32)
+        has = triangles is not None and len(triangles)
+        self.collision_edges = unique_edges(triangles) if has else np.zeros((0, 2), np.int64)
+        self.collision_rev += 1
+
+    def clear_collision_mesh(self) -> None:
+        self.collision_points = np.zeros((0, 3), np.float32)
+        self.collision_edges = np.zeros((0, 2), np.int64)
+        self.collision_rev += 1
 
     def update_points(self, positions: np.ndarray) -> None:
         """Replace the vertex positions without touching the edge, triangle or grid topology.
@@ -1138,6 +1323,22 @@ class Renderer:
                 cov = (1.0 - np.exp(-gain * a))[:, None]
                 under = out[hit].astype(np.float32)
                 out[hit] = np.clip(under + (colour - under) * cov, 0, 255).astype(np.uint8)
+        if self.show_collision and len(self.collision_edges):
+            cx0, cy0, cx1, cy1, _cd = project_edges(
+                self.collision_points, self.collision_edges, cam, w, h
+            )
+            if len(cx0):
+                cc, _ = rasterise(cx0, cy0, cx1, cy1, np.ones(len(cx0), np.float32), w, h)
+                chit = np.flatnonzero(cc)
+                if len(chit):
+                    clip_rgb = _rgb(CLIP_OVERLAY_COLOUR)
+                    # additive translucency: a face stack reads brighter, so the clip volumes
+                    # look like translucent solids over the wireframe rather than flat lines.
+                    ccov = (1.0 - np.exp(-0.5 * cc[chit]))[:, None]
+                    cunder = out[chit].astype(np.float32)
+                    out[chit] = np.clip(
+                        cunder + (clip_rgb - cunder) * ccov, 0, 255
+                    ).astype(np.uint8)
         img8 = out.reshape(h, w, 3)
         image = QImage(img8.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
         self.last_ms = (time.perf_counter() - started) * 1000.0
@@ -1211,6 +1412,9 @@ class MeshCanvas(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # the right-click context menu is built by hand in mouseReleaseEvent (a right DRAG is
+        # fly-look), so suppress Qt's automatic one.
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
         self.controller = None  # a MapEditController while editing, else None
         #: True when this zone can be edited, so the hint prompts to turn on Edit even
         #: before the controller exists.
@@ -1287,6 +1491,14 @@ class MeshCanvas(QWidget):
 
     def set_shaded(self, on: bool) -> None:
         self.shaded = on
+        self.invalidate()
+
+    def set_show_collision(self, on: bool) -> None:
+        """Turn the translucent clip-brush collision overlay on or off. The overlay geometry is
+        supplied separately by the view through ``renderer.set_collision_mesh``."""
+        self.renderer.show_collision = on
+        if self.controller is not None:
+            self.controller.show_collision = on
         self.invalidate()
 
     def gl_available(self) -> bool:
@@ -1399,7 +1611,7 @@ class MeshCanvas(QWidget):
         shaded = self._shaded_ready()
         key = (w, h, fast, c.yaw, c.pitch, c.distance, tuple(c.target), c.ortho, c.ortho_half_h,
                self.renderer.depth_cue, self.renderer.grid, theme.current().name,
-               shaded)  # fmt: skip
+               shaded, self.renderer.show_collision, self.renderer.collision_rev)  # fmt: skip
         if key != self._key or self._image is None:
             self._image = self._gl_image(w, h) if shaded else None
             if self._image is None:
@@ -1468,6 +1680,8 @@ class MeshCanvas(QWidget):
         ctl = self.controller
         if ctl is None:
             return ""
+        if ctl.selected_clip is not None:
+            return f"clip brush #{ctl.selected_clip}"
         prop = ctl.selected_prop_obj()
         if prop is not None:
             return f"{prop.model or 'prop'} #{prop.index}"
@@ -1599,7 +1813,42 @@ class MeshCanvas(QWidget):
                 p.drawRect(int(sx - r), int(sy - r), 2 * r, 2 * r)
         self._paint_prop_markers(p)
         self._paint_cluster(p)
+        self._paint_selected_clip(p)
         self._paint_gizmo_handles(p)
+
+    def _paint_box(self, p: QPainter, mins, maxs) -> None:
+        """Draw one axis-aligned box as a wireframe, projecting its eight corners."""
+        from opent5.edit import gizmo as gz
+
+        eye, right, up, forward = self.camera.basis()
+        f = focal(self.height())
+        w, h = self.width(), self.height()
+        oscale = self.camera.ortho_scale(h) if self.camera.ortho else None
+        corners = [
+            (mins[0], mins[1], mins[2]), (maxs[0], mins[1], mins[2]),
+            (maxs[0], maxs[1], mins[2]), (mins[0], maxs[1], mins[2]),
+            (mins[0], mins[1], maxs[2]), (maxs[0], mins[1], maxs[2]),
+            (maxs[0], maxs[1], maxs[2]), (mins[0], maxs[1], maxs[2]),
+        ]  # fmt: skip
+        edges = (
+            (0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        )  # fmt: skip
+        scr = [gz.project_point(c, eye, right, up, forward, f, w, h, oscale) for c in corners]
+        for a, b in edges:
+            if scr[a][3] and scr[b][3]:
+                p.drawLine(QPointF(scr[a][0], scr[a][1]), QPointF(scr[b][0], scr[b][1]))
+
+    def _paint_selected_clip(self, p: QPainter) -> None:
+        """Highlight the selected clip brush (an invisible wall) so it reads clearly against the
+        overlay, in the same clip colour but brighter."""
+        ctl = self.controller
+        box = ctl.selected_clip_box() if ctl is not None and ctl.selected_clip is not None else None
+        if box is None:
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.setPen(QPen(QColor(CLIP_OVERLAY_COLOUR), 2.0))
+        self._paint_box(p, box[0], box[1])
 
     def _diamond(self, p: QPainter, sx: float, sy: float, r: float) -> None:
         # QPainter.drawPolygon takes a single QPolygonF, not loose points: passing four
@@ -1816,8 +2065,102 @@ class MeshCanvas(QWidget):
             self.invalidate()
         if e.button() == Qt.MouseButton.RightButton:
             self._end_fly_hold()
+            # a right CLICK (not a fly-look drag) over the edit view opens the context menu.
+            if (
+                self.controller is not None
+                and self._press_pos is not None
+                and (e.position() - self._press_pos).manhattanLength() < 4
+            ):
+                self._show_context_menu(e.position())
         self._drag = None
         self._settle.start(10)
+
+    def _show_context_menu(self, pos) -> None:
+        """Right-click menu on a selected prop or clip brush. The default acts on the whole
+        bundle; the other items act on a single piece, and the move-scope toggles set which
+        pieces a later move drag follows. Baked-triangle collision is listed but disabled."""
+        ctl = self.controller
+        if ctl is None:
+            return
+        px, py = pos.x(), pos.y()
+        # if nothing relevant is selected, pick what was right-clicked first
+        if ctl.selected_prop is None and ctl.selected_clip is None:
+            ctl.pick(self.camera, px, py, self.width(), self.height())
+            self.selection_changed.emit(ctl.selected_id)
+        menu = QMenu(self)
+        if ctl.selected_prop is not None:
+            self._build_prop_menu(menu, ctl)
+        elif ctl.selected_clip is not None:
+            self._build_clip_menu(menu, ctl)
+        else:
+            return
+        menu.exec(self.mapToGlobal(QPoint(int(px), int(py))))
+        self.invalidate()
+
+    def _build_prop_menu(self, menu: QMenu, ctl) -> None:
+        has_cluster = bool(ctl.selected_cluster())
+        menu.addAction(
+            "Delete everything (model + collision)",
+            lambda: self._menu_delete(ctl.delete_selected_prop_clip),
+        )
+        menu.addAction(
+            "Delete model only", lambda: self._menu_delete(ctl.delete_selected_model_only)
+        )
+        coll = menu.addAction(
+            "Delete collision only", lambda: self._menu_delete(ctl.delete_selected_collision_only)
+        )
+        coll.setEnabled(has_cluster)
+        menu.addSeparator()
+        am = menu.addAction("Move drag moves the model")
+        am.setCheckable(True)
+        am.setChecked(ctl.move_model)
+        am.toggled.connect(lambda v: setattr(ctl, "move_model", v))
+        ac = menu.addAction("Move drag moves the collision")
+        ac.setCheckable(True)
+        ac.setChecked(ctl.move_collision)
+        ac.toggled.connect(lambda v: setattr(ctl, "move_collision", v))
+        pieces = ctl.footprint_pieces()
+        if pieces["clips"]:
+            sub = menu.addMenu("Delete one clip brush")
+            for i in pieces["clips"]:
+                sub.addAction(
+                    f"clip brush #{i}",
+                    lambda i=i: self._menu_delete(lambda: ctl.delete_clip_brushes([i])),
+                )
+        if pieces["props"]:
+            sub2 = menu.addMenu("Overlapping props")
+            for j in pieces["props"]:
+                sub2.addAction(
+                    f"delete prop #{j} (everything)",
+                    lambda j=j: self._menu_delete_other_prop(j),
+                )
+        menu.addSeparator()
+        baked = menu.addAction("Baked-triangle collision: cannot remove (needs recompile)")
+        baked.setEnabled(False)
+
+    def _build_clip_menu(self, menu: QMenu, ctl) -> None:
+        menu.addAction(
+            "Delete this clip brush (invisible wall)",
+            lambda: self._menu_delete(ctl.delete_selected_clip),
+        )
+        baked = menu.addAction("Baked-triangle collision: cannot remove (needs recompile)")
+        baked.setEnabled(False)
+
+    def _menu_delete(self, action) -> None:
+        action()
+        self.controller.selected_prop = None
+        self.selection_changed.emit(None)
+        self.edited.emit()
+        self.invalidate()
+
+    def _menu_delete_other_prop(self, prop_index: int) -> None:
+        ctl = self.controller
+        ctl.selected_prop = prop_index
+        ctl.delete_selected_prop_clip()
+        ctl.selected_prop = None
+        self.selection_changed.emit(None)
+        self.edited.emit()
+        self.invalidate()
 
     def mouseDoubleClickEvent(self, e) -> None:
         if e.button() != Qt.MouseButton.LeftButton:
@@ -1968,8 +2311,12 @@ class MeshCanvas(QWidget):
             ctl.mode = "rotate"
         elif k == Qt.Key.Key_B and not ctrl:
             self._add_crate()
+        elif k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and ctl.selected_clip is not None:
+            ctl.delete_selected_clip()  # remove the picked clip brush (an invisible wall)
+            self.selection_changed.emit(None)
+            self.edited.emit()
         elif k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and ctl.selected_prop is not None:
-            ctl.delete_selected_prop_clip()  # remove the prop's clip cluster (collision)
+            ctl.delete_selected_prop_clip()  # remove the whole bundle (model + collision)
             ctl.selected_prop = None
             self.selection_changed.emit(None)
             self.edited.emit()
@@ -2216,6 +2563,16 @@ class MapEditPanel(QWidget):
         if self.controller is not None:
             self.undo_button.setEnabled(self.controller.session.can_undo)
             self.redo_button.setEnabled(self.controller.session.can_redo)
+        # a clip brush selected in the collision overlay: show it, offer removal
+        clip = self.controller.selected_clip if self.controller else None
+        if clip is not None:
+            self.dup_button.setEnabled(False)
+            self.del_button.setEnabled(True)
+            self.selected_label.setText(
+                f"clip brush #{clip} (an invisible collision wall)\n"
+                "Delete removes it. Baked-triangle collision cannot be removed here."
+            )
+            return
         # a static-model prop selected: show its clip cluster, not entity fields
         prop = self.controller.selected_prop_obj() if self.controller else None
         if prop is not None:
@@ -2283,6 +2640,10 @@ class MapEditPanel(QWidget):
 
     def _delete(self) -> None:
         if self.controller is None:
+            return
+        if self.controller.selected_clip is not None:
+            self._guard(self.controller.delete_selected_clip)
+            self.show_object(None)
             return
         if self.controller.selected_prop is not None:
             self._guard(self.controller.delete_selected_prop_clip)
@@ -2368,6 +2729,18 @@ class MeshView(AssetView):
         self.fly_button.setAutoRaise(True)
         self.fly_button.setToolTip("Fly through the map: WASD move, Q/E down/up, Shift sprint "
                                    "(Space, or hold the right button)")  # fmt: skip
+        self.collision_button = self._toggle("Show collision", False, self._set_show_collision)
+        self.collision_button.setToolTip(
+            "Overlay the clip-brush collision (the invisible walls) as translucent volumes; "
+            "click one to select it, Delete removes it"
+        )
+        self.collision_button.setVisible(False)
+        self.collision_family = QComboBox(bar)
+        for label, _fam in COLLISION_FAMILIES:
+            self.collision_family.addItem(label)
+        self.collision_family.setToolTip("Which collision to show in the overlay")
+        self.collision_family.currentIndexChanged.connect(self._set_collision_family)
+        self.collision_family.setVisible(False)
         self.mode = QComboBox(bar)
         self.mode.addItems(COLLISION_MODES)
         self.mode.setToolTip("Which collision geometry to draw")
@@ -2394,7 +2767,8 @@ class MeshView(AssetView):
         self.info = QLabel("", bar)
         self.info.setObjectName("AssetMeta")
         for w in (self.shaded_button, self.depth_button, self.grid_button,
-                  self.models_button, self.edit_button, self.fly_button, self.mode):  # fmt: skip
+                  self.models_button, self.edit_button, self.fly_button,
+                  self.collision_button, self.collision_family, self.mode):  # fmt: skip
             row.addWidget(w)
         row.addSpacing(8)
         for b in self.view_buttons:
@@ -2430,6 +2804,9 @@ class MeshView(AssetView):
         #: last prop-edit revision the models mesh was rebuilt for, so a prop edit refreshes
         #: the view live but an entity-only edit does not rebuild the whole mesh.
         self._last_prop_rev = 0
+        #: last clip-edit revision the collision overlay was rebuilt for, so a clip add/remove
+        #: refreshes the overlay without rebuilding the world mesh.
+        self._last_collision_rev = 0
         self.split = QSplitter(Qt.Orientation.Horizontal, self)
         self.split.addWidget(holder)
         self.split.addWidget(self.panel)
@@ -2545,6 +2922,63 @@ class MeshView(AssetView):
             self.fly_button.setChecked(on)
             self.fly_button.blockSignals(False)
 
+    # -- collision overlay (the clip-brush invisible walls) ----------------------------------
+
+    def _collision_families(self) -> tuple:
+        return COLLISION_FAMILIES[self.collision_family.currentIndex()][1]
+
+    def _set_show_collision(self, on: bool) -> None:
+        self.collision_family.setVisible(on)
+        self.canvas.set_show_collision(on)
+        if on:
+            self._refresh_collision_overlay()
+        else:
+            self.canvas.renderer.clear_collision_mesh()
+        self.canvas.invalidate()
+        self.canvas.setFocus()
+
+    def _set_collision_family(self, _index: int) -> None:
+        if self._edit_controller is not None:
+            self._edit_controller.collision_families = self._collision_families()
+        if self.collision_button.isChecked():
+            self._refresh_collision_overlay()
+
+    def _refresh_collision_overlay(self, drop: bool = False) -> None:
+        """Build (or rebuild) the clip-brush overlay mesh and hand it to the renderer. ``drop``
+        clears the cached mesh first, for after a clip edit; a plain toggle reuses the cache.
+        This never touches the world+models mesh, so showing or editing collision does not
+        trigger a world-mesh rebuild."""
+        if self.doc is None:
+            return
+        from opent5.gui import geometry
+
+        fam = self._collision_families()
+        if self._edit_controller is not None:
+            self._edit_controller.collision_families = fam
+        if drop:
+            geometry.drop_collision_overlay(self.doc)
+        try:
+            mesh = geometry.collision_overlay_mesh(self.doc, fam)
+        except (EditError, ValueError, KeyError, IndexError, TypeError) as exc:
+            self.status.emit(f"Could not build the collision overlay: {exc}")
+            return
+        if mesh is None:
+            self.canvas.renderer.clear_collision_mesh()
+            self.status.emit("This zone has no clipMap collision to show.")
+            return
+        self.canvas.renderer.set_collision_mesh(mesh.positions, mesh.triangles)
+        self.canvas.invalidate()
+
+    def _maybe_refresh_collision(self) -> None:
+        ctl = self._edit_controller
+        if ctl is None or not self.collision_button.isChecked():
+            return
+        rev = getattr(ctl, "_collision_rev", 0)
+        if rev == self._last_collision_rev:
+            return
+        self._last_collision_rev = rev
+        self._refresh_collision_overlay(drop=True)
+
     # -- in-place editing --------------------------------------------------------------------
 
     def _can_edit(self) -> bool:
@@ -2590,6 +3024,9 @@ class MeshView(AssetView):
                 return
             self._edit_controller = MapEditController(session)
             self._last_prop_rev = self._edit_controller._prop_rev
+            self._last_collision_rev = self._edit_controller._collision_rev
+            self._edit_controller.show_collision = self.collision_button.isChecked()
+            self._edit_controller.collision_families = self._collision_families()
             self._edit_controller.props_shown = self.models_button.isChecked()
             # start on Props so the view is not buried under the entity dots; the panel's Pick
             # control switches to Entities or All.
@@ -2619,6 +3056,14 @@ class MeshView(AssetView):
         self._edit_controller = None
         self._session = None
         self._last_prop_rev = 0
+        self._last_collision_rev = 0
+        if self.collision_button.isChecked():
+            self.collision_button.blockSignals(True)
+            self.collision_button.setChecked(False)
+            self.collision_button.blockSignals(False)
+        self.collision_family.setVisible(False)
+        self.canvas.renderer.clear_collision_mesh()
+        self.canvas.renderer.show_collision = False
 
     def _on_pick(self, obj_id) -> None:
         self.panel.show_object(obj_id)
@@ -2627,10 +3072,12 @@ class MeshView(AssetView):
         if self._edit_controller is not None:
             self.panel.show_object(self._edit_controller.selected_id)
         self._maybe_refresh_models()
+        self._maybe_refresh_collision()
         self.canvas.invalidate()
 
     def _on_panel_changed(self) -> None:
         self._maybe_refresh_models()
+        self._maybe_refresh_collision()
         self.canvas.invalidate()
 
     def _maybe_refresh_models(self) -> None:
@@ -2741,6 +3188,7 @@ class MeshView(AssetView):
         self.models_button.setVisible(kind in ("world", "world_models"))
         self._teardown_edit()
         self.edit_button.setVisible(self._can_edit())
+        self.collision_button.setVisible(self._can_edit())
         self.canvas.edit_available = self._can_edit()
         label = ref.label if ref is not None else KIND_TITLES.get(kind, kind)
         self._show_message(f"Building mesh for {label} ...")
@@ -2765,6 +3213,7 @@ class MeshView(AssetView):
         self.models_button.setVisible(kind in ("world", "world_models"))
         self._teardown_edit()
         self.edit_button.setVisible(self._can_edit())
+        self.collision_button.setVisible(self._can_edit())
         self.canvas.edit_available = self._can_edit()
         self._sync = True
         try:

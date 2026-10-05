@@ -112,6 +112,35 @@ _H_NUM_BRUSHES = 0x94
 PLAYER_CLIP_CONTENTS = 0x8030200
 PLAYER_CLIP_SURFACE = 0x000440A0
 
+#: The clip-family contents bit. Every clip brush in retail mp_nuked (the player clip
+#: 0x8030200, and the vehicle / missile / etc. clips 0x8000400, 0x8030600, 0x9000000 ...)
+#: carries bit 0x08000000, while the solid world brushes do not. The device-proven player clip
+#: the editor adds carries it too. Used to tell a prop's invisible clip wall apart from a solid
+#: world brush when the collision view filters what it shows. This is a pragmatic grouping by
+#: the contents bits observed in retail clipMaps, not a full decode of the engine's flags.
+CLIP_CONTENTS_BIT = 0x08000000
+#: ``CONTENTS_SOLID``: a solid world brush a trace always stops at.
+CONTENTS_SOLID = 0x1
+
+
+def is_clip_contents(contents: int) -> bool:
+    """Whether a brush's contents mark it as an invisible clip wall (player / vehicle / ...
+    clip), the kind a prop carries and the collision view lets you see and remove."""
+    return bool(int(contents) & CLIP_CONTENTS_BIT)
+
+
+def contents_family(contents: int) -> str:
+    """``'clip'`` for an invisible clip wall, ``'solid'`` for a solid world brush, else
+    ``'other'`` (detail / structural world collision). A disabled brush (contents 0) is
+    ``'other'``. Pragmatic, by the contents bits seen in retail clipMaps; enough to filter the
+    collision view into at least clip-family versus solid."""
+    c = int(contents)
+    if c & CLIP_CONTENTS_BIT:
+        return "clip"
+    if c & CONTENTS_SOLID:
+        return "solid"
+    return "other"
+
 _PTR_NULL = 0
 _PTR_INLINE = 0xFFFFFFFF
 _OFFSET_BLOCK_SHIFT = 29

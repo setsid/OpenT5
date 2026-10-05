@@ -481,6 +481,77 @@ def collision_mesh(xfile, asset) -> MeshData:
     )
 
 
+def collision_overlay_mesh(doc, families=("clip",)) -> MeshData | None:
+    """A mesh of the clipMap's clip brushes whose contents family is in ``families``
+    (``opent5.convert.propclip.contents_family``: 'clip', 'solid', 'other'), triangulated for
+    the collision overlay to draw as translucent volumes over the edit view. ``groups`` holds
+    each triangle's clipMap brush index, so a picked or highlighted triangle maps back to the
+    brush the editor can remove with ``remove_clips``. Cached per (zone, families); ``None``
+    when the zone carries no clipMap.
+
+    The baked-triangle collision (the clipMap's tri_indices/verts) is deliberately left out:
+    it is separate collision that cannot be removed without a recompile, so the overlay shows
+    only the removable clip walls. The full 'collision' view still shows the baked triangles."""
+    xfile = _xfile(doc)
+    try:
+        asset = _pick(xfile, COLLISION_TYPES, None, "collision (col_map)")
+    except EditError:
+        return None
+    fam = tuple(families)
+    key = (id(xfile), "collision_overlay", fam)
+    if key in _cache:
+        return _cache[key]
+    from opent5.convert import propclip as pc
+    from opent5.export import collision as col
+    from opent5.xfile.schema import view
+
+    c = asset.data
+    if c.get("brushes") is None:
+        return None
+    h = _helper(xfile)
+    try:
+        brushes = col.parse_brushes(view(c).array("brushes"), h.brush_sides)
+    except ValueError:
+        return None
+    want = set(fam)
+    positions, tris, groups, at = [], [], [], 0
+    for i, b in enumerate(brushes):
+        if pc.contents_family(b.contents) not in want:
+            continue
+        faces = brush_faces(b)
+        if not faces:
+            continue
+        p, t = col.triangulate(faces)
+        positions.append(np.asarray(p, np.float32))
+        tris.append(t + at)
+        groups.append(np.full(len(t), i, np.int32))
+        at += len(p)
+    if positions:
+        out = MeshData(
+            np.concatenate(positions),
+            np.concatenate(tris).astype(np.int32),
+            groups=np.concatenate(groups),
+            label="collision",
+            notes=[f"{at} clip verts in {len(groups)} brushes"],
+        )
+    else:
+        out = MeshData(
+            np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int32),
+            groups=np.zeros(0, np.int32), label="collision", notes=["0 clip brushes"],
+        )  # fmt: skip
+    _cache[key] = out
+    return out
+
+
+def drop_collision_overlay(doc) -> None:
+    """Forget the cached collision-overlay meshes for this zone, so a rebuild re-reads the
+    edited clip brushes after a clip is added or removed (a removed clip's contents go to 0, so
+    it drops out of the clip family and the overlay no longer shows it)."""
+    xfile = _xfile(doc)
+    for key in [k for k in _cache if k[0] == id(xfile) and k[1] == "collision_overlay"]:
+        del _cache[key]
+
+
 def _model(xfile, node, name: str) -> MeshData:
     h = _helper(xfile)
     try:

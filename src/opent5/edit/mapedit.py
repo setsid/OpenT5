@@ -90,6 +90,27 @@ def _render_moved_collision_stays() -> str:
     )
 
 
+def _render_moved_fresh_clip_notice() -> str:
+    """Said when a prop with no clip cluster is moved: the model moved and a fresh solid clip
+    was added at the new footprint, so it is solid where it now sits. The old baked-triangle
+    collision cannot be removed here, so it is left behind and we say so."""
+    return (
+        "Moved the prop's model and added a solid clip at the new footprint, so it blocks "
+        "where it now sits. Any baked-triangle collision at the old position stays, as baked "
+        "collision clears only with a full recompile, which is not available here."
+    )
+
+
+def _render_moved_no_clip_added_notice() -> str:
+    """Said when a clip-less prop is moved but the new spot is outside the collision BSP, so a
+    clip could not be added there."""
+    return (
+        "Moved the prop's model, but the new spot is outside the collision BSP, so no clip "
+        "could be added there and it is not solid. Any baked collision at the old position "
+        "stays (baked collision clears only with a full recompile)."
+    )
+
+
 def _render_hidden_collision_stays() -> str:
     """Said when a prop with no clip cluster is deleted: the model is hidden, but any baked
     collision remains."""
@@ -117,6 +138,11 @@ _INST_MAXS = 0x0C
 #: inst and draw-inst arrays on PS3, confirmed by round-trip on mp_nuked).
 _CLIP_NUM_SMODELS = 0x10
 _GFX_SMODEL_COUNT = 0x35C
+#: Tolerance (world units) for matching a clipMap static-model prop to its GfxWorld draw
+#: instance by origin, once the model name already constrains the candidates. The two tables
+#: store the same placement, so a correct match sits within a unit; the small window only
+#: rejects a same-model instance that is a different placement.
+_LINK_TOL = 2.0
 
 
 def _vec_str(vec) -> str:
@@ -426,6 +452,10 @@ class EditSession:
     def _load_model(self) -> None:
         #: (ClipMap, BspLocator) once built, (None, None) when the zone has none; None at first.
         self._clip: tuple | None = None
+        #: stable prop-index -> GfxWorld draw-instance-index link, built once by model AND
+        #: origin (``_prop_draw_map``). None until built; dropped when the prop/draw-inst set
+        #: changes (an add, or an undo/redo), never on a move (indices stay put).
+        self._prop_draw: dict[int, int] | None = None
         #: prop key -> the clip brush indices the editor manages for it (editor-added or moved).
         self._prop_clips: dict[Any, list[int]] = {}
         #: AABBs of the clip volumes clip edits have touched (old and new footprints), so the
@@ -749,23 +779,58 @@ class EditSession:
         cluster = self._cluster_for(key, footprint)
         d = tuple(float(v) for v in delta)
         if not cluster:
-            # No clip cluster under the prop (most stock props have none). The render must
-            # still move so the model follows the gizmo; only a real static-model index has a
-            # render record to move. Its baked collision is left where it is, and we say so.
-            if isinstance(key, int) and 0 <= key < self._sml_count():
-                self._commit_clip(
-                    lambda cm, loc: self._render_shift(key, d),
-                    None,
-                    "move prop",
-                    touch_gfx=True,
-                )
-                return {
-                    "moved": [],
-                    "found": False,
-                    "render_moved": True,
-                    "warnings": [_render_moved_collision_stays()],
-                }
-            return {"moved": [], "found": False, "warnings": [_COLLISION_STAYS]}
+            # No clip cluster under the prop (most stock props have none). Move the render so
+            # the model follows the gizmo AND add a fresh solid clip at the new footprint, so a
+            # prop with no clip of its own becomes solid where it now sits (the bundle move's
+            # "solid at the new spot" guarantee). The old baked-triangle collision cannot be
+            # relocated or removed here, so it is left behind and we warn. A prop with no render
+            # and no footprint has nothing to act on.
+            is_prop = isinstance(key, int) and 0 <= key < self._sml_count()
+            if not is_prop and footprint is None:
+                return {"moved": [], "found": False, "warnings": [_COLLISION_STAYS]}
+            added: dict = {}
+
+            def op(cm, loc):
+                if is_prop:
+                    self._render_shift(key, d)
+                brush = None
+                if footprint is not None:
+                    new_min = tuple(footprint[0][k] + d[k] for k in range(3))
+                    new_max = tuple(footprint[1][k] + d[k] for k in range(3))
+                    try:
+                        brush = pc.add_clip_bsp(cm, loc, new_min, new_max)
+                    except pc.ClipError:
+                        brush = None  # new spot outside the BSP: move the model, add no clip
+                added["brush"] = brush
+                return brush
+
+            self._commit_clip(
+                op,
+                lambda brush: self._prop_clips.__setitem__(key, [brush])
+                if brush is not None
+                else None,
+                "move prop",
+                touch_gfx=True,
+            )
+            brush = added.get("brush")
+            if brush is not None and footprint is not None:
+                self._note_edited_box(footprint[0], footprint[1])
+                new_min = tuple(footprint[0][k] + d[k] for k in range(3))
+                new_max = tuple(footprint[1][k] + d[k] for k in range(3))
+                self._note_edited_box(new_min, new_max)
+            if brush is not None:
+                warn = _render_moved_fresh_clip_notice()
+            elif footprint is not None:
+                warn = _render_moved_no_clip_added_notice()
+            else:
+                warn = _render_moved_collision_stays()
+            return {
+                "moved": [brush] if brush is not None else [],
+                "found": False,
+                "render_moved": is_prop,
+                "added_clip": brush,
+                "warnings": [warn],
+            }
         warnings = [] if key in self._prop_clips else [_baked_shadow_notice("Moving")]
         cm, _ = self._clip_engine()
         old_bounds = pc.cluster_bounds(cm, cluster)
@@ -874,6 +939,105 @@ class EditSession:
             "warnings": warnings,
         }
 
+    # -- individual bundle pieces (the right-click menu drives these) ------------------------
+
+    def move_prop_render(self, key, delta) -> dict:
+        """Move ONLY a prop's render by ``delta`` (the model, not its collision). One
+        reversible edit. For the menu's "model only" move."""
+        d = tuple(float(v) for v in delta)
+        if not (isinstance(key, int) and 0 <= key < self._sml_count()):
+            return {"render_moved": False, "warnings": [_COLLISION_STAYS]}
+        self._commit_clip(
+            lambda cm, loc: self._render_shift(key, d), None, "move prop model", touch_gfx=True
+        )
+        return {"render_moved": True, "warnings": [_baked_shadow_notice("Moving")]}
+
+    def move_prop_cluster(self, key, delta, footprint=None, brushes=None) -> dict:
+        """Move ONLY a prop's clip cluster by ``delta`` (the collision, not the render). Uses
+        ``brushes`` if given, else the prop's managed/stock cluster. For the menu's "collision
+        only" move. Reversible; ``numBrushes`` unchanged."""
+        cluster = list(brushes) if brushes is not None else self._cluster_for(key, footprint)
+        d = tuple(float(v) for v in delta)
+        if not cluster:
+            return {"moved": [], "found": False, "warnings": [_COLLISION_STAYS]}
+        cm, _ = self._clip_engine()
+        old_bounds = pc.cluster_bounds(cm, cluster)
+        def _assoc(_r):
+            if key is not None:
+                self._prop_clips[key] = list(cluster)
+
+        self._commit_clip(
+            lambda cm_, loc: (pc.move_cluster_bsp(cm_, loc, cluster, d), None)[1],
+            _assoc,
+            "move clip",
+        )
+        if old_bounds is not None:
+            self._note_edited_box(*old_bounds)
+            self._note_edited_box(
+                tuple(old_bounds[0][k] + d[k] for k in range(3)),
+                tuple(old_bounds[1][k] + d[k] for k in range(3)),
+            )
+        return {"moved": list(cluster), "found": True, "warnings": []}
+
+    def remove_prop_render(self, key) -> dict:
+        """Hide ONLY a prop's render (the model), leaving its collision. One reversible edit.
+        For the menu's "model only" delete."""
+        if not (isinstance(key, int) and 0 <= key < self._sml_count()):
+            return {"render_hidden": False, "warnings": []}
+        self._commit_clip(
+            lambda cm, loc: self._render_hide(key), None, "hide prop model", touch_gfx=True
+        )
+        return {"render_hidden": True, "warnings": [_baked_shadow_notice("Deleting")]}
+
+    def remove_clips(self, indices, key=None) -> dict:
+        """Remove a given set of clip brushes (disable them in place, drop their leaf
+        references), reversibly. For the menu's "collision only" delete, for deleting the
+        individual clip brushes picked in the collision view, and for removing a leftover
+        invisible wall that belongs to no prop. ``key`` (when the brushes are a prop's cluster)
+        is dropped from the managed associations."""
+        engine = self._clip_engine()
+        if engine is None:
+            return {"removed": [], "warnings": [self.doc.zone_name + ": no editable clipMap"]}
+        cm, _ = engine
+        indices = [int(i) for i in indices if 0 <= int(i) < cm.num_brushes]
+        if not indices:
+            return {"removed": [], "warnings": []}
+        old_bounds = pc.cluster_bounds(cm, indices)
+        self._commit_clip(
+            lambda cm_, loc: (pc.remove_cluster(cm_, indices), None)[1],
+            (lambda _r: self._prop_clips.pop(key, None)) if key is not None else None,
+            "remove clip",
+        )
+        if old_bounds is not None:
+            self._note_edited_box(*old_bounds)
+        return {"removed": list(indices), "warnings": []}
+
+    # -- collision brushes for the collision view --------------------------------------------
+
+    def collision_brushes(self, families=("clip",)) -> list:
+        """The clipMap's clip brushes for the collision view to show, pick and delete: a list
+        of ``(index, mins, maxs, contents, family)`` for each brush whose contents family
+        (``opent5.convert.propclip.contents_family``: 'clip', 'solid' or 'other') is in
+        ``families``. A disabled brush (contents 0, already removed) is skipped. Empty when the
+        zone has no editable clipMap. These are the invisible walls the user sees and can
+        remove with ``remove_clips``; the baked-triangle collision is separate and is marked
+        un-removable in the UI."""
+        engine = self._clip_engine()
+        if engine is None:
+            return []
+        cm, _ = engine
+        want = set(families) if families else None
+        out = []
+        for i in range(cm.num_brushes):
+            b = cm.brush(i)
+            if b.contents == 0:
+                continue
+            fam = pc.contents_family(b.contents)
+            if want is not None and fam not in want:
+                continue
+            out.append((i, b.mins, b.maxs, b.contents, fam))
+        return out
+
     # -- static-model render (cStaticModel + GfxWorld draw inst + smodel inst) ----------------
 
     def _sml_count(self) -> int:
@@ -922,6 +1086,58 @@ class EditSession:
                 return j
         return None
 
+    def _draw_inst_name(self, j: int) -> str | None:
+        e = self._draw_insts()[j]
+        node = e.get("model") if isinstance(e, dict) else None
+        return node.get("name") if isinstance(node, dict) else getattr(node, "name", None)
+
+    def _draw_inst_origin(self, j: int):
+        return struct.unpack_from(">3f", self._draw_raw(j), _DRAW_ORIGIN)
+
+    def _prop_draw_map(self) -> dict[int, int]:
+        """A stable mapping from a clipMap static-model prop index to its GfxWorld draw
+        instance, matched by model name AND origin so a prop that shares a spot with a
+        different-model neighbour links to its OWN render, not the neighbour's. Origin-only
+        matching (the old ``_draw_inst_at_origin`` within 0.5 units) silently linked such
+        props to the wrong draw instance, which is why moving some props moved nothing or the
+        wrong model. Each draw instance is claimed by at most one prop. Built once and cached;
+        a prop with no matching draw instance (e.g. a scripted vehicle) is absent, so its
+        render simply does not move. The indices stay valid across moves and rotations (they
+        rewrite records in place), so the map is dropped only when a prop or draw instance is
+        added or an undo/redo changes the set."""
+        if self._prop_draw is not None:
+            return self._prop_draw
+        mapping: dict[int, int] = {}
+        di = self._draw_insts()
+        if not di:
+            self._prop_draw = mapping
+            return mapping
+        by_model: dict[Any, list[int]] = {}
+        for j in range(len(di)):
+            by_model.setdefault(self._draw_inst_name(j), []).append(j)
+        claimed: set[int] = set()
+        tol2 = _LINK_TOL * _LINK_TOL
+        for p in self.static_models():
+            best, best_d = None, tol2
+            for j in by_model.get(p.model, ()):
+                if j in claimed:
+                    continue
+                o = self._draw_inst_origin(j)
+                d = sum((o[k] - p.origin[k]) ** 2 for k in range(3))
+                if d <= best_d:
+                    best, best_d = j, d
+            if best is not None:
+                claimed.add(best)
+                mapping[p.index] = best
+        self._prop_draw = mapping
+        return mapping
+
+    def _draw_inst_for(self, prop_index) -> int | None:
+        """The GfxWorld draw instance a prop's render lives in, through the stable link."""
+        if not isinstance(prop_index, int):
+            return None
+        return self._prop_draw_map().get(prop_index)
+
     def _set_draw_inst(self, j: int, raw: bytes) -> None:
         """Replace draw-inst ``j`` with a fresh element (never mutate in place, so the clip
         snapshot's shallow list copy restores exactly)."""
@@ -946,20 +1162,23 @@ class EditSession:
 
     def _render_shift(self, prop_index, d) -> bool:
         """Shift a static-model prop's render by ``d``: the clipMap ``cStaticModel`` origin
-        and bounds, plus the GfxWorld draw instance (found by its current origin) and the
-        parallel smodel inst bounds. Returns True when a render record was found. Node edits
-        only; the commit snapshots and marks the assets."""
+        and bounds, plus the GfxWorld draw instance (through the stable prop->draw-inst link)
+        and the parallel smodel inst bounds. Returns True when a render record was found. Node
+        edits only; the commit snapshots and marks the assets."""
         if not isinstance(prop_index, int) or not (0 <= prop_index < self._sml_count()):
             return False
         d = tuple(float(v) for v in d)
+        # Resolve the link BEFORE moving the cStaticModel origin: the link map is built lazily
+        # by matching prop origins against draw-inst origins, and a first lookup after the
+        # origin had already shifted would match nothing (the draw insts are still at the old
+        # spots). Building it here keeps the two tables' origins consistent at map-build time.
+        j = self._draw_inst_for(prop_index)
         sml = bytearray(self._clip_node["static_model_list"])
         o = prop_index * _SM_SIZE
-        origin = struct.unpack_from(">3f", sml, o + _SM_ORIGIN)
         for off in (_SM_ORIGIN, _SM_ABSMIN, _SM_ABSMAX):
             v = struct.unpack_from(">3f", sml, o + off)
             struct.pack_into(">3f", sml, o + off, *(v[k] + d[k] for k in range(3)))
         self._clip_node["static_model_list"] = bytes(sml)
-        j = self._draw_inst_at_origin(origin)
         if j is not None:
             raw = bytearray(self._draw_raw(j))
             org = struct.unpack_from(">3f", raw, _DRAW_ORIGIN)
@@ -976,9 +1195,7 @@ class EditSession:
         ``cStaticModel`` is left as it is, so the clip removal is the collision side."""
         if not isinstance(prop_index, int) or not (0 <= prop_index < self._sml_count()):
             return False
-        o = prop_index * _SM_SIZE
-        origin = struct.unpack_from(">3f", self._clip_node["static_model_list"], o + _SM_ORIGIN)
-        j = self._draw_inst_at_origin(origin)
+        j = self._draw_inst_for(prop_index)
         if j is None:
             return False
         raw = bytearray(self._draw_raw(j))
@@ -999,7 +1216,6 @@ class EditSession:
         yaw = gz.yaw_matrix(degrees)
         sml = bytearray(self._clip_node["static_model_list"])
         o = prop_index * _SM_SIZE
-        origin = struct.unpack_from(">3f", sml, o + _SM_ORIGIN)
         inv = np.array(struct.unpack_from(">9f", sml, o + _SM_INVAXIS), np.float64).reshape(3, 3)
         # invScaledAxis is the inverse of the model->world axis, so it turns by -degrees.
         inv_rot = inv @ gz.yaw_matrix(-degrees)
@@ -1007,7 +1223,7 @@ class EditSession:
         struct.pack_into(">3f", sml, o + _SM_ABSMIN, *new_mins)
         struct.pack_into(">3f", sml, o + _SM_ABSMAX, *new_maxs)
         self._clip_node["static_model_list"] = bytes(sml)
-        j = self._draw_inst_at_origin(origin)
+        j = self._draw_inst_for(prop_index)
         if j is not None:
             from opent5.convert.world import cmp_pack
             from opent5.xfile.schema import unpack_cmp
@@ -1067,6 +1283,9 @@ class EditSession:
             )
             self._gfx_node["header"] = bytes(gh)
             self._gfx_touched = True
+        # a prop and its draw instance were appended: drop the link map so it rebuilds over
+        # the new set (the appended draw instance sits at the centre, so it re-links cleanly).
+        self._prop_draw = None
         return new_index
 
     def _sml_elem(self, i: int) -> bytes:
@@ -1221,6 +1440,7 @@ class EditSession:
         for _ in range(entry.ops):
             self.doc.undo()
         entry.edit.revert(self)
+        self._prop_draw = None  # an add/delete may be undone; rebuild the link over the set
         self._redo.append(entry)
         return entry.edit
 
@@ -1231,6 +1451,7 @@ class EditSession:
         entry.edit.apply(self)
         for _ in range(entry.ops):
             self.doc.redo()
+        self._prop_draw = None
         self._undo.append(entry)
         return entry.edit
 
